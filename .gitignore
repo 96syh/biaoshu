@@ -23,8 +23,14 @@ backend/static/
 # 临时和缓存文件
 *.tmp
 *.temp
+.tmp/
+tmp/
 .DS_Store
 Thumbs.db
+
+# 本地运行与打包产物
+.venv311/
+release/
 
 # Node.js相关
 node_modules/

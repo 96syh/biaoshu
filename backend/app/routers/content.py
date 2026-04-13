@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from ..models.schemas import ContentGenerationRequest, ChapterContentRequest
 from ..services.openai_service import OpenAIService
 from ..utils.config_manager import config_manager
+from ..utils.provider_registry import get_provider_auth_error
 from ..utils.sse import sse_response
 import json
 
@@ -15,9 +16,9 @@ async def generate_chapter_content(request: ChapterContentRequest):
     try:
         # 加载配置
         config = config_manager.load_config()
-        
-        if not config.get('api_key'):
-            raise HTTPException(status_code=400, detail="请先配置OpenAI API密钥")
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
 
         # 创建OpenAI服务实例
         openai_service = OpenAIService()
@@ -34,6 +35,8 @@ async def generate_chapter_content(request: ChapterContentRequest):
         
         return {"success": True, "content": content}
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"章节内容生成失败: {str(e)}")
 
@@ -44,9 +47,9 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
     try:
         # 加载配置
         config = config_manager.load_config()
-        
-        if not config.get('api_key'):
-            raise HTTPException(status_code=400, detail="请先配置OpenAI API密钥")
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
 
         # 创建OpenAI服务实例
         openai_service = OpenAIService()
@@ -67,6 +70,9 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
                     full_content += chunk
                     # 实时发送内容片段
                     yield f"data: {json.dumps({'status': 'streaming', 'content': chunk, 'full_content': full_content}, ensure_ascii=False)}\n\n"
+
+                if not full_content.strip():
+                    raise Exception("模型返回空内容，可能是配额限制、内容拦截或兼容模式异常")
                 
                 # 发送完成信号
                 yield f"data: {json.dumps({'status': 'completed', 'content': full_content}, ensure_ascii=False)}\n\n"
@@ -80,5 +86,7 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
         
         return sse_response(generate())
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"章节内容生成失败: {str(e)}")

@@ -8,7 +8,20 @@ import fastapi.middleware.cors
 import starlette.middleware.cors
 
 from .config import settings
-from .routers import config, document, outline, content, search, expand
+from .routers import config, document, outline, content, expand
+
+HTML_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+search = None
+if os.getenv("ENABLE_SEARCH_ROUTER", "false").lower() == "true":
+    try:
+        from .routers import search
+    except Exception as search_import_error:
+        print(f"搜索模块未启用: {search_import_error}")
 
 # 创建FastAPI应用实例
 app = FastAPI(
@@ -31,8 +44,10 @@ app.include_router(config.router)
 app.include_router(document.router)
 app.include_router(outline.router)
 app.include_router(content.router)
-app.include_router(search.router)
 app.include_router(expand.router)
+
+if search is not None:
+    app.include_router(search.router)
 
 # 健康检查端点
 @app.get("/health")
@@ -48,12 +63,16 @@ async def health_check():
 if os.path.exists("static"):
     # 挂载静态资源文件夹
     app.mount("/static", StaticFiles(directory="static/static"), name="static")
+
+    def frontend_index_response() -> FileResponse:
+        """返回前端入口页，并显式禁止浏览器缓存 HTML 入口"""
+        return FileResponse("static/index.html", headers=HTML_NO_CACHE_HEADERS)
     
     # 处理React应用的路由（SPA路由支持）
     @app.get("/")
     async def read_index():
         """根路径，返回前端首页"""
-        return FileResponse("static/index.html")
+        return frontend_index_response()
     
     @app.get("/{full_path:path}")
     async def serve_react_app(full_path: str):
@@ -70,7 +89,7 @@ if os.path.exists("static"):
             return FileResponse(static_file_path)
         
         # 对于其他所有路径，返回React应用的index.html（SPA路由）
-        return FileResponse("static/index.html")
+        return frontend_index_response()
 else:
     # 如果没有静态文件，返回API信息
     @app.get("/")

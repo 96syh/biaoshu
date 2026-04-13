@@ -18,7 +18,6 @@ try:
     import pdfplumber
     import fitz  # PyMuPDF
     from docx2python import docx2python
-    from PIL import Image
     HAS_ADVANCED_LIBS = True
 except ImportError as e:
     HAS_ADVANCED_LIBS = False
@@ -28,9 +27,42 @@ except ImportError as e:
 class FileService:
     """文件处理服务"""
 
+    SUPPORTED_UPLOAD_MESSAGE = "仅支持 PDF 和 DOCX 文件，暂不支持 DOC，请先另存为 DOCX 后再上传"
+
     # 图片上传配置
     IMAGE_UPLOAD_URL = "https://mt.agnet.top/image/upload"
     IMAGE_UPLOAD_TIMEOUT = 30  # 超时时间（秒）
+
+    @staticmethod
+    def detect_upload_file_kind(file: UploadFile) -> Optional[str]:
+        """根据扩展名和 MIME 类型识别上传文件类型"""
+        filename = (file.filename or "").lower()
+        extension = os.path.splitext(filename)[1]
+        content_type = (file.content_type or "").lower()
+
+        if extension == ".doc" or content_type in {
+            "application/msword",
+            "application/doc",
+            "application/vnd.ms-word",
+        }:
+            return "doc"
+
+        if extension == ".pdf" or content_type == "application/pdf":
+            return "pdf"
+
+        if extension == ".docx" or content_type == (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ):
+            return "docx"
+
+        return None
+
+    @staticmethod
+    def get_upload_validation_message(file: UploadFile) -> str:
+        """返回上传文件类型校验失败时的提示信息"""
+        if FileService.detect_upload_file_kind(file) == "doc":
+            return "暂不支持 .doc 文件，请先另存为 .docx 后再上传"
+        return FileService.SUPPORTED_UPLOAD_MESSAGE
 
     @staticmethod
     async def upload_image_to_server(image_data: bytes, filename: str) -> Optional[str]:
@@ -508,6 +540,10 @@ class FileService:
     @staticmethod
     async def process_uploaded_file(file: UploadFile) -> str:
         """处理上传的文件并提取文本内容"""
+        file_kind = FileService.detect_upload_file_kind(file)
+        if file_kind in (None, "doc"):
+            raise Exception(FileService.get_upload_validation_message(file))
+
         # 检查文件大小
         content = await file.read()
         if len(content) > settings.max_file_size:
@@ -521,12 +557,12 @@ class FileService:
         
         try:
             # 根据文件类型提取文本和图片
-            if file.content_type == "application/pdf":
+            if file_kind == "pdf":
                 text = await FileService.extract_text_from_pdf(file_path)
-            elif file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            elif file_kind == "docx":
                 text = await FileService.extract_text_from_docx(file_path)
             else:
-                raise Exception("不支持的文件类型，请上传PDF或Word文档")
+                raise Exception(FileService.get_upload_validation_message(file))
 
             # 成功提取后，使用安全的文件清理方法
             FileService._safe_file_cleanup(file_path)

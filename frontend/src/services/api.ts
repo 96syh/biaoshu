@@ -3,7 +3,19 @@
  */
 import axios from 'axios';
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+const getDefaultApiBaseUrl = () => {
+  if (process.env.REACT_APP_API_URL) {
+    return process.env.REACT_APP_API_URL;
+  }
+
+  if (typeof window !== 'undefined' && window.location.origin) {
+    return window.location.origin;
+  }
+
+  return 'http://localhost:8000';
+};
+
+const API_BASE_URL = getDefaultApiBaseUrl();
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -20,6 +32,7 @@ api.interceptors.response.use(
 );
 
 export interface ConfigData {
+  provider: string;
   api_key: string;
   base_url?: string;
   model_name: string;

@@ -1,4 +1,4 @@
-# 易标极速版 - AI智能标书写作助手
+# 华正AI标书创作平台 - AI智能标书写作助手
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.8+-blue.svg" alt="Python">
@@ -30,12 +30,6 @@
 - 🔧 **易于使用**: 简洁直观的界面设计，无需专业培训即可上手
 - 🔄 **持续优化**: 基于用户反馈不断改进AI算法和用户体验
 
-## 🌐 官方网站
-
-**在线体验**: [https://yibiao.pro](https://yibiao.pro)
-
-获取更多产品信息、在线体验和技术支持。
-
 ## 📦 使用说明
 
 ### 💻 系统要求
@@ -46,9 +40,8 @@
 
 ### ⬇️ 下载安装
 
-1. **直接下载**：从 [GitHub Releases](https://github.com/yibiaoai/yibiao-simple/releases) 下载最新版本的exe文件
-2. **运行程序**：双击 `yibiao-simple.exe` 即可启动应用
-3. **配置AI**：首次使用需要配置API Key密钥（推荐DeepSeek）
+1. **运行程序**：双击 `huazheng-ai.exe` 即可启动应用
+2. **配置AI**：首次使用需要配置API Key密钥（推荐DeepSeek）
 
 
 ### 📝 使用流程
@@ -81,7 +74,7 @@
 ### 🏗️ 项目结构
 
 ```
-易标极速版/
+华正AI标书创作平台/
 ├── 📁 backend/                 # 后端服务
 │   ├── 📁 app/
 │   │   ├── main.py            # FastAPI应用入口
@@ -103,13 +96,12 @@
 ```
 
 
-## 🚀 参与开发
+## 🚀 开发说明
 
 ### 开发环境运行
 
 ```bash
-# 克隆项目
-git clone https://github.com/yibiaoai/yibiao-simple.git
+# 进入项目目录
 cd yibiao-simple
 
 # 一键启动
@@ -127,7 +119,37 @@ python build.py
 build.bat
 ```
 
-构建完成后，exe文件位于 `dist/yibiao-simple.exe`
+构建完成后，exe文件位于 `dist/huazheng-ai.exe`
+
+### Docker 打包（精简运行时，默认 amd64）
+
+当前 Docker 方案采用两阶段构建：
+
+- 前端在 `node` 阶段编译为静态文件
+- 运行时仅保留 `FastAPI` 后端、前端静态产物和核心 Python 依赖
+- 默认关闭搜索路由，避免把 `Playwright / Selenium / MCP` 这类重依赖打进镜像
+
+在项目根目录执行：
+
+```bash
+docker buildx build --platform linux/amd64 -t huazheng-ai:amd64 . --load
+```
+
+本地运行：
+
+```bash
+docker run --rm -p 8000:8000 \
+  -v huazheng-ai-config:/home/app/.ai_write_helper \
+  -v huazheng-ai-uploads:/app/backend/uploads \
+  huazheng-ai:amd64
+```
+
+启动后访问：
+
+- `http://localhost:8000`
+- `http://localhost:8000/docs`
+
+如果需要把镜像发给 amd64 服务器，建议直接使用带平台参数的 `buildx` 构建；若需要推送到镜像仓库，可把 `build` 改为 `build --push`。
 
 ## 📚 API文档
 
@@ -137,34 +159,17 @@ build.bat
 ## 📌代办任务
 - [ ] 录入预期字数
 
-## 🤝 贡献指南
-
-欢迎各种形式的贡献！
-
-1. **🐛 问题反馈**: 在 [Issues](https://github.com/yibiaoai/yibiao-simple/issues) 中报告bug
-2. **💡 功能建议**: 提出新功能需求和改进建议  
-3. **🔧 代码贡献**: Fork项目，提交Pull Request
-4. **📖 文档完善**: 帮助改进文档和使用说明
-
 
 ## 📄 许可证
 
-本项目基于 [MIT License](LICENSE) 开源协议发布。
+本项目基于 [MIT License](LICENSE) 协议发布。
 
 ## 🙋‍♂️ 联系我们
 
-- **官方网站**: [https://yibiao.pro](https://yibiao.pro)
-- **问题反馈**: [GitHub Issues]((https://github.com/yibiaoai/yibiao-simple/issues)
-- **邮箱联系**: support@yibiao.pro
+- **邮箱联系**: support@huazheng-ai.com
 
 ---
 
 <p align="center">
-  ⭐ 如果这个项目对您有帮助，请给我们一个Star支持！
-</p>
-
-
-
-<p align="center">
-  Made with ❤️ by 易标团队 
+  Made with ❤️ by 华正AI团队 
 </p>

@@ -5,6 +5,7 @@ import React, { useState } from 'react';
 import { OutlineData, OutlineItem } from '../types';
 import { outlineApi, expandApi } from '../services/api';
 import { ChevronRightIcon, ChevronDownIcon, DocumentTextIcon, PencilIcon, TrashIcon, PlusIcon } from '@heroicons/react/24/outline';
+import { consumeSseStream } from '../utils/sse';
 
 interface OutlineEditProps {
   projectOverview: string;
@@ -19,6 +20,7 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
   outlineData,
   onOutlineGenerated,
 }) => {
+  const uploadFileFormatMessage = '仅支持 PDF 和 DOCX 文件，暂不支持 DOC，请先另存为 DOCX';
   const [generating, setGenerating] = useState(false);
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -31,10 +33,80 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
   const [oldOutline, setOldOutline] = useState<string | null>(null);
   const [oldDocument, setOldDocument] = useState<string | null>(null);
 
+  const extractJsonPayload = (raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return trimmed;
+    }
+
+    const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    const candidate = fencedMatch ? fencedMatch[1].trim() : trimmed;
+
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      // 继续尝试提取主体 JSON
+    }
+
+    const startIndexes = [candidate.indexOf('{'), candidate.indexOf('[')].filter((index) => index >= 0);
+    if (startIndexes.length === 0) {
+      return candidate;
+    }
+
+    const start = Math.min(...startIndexes);
+    const opening = candidate[start];
+    const closing = opening === '{' ? '}' : ']';
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = start; index < candidate.length; index += 1) {
+      const char = candidate[index];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+
+      if (char === opening) {
+        depth += 1;
+        continue;
+      }
+
+      if (char === closing) {
+        depth -= 1;
+        if (depth === 0) {
+          return candidate.slice(start, index + 1).trim();
+        }
+      }
+    }
+
+    return candidate;
+  };
+
   // 处理方案扩写文件上传
   const handleExpandUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+
+    const fileName = file.name.toLowerCase();
+    if (!fileName.endsWith('.pdf') && !fileName.endsWith('.docx')) {
+      setMessage({ type: 'error', text: uploadFileFormatMessage });
+      event.target.value = '';
+      return;
+    }
 
     try {
       setuploadedExpand(true);
@@ -76,44 +148,25 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
         old_document: oldDocument || undefined,
       });
 
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('无法读取响应流');
-      }
-
       let result = '';
-      const decoder = new TextDecoder();
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') {
-              break;
-            }
-            try {
-              const parsed = JSON.parse(data);
-              if (parsed.chunk) {
-                result += parsed.chunk;
-                // 实时显示生成的内容
-                setStreamingContent(result);
-              }
-            } catch (e) {
-              // 忽略JSON解析错误
-            }
-          }
+      await consumeSseStream(response, (payload) => {
+        if (payload.error) {
+          throw new Error(payload.message || '目录生成失败');
         }
+        if (typeof payload.chunk !== 'string' || !payload.chunk) {
+          return;
+        }
+        result += payload.chunk;
+        setStreamingContent(result);
+      });
+
+      if (!result.trim()) {
+        throw new Error('目录生成结果为空，请检查模型配置后重试');
       }
 
       // 解析最终结果
       try {
-        const outlineJson = JSON.parse(result);
+        const outlineJson = JSON.parse(extractJsonPayload(result));
         onOutlineGenerated(outlineJson);
         setMessage({ type: 'success', text: '目录结构生成完成' });
         setStreamingContent(''); // 清空流式内容
@@ -483,10 +536,21 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
   };
 
   return (
-    <div className="max-w-6xl mx-auto space-y-6">
+    <div className="workspace-shell">
+      <section className="workspace-intro">
+        <span className="workspace-kicker">Step 02</span>
+        <h2 className="workspace-title">目录结构工作台</h2>
+        <p className="workspace-copy">
+          将招标要求和扩写材料压缩成一套可编辑目录树，方便演示“从评分条款到技术章节框架”的生成过程。
+        </p>
+      </section>
+
       {/* 操作按钮 */}
-      <div className="bg-white rounded-lg shadow p-6">
-        <h2 className="text-xl font-semibold text-gray-900 mb-4">📋 目录管理</h2>
+      <div className="surface-panel">
+        <div className="mb-5">
+          <p className="workspace-kicker">Outline Studio</p>
+          <h2 className="mt-2 text-xl font-semibold tracking-[-0.03em] text-slate-950">目录管理</h2>
+        </div>
         
         <div className="flex space-x-4">
           {/* 方案扩写按钮 */}
@@ -494,18 +558,18 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
             <input
               type="file"
               id="expand-file-upload"
-              accept=".pdf,.doc,.docx"
+              accept=".pdf,.docx"
               onChange={handleExpandUpload}
               className="hidden"
               disabled={uploadedExpand}
             />
             <label
               htmlFor="expand-file-upload"
-              className={`inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white cursor-pointer ${
+              className={`inline-flex items-center rounded-2xl px-4 py-3 text-sm font-medium text-white cursor-pointer transition ${
                 uploadedExpand
-                  ? 'bg-gray-400 cursor-not-allowed'
-                  : 'bg-green-600 hover:bg-green-700'
-              } focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500`}
+                  ? 'bg-slate-300 cursor-not-allowed'
+                  : 'bg-gradient-to-r from-emerald-600 to-teal-600 shadow-[0_18px_40px_-20px_rgba(5,150,105,0.7)] hover:-translate-y-0.5'
+              }`}
             >
               {uploadedExpand ? (
                 <>
@@ -526,7 +590,7 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
           <button
             onClick={handleGenerateOutline}
             disabled={generating || !projectOverview || !techRequirements}
-            className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:bg-gray-400"
+            className="primary-button"
           >
             {generating ? (
               <>
@@ -547,7 +611,7 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
 
         {/* 显示已上传的方案扩写文件 */}
         {expandFile && (
-          <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded-md">
+          <div className="notice-banner notice-banner--success mt-4">
             <div className="flex items-center">
               <DocumentTextIcon className="h-5 w-5 text-green-600 mr-2" />
               <span className="text-sm text-green-800">
@@ -558,7 +622,7 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
         )}
 
         {!projectOverview && !techRequirements && (
-          <div className="mt-4 p-4 bg-yellow-50 border border-yellow-200 rounded-md">
+          <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4">
             <p className="text-sm text-yellow-800">
               请先在"标书解析"步骤中完成文档分析，获取项目概述和技术评分要求。
             </p>
@@ -567,9 +631,9 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
 
         {/* 流式生成内容显示 */}
         {generating && streamingContent && (
-          <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-md">
+          <div className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4">
             <h4 className="text-sm font-medium text-blue-800 mb-2">正在生成目录结构...</h4>
-            <div className="bg-white p-3 rounded border max-h-48 overflow-y-auto">
+            <div className="surface-panel-soft max-h-48 overflow-y-auto">
               <pre className="text-xs text-gray-700 whitespace-pre-wrap font-mono">
                 {streamingContent}
               </pre>
@@ -580,18 +644,18 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
 
       {/* 目录结构显示 */}
       {outlineData && (
-        <div className="bg-white rounded-lg shadow p-6">
+        <div className="surface-panel">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-medium text-gray-900">目录结构</h3>
             <button
               onClick={addRootItem}
-              className="inline-flex items-center px-3 py-1 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700"
+              className="secondary-button"
             >
               <PlusIcon className="h-4 w-4 mr-1" />
               添加目录项
             </button>
           </div>
-          <div className="border rounded-lg p-4 max-h-96 overflow-y-auto">
+          <div className="surface-panel-soft max-h-96 overflow-y-auto">
             {outlineData.outline.map(item => renderOutlineItem(item))}
           </div>
         </div>
@@ -599,10 +663,10 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
 
       {/* 消息提示 */}
       {message && (
-        <div className={`p-4 rounded-md ${
-          message.type === 'success' 
-            ? 'bg-green-100 text-green-700 border border-green-200' 
-            : 'bg-red-100 text-red-700 border border-red-200'
+        <div className={`notice-banner ${
+          message.type === 'success'
+            ? 'notice-banner--success'
+            : 'notice-banner--error'
         }`}>
           {message.text}
         </div>

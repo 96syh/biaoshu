@@ -18,9 +18,10 @@ class ConfigManager:
     def load_config(self) -> Dict:
         """从本地JSON文件加载配置"""
         default_config = {
+            'provider': 'openai',
             'api_key': '',
             'base_url': '',
-            'model_name': 'gpt-3.5-turbo'
+            'model_name': 'gpt-4.1-mini'
         }
         
         if os.path.exists(self.config_file):
@@ -33,9 +34,10 @@ class ConfigManager:
         
         return default_config
     
-    def save_config(self, api_key: str, base_url: str, model_name: str) -> bool:
+    def save_config(self, provider: str, api_key: str, base_url: str, model_name: str) -> bool:
         """保存配置到本地JSON文件"""
         config = {
+            'provider': provider,
             'api_key': api_key,
             'base_url': base_url,
             'model_name': model_name

@@ -3,17 +3,24 @@ from fastapi import APIRouter, HTTPException
 from ..models.schemas import ConfigRequest, ConfigResponse, ModelListResponse
 from ..services.openai_service import OpenAIService
 from ..utils.config_manager import config_manager
+from ..utils.provider_registry import (
+    get_default_models,
+    normalize_base_url,
+    provider_requires_api_key,
+)
 
 router = APIRouter(prefix="/api/config", tags=["配置管理"])
 
 
 @router.post("/save", response_model=ConfigResponse)
 async def save_config(config: ConfigRequest):
-    """保存OpenAI配置"""
+    """保存模型配置"""
     try:
+        normalized_base_url = normalize_base_url(config.provider, config.base_url or "")
         success = config_manager.save_config(
+            provider=config.provider,
             api_key=config.api_key,
-            base_url=config.base_url or "",
+            base_url=normalized_base_url,
             model_name=config.model_name
         )
         
@@ -40,17 +47,20 @@ async def load_config():
 async def get_available_models(config: ConfigRequest):
     """获取可用的模型列表"""
     try:
-        if not config.api_key:
+        if provider_requires_api_key(config.provider) and not config.api_key:
             return ModelListResponse(
                 models=[],
                 success=False,
-                message="请先输入API Key"
+                message="当前供应商需要先输入 API Key"
             )
+
+        normalized_base_url = normalize_base_url(config.provider, config.base_url or "")
 
         # 临时保存配置以供OpenAI服务使用
         temp_saved = config_manager.save_config(
+            provider=config.provider,
             api_key=config.api_key,
-            base_url=config.base_url,
+            base_url=normalized_base_url,
             model_name=config.model_name
         )
 
@@ -74,6 +84,19 @@ async def get_available_models(config: ConfigRequest):
         )
         
     except Exception as e:
+        if config.provider == "custom":
+            return ModelListResponse(
+                models=[],
+                success=False,
+                message=f"未能从自定义端点同步模型列表：{str(e)}"
+            )
+        fallback_models = get_default_models(config.provider)
+        if fallback_models:
+            return ModelListResponse(
+                models=fallback_models,
+                success=True,
+                message=f"未能拉取远端模型，已回退到推荐模型列表：{str(e)}"
+            )
         return ModelListResponse(
             models=[],
             success=False,

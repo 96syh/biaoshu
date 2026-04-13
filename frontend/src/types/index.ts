@@ -3,6 +3,7 @@
  */
 
 export interface ConfigData {
+  provider: string;
   api_key: string;
   base_url?: string;
   model_name: string;

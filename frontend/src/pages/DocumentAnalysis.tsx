@@ -1,11 +1,12 @@
 /**
  * 文档分析页面
  */
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { documentApi } from '../services/api';
 import { CloudArrowUpIcon, DocumentIcon } from '@heroicons/react/24/outline';
 import { draftStorage } from '../utils/draftStorage';
+import { consumeSseStream } from '../utils/sse';
 
 interface DocumentAnalysisProps {
   fileContent: string;
@@ -22,6 +23,7 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
   onFileUpload,
   onAnalysisComplete,
 }) => {
+  const uploadFileFormatMessage = '仅支持 PDF 和 DOCX 文件，暂不支持 DOC，请先另存为 DOCX';
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -30,6 +32,14 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
 
   const [localOverview, setLocalOverview] = useState(projectOverview);
   const [localRequirements, setLocalRequirements] = useState(techRequirements);
+
+  useEffect(() => {
+    setLocalOverview(projectOverview);
+  }, [projectOverview]);
+
+  useEffect(() => {
+    setLocalRequirements(techRequirements);
+  }, [techRequirements]);
   
 
   // 处理换行符的函数 - 只做基本转换
@@ -92,6 +102,13 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
+      const fileName = file.name.toLowerCase();
+      if (!fileName.endsWith('.pdf') && !fileName.endsWith('.docx')) {
+        setUploadedFile(null);
+        setMessage({ type: 'error', text: uploadFileFormatMessage });
+        event.target.value = '';
+        return;
+      }
       setUploadedFile(file);
       handleFileUpload(file);
     }
@@ -135,41 +152,6 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
       let overviewResult = '';
       let requirementsResult = '';
 
-      const decoder = new TextDecoder();
-
-      // 处理流式响应的通用函数
-      const processStream = async (response: Response, onChunk: (chunk: string) => void) => {
-        const reader = response.body?.getReader();
-        if (!reader) {
-          throw new Error('无法读取响应流');
-        }
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') {
-                break;
-              }
-              try {
-                const parsed = JSON.parse(data);
-                if (parsed.chunk) {
-                  onChunk(parsed.chunk);
-                }
-              } catch (e) {
-                // 忽略JSON解析错误
-              }
-            }
-          }
-        }
-      };
-
       // 第一步：分析项目概述
       setCurrentAnalysisStep('overview');
       const overviewResponse = await documentApi.analyzeDocumentStream({
@@ -177,13 +159,21 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
         analysis_type: 'overview',
       });
 
-      await processStream(overviewResponse, (chunk) => {
-        overviewResult += chunk;
-        const normalizedContent = normalizeLineBreaks(overviewResult);
-        setStreamingOverview(normalizedContent);
+      await consumeSseStream(overviewResponse, (payload) => {
+        if (payload.error) {
+          throw new Error(payload.message || '项目概述解析失败');
+        }
+        if (typeof payload.chunk !== 'string' || !payload.chunk) {
+          return;
+        }
+        overviewResult += payload.chunk;
+        setStreamingOverview(normalizeLineBreaks(overviewResult));
       });
 
       const finalOverview = normalizeLineBreaks(overviewResult);
+      if (!finalOverview.trim()) {
+        throw new Error('项目概述解析结果为空，请检查模型配置后重试');
+      }
       setLocalOverview(finalOverview);
 
       // 第二步：分析技术评分要求
@@ -193,17 +183,25 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
         analysis_type: 'requirements',
       });
 
-      await processStream(requirementsResponse, (chunk) => {
-        requirementsResult += chunk;
-        const normalizedContent = normalizeLineBreaks(requirementsResult);
-        setStreamingRequirements(normalizedContent);
+      await consumeSseStream(requirementsResponse, (payload) => {
+        if (payload.error) {
+          throw new Error(payload.message || '技术评分要求解析失败');
+        }
+        if (typeof payload.chunk !== 'string' || !payload.chunk) {
+          return;
+        }
+        requirementsResult += payload.chunk;
+        setStreamingRequirements(normalizeLineBreaks(requirementsResult));
       });
 
       const finalRequirements = normalizeLineBreaks(requirementsResult);
+      if (!finalRequirements.trim()) {
+        throw new Error('技术评分要求解析结果为空，请检查模型配置后重试');
+      }
       setLocalRequirements(finalRequirements);
 
       // 完成后更新父组件状态
-      onAnalysisComplete(overviewResult, requirementsResult);
+      onAnalysisComplete(finalOverview, finalRequirements);
       setMessage({ type: 'success', text: '标书解析完成' });
       
       // 清空流式内容
@@ -222,29 +220,42 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
   };
 
   return (
-    <div className="max-w-4xl mx-auto space-y-8">
+    <div className="workspace-shell">
+      <section className="workspace-intro">
+        <span className="workspace-kicker">Step 01</span>
+        <h2 className="workspace-title">招标资料解析台</h2>
+        <p className="workspace-copy">
+          上传 PDF 或 DOCX，系统会先抽取原文，再进入项目概述与技术评分拆解。这里建议用真实招标书演示，展示效果最直观。
+        </p>
+      </section>
+
       {/* 文件上传区域 */}
-      <div className="bg-white rounded-lg shadow p-6">
-        <h2 className="text-xl font-semibold text-gray-900 mb-4">📄 文档上传</h2>
+      <div className="surface-panel">
+        <div className="mb-5">
+          <p className="workspace-kicker">Source File</p>
+          <h2 className="mt-2 text-xl font-semibold tracking-[-0.03em] text-slate-950">文档上传</h2>
+        </div>
         
         <div 
-          className="border-2 border-dashed border-gray-300 rounded-lg p-12 text-center hover:border-gray-400 transition-colors cursor-pointer"
+          className="rounded-[28px] border border-dashed border-slate-300 bg-slate-50/70 px-8 py-14 text-center transition hover:border-sky-300 hover:bg-white/90 cursor-pointer"
           onClick={() => fileInputRef.current?.click()}
         >
-          <CloudArrowUpIcon className="mx-auto h-12 w-12 text-gray-400" />
+          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-3xl bg-gradient-to-br from-sky-500 to-teal-500 shadow-[0_24px_54px_-26px_rgba(29,78,216,0.55)]">
+            <CloudArrowUpIcon className="h-8 w-8 text-white" />
+          </div>
           <div className="mt-4">
-            <p className="text-lg text-gray-600">
+            <p className="text-lg font-medium text-slate-800">
               {uploadedFile ? uploadedFile.name : '点击选择文件或拖拽文件到这里'}
             </p>
-            <p className="text-sm text-gray-500 mt-2">
-              支持 PDF 和 Word 文档，最大 10MB
+            <p className="mt-2 text-sm text-slate-500">
+              支持 PDF 和 DOCX 文档，最大 10MB
             </p>
           </div>
           
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,.docx,.doc"
+            accept=".pdf,.docx"
             onChange={handleFileSelect}
             className="hidden"
           />
@@ -252,7 +263,7 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
         
         {uploading && (
           <div className="mt-4 text-center">
-            <div className="inline-flex items-center px-4 py-2 text-sm text-blue-600">
+            <div className="inline-flex items-center rounded-full bg-sky-50 px-4 py-2 text-sm font-medium text-sky-700">
               <div className="animate-spin -ml-1 mr-3 h-5 w-5 text-blue-600">
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
@@ -267,14 +278,17 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
 
       {/* 文档分析区域 */}
       {fileContent && (
-        <div className="bg-white rounded-lg shadow p-6">
-          <h2 className="text-xl font-semibold text-gray-900 mb-4">🔍 文档分析</h2>
+        <div className="surface-panel">
+          <div className="mb-5">
+            <p className="workspace-kicker">Analysis</p>
+            <h2 className="mt-2 text-xl font-semibold tracking-[-0.03em] text-slate-950">文档分析</h2>
+          </div>
           
           <div className="flex justify-center mb-6">
             <button
               onClick={handleAnalysis}
               disabled={analyzing}
-              className="inline-flex items-center justify-center px-6 py-3 border border-transparent text-base font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:bg-gray-400 disabled:cursor-not-allowed"
+              className="primary-button min-w-[180px]"
             >
               {analyzing ? (
                 <>
@@ -300,10 +314,10 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
           {/* 流式分析内容显示 */}
           {analyzing && (((currentAnalysisStep === 'overview') && streamingOverview) || ((currentAnalysisStep === 'requirements') && streamingRequirements)) && (
             <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-              <h4 className="text-sm font-medium text-blue-800 mb-3">
+              <h4 className="mb-3 text-sm font-medium text-blue-800">
                 {currentAnalysisStep === 'overview' ? '正在分析项目概述...' : '正在分析技术评分要求...'}
               </h4>
-              <div className="bg-white p-3 rounded-lg border border-gray-200 max-h-64 overflow-y-auto shadow-sm">
+              <div className="surface-panel-soft max-h-64 overflow-y-auto">
                 <div className="text-xs prose prose-sm max-w-none">
                   <ReactMarkdown components={streamingComponents}>
                     {currentAnalysisStep === 'overview' ? streamingOverview : streamingRequirements}
@@ -317,10 +331,10 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* 项目概述 */}
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-3">
+              <label className="mb-3 block text-sm font-medium text-slate-700">
                 项目概述
               </label>
-              <div className="w-full p-4 border border-gray-300 rounded-lg focus-within:ring-blue-500 focus-within:border-blue-500 max-h-80 overflow-y-auto bg-white shadow-sm">
+              <div className="surface-panel-soft max-h-80 overflow-y-auto">
                 <div className="prose prose-sm max-w-none text-gray-800">
                   <ReactMarkdown components={markdownComponents}>
                     {localOverview || '项目概述将在这里显示...'}
@@ -331,10 +345,10 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
 
             {/* 技术评分要求 */}
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-3">
+              <label className="mb-3 block text-sm font-medium text-slate-700">
                 技术评分要求
               </label>
-              <div className="w-full p-4 border border-gray-300 rounded-lg focus-within:ring-green-500 focus-within:border-green-500 max-h-80 overflow-y-auto bg-white shadow-sm">
+              <div className="surface-panel-soft max-h-80 overflow-y-auto">
                 <div className="prose prose-sm max-w-none text-gray-800">
                   <ReactMarkdown components={markdownComponents}>
                     {localRequirements || '技术评分要求将在这里显示...'}
@@ -348,10 +362,10 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
 
       {/* 消息提示 */}
       {message && (
-        <div className={`p-4 rounded-md ${
-          message.type === 'success' 
-            ? 'bg-green-100 text-green-700 border border-green-200' 
-            : 'bg-red-100 text-red-700 border border-red-200'
+        <div className={`notice-banner ${
+          message.type === 'success'
+            ? 'notice-banner--success'
+            : 'notice-banner--error'
         }`}>
           {message.text}
         </div>

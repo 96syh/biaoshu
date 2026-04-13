@@ -1,0 +1,8 @@
+{
+  "name": "yibiao-client-demo",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  }
+}

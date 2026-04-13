@@ -1,15 +1,15 @@
 /**
- * 本地草稿持久化（localStorage）
- * 目标：刷新页面不丢失“标书解析/目录/正文”关键中间结果，方便调试与续写。
+ * 工作台草稿存储
  *
- * 注意：localStorage 容量有限（通常 5-10MB），大正文可能触发 QUOTA_EXCEEDED_ERR。
- * 这里做了 try/catch，失败时不影响主流程。
+ * 当前按演示需求处理：页面刷新后必须回到全新工作台，
+ * 因此禁用自动恢复与持续写入，只保留显式清理旧键的能力。
  */
 
 import type { AppState, OutlineItem } from '../types';
 
-const DRAFT_KEY = 'yibiao:draft:v1';
-const CONTENT_BY_ID_KEY = 'yibiao:contentById:v1';
+const DRAFT_KEY = 'huazheng:draft:v1';
+const CONTENT_BY_ID_KEY = 'huazheng:contentById:v1';
+const WORKSPACE_DRAFT_ENABLED = false;
 
 export type DraftState = Pick<
   AppState,
@@ -29,10 +29,16 @@ const safeJsonParse = <T,>(raw: string | null): T | null => {
 
 export const draftStorage = {
   loadDraft(): Partial<DraftState> | null {
+    if (!WORKSPACE_DRAFT_ENABLED) {
+      return null;
+    }
     return safeJsonParse<Partial<DraftState>>(localStorage.getItem(DRAFT_KEY));
   },
 
   saveDraft(partial: Partial<DraftState>) {
+    if (!WORKSPACE_DRAFT_ENABLED) {
+      return;
+    }
     try {
       const prev = safeJsonParse<Partial<DraftState>>(localStorage.getItem(DRAFT_KEY)) || {};
       const next = { ...prev, ...partial };
@@ -43,19 +49,26 @@ export const draftStorage = {
   },
 
   clearAll() {
-    // 按用户要求：上传新招标文件时清空之前的 localStorage
+    // 仅清理当前应用自己的草稿键，避免误删同域下其他数据
     try {
-      localStorage.clear();
+      localStorage.removeItem(DRAFT_KEY);
+      localStorage.removeItem(CONTENT_BY_ID_KEY);
     } catch (e) {
       console.warn('清空 localStorage 失败:', e);
     }
   },
 
   loadContentById(): ContentById {
+    if (!WORKSPACE_DRAFT_ENABLED) {
+      return {};
+    }
     return safeJsonParse<ContentById>(localStorage.getItem(CONTENT_BY_ID_KEY)) || {};
   },
 
   saveContentById(contentById: ContentById) {
+    if (!WORKSPACE_DRAFT_ENABLED) {
+      return;
+    }
     try {
       localStorage.setItem(CONTENT_BY_ID_KEY, JSON.stringify(contentById));
     } catch (e) {
@@ -64,6 +77,9 @@ export const draftStorage = {
   },
 
   upsertChapterContent(chapterId: string, content: string) {
+    if (!WORKSPACE_DRAFT_ENABLED) {
+      return;
+    }
     try {
       const map = draftStorage.loadContentById();
       map[chapterId] = content;
@@ -77,6 +93,9 @@ export const draftStorage = {
    * 按当前 outline 的叶子节点过滤 contentById，避免目录变更后错误回填。
    */
   filterContentByOutlineLeaves(outline: OutlineItem[]): ContentById {
+    if (!WORKSPACE_DRAFT_ENABLED) {
+      return {};
+    }
     const map = draftStorage.loadContentById();
     const leafIds = new Set<string>();
     const walk = (items: OutlineItem[]) => {
@@ -97,5 +116,3 @@ export const draftStorage = {
     return filtered;
   },
 };
-
-

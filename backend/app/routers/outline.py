@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from ..models.schemas import OutlineRequest, OutlineResponse
 from ..services.openai_service import OpenAIService
 from ..utils.config_manager import config_manager
-from ..utils import prompt_manager
+from ..utils.provider_registry import get_provider_auth_error
 from ..utils.sse import sse_response
 import json
 import asyncio
@@ -17,9 +17,9 @@ async def generate_outline(request: OutlineRequest):
     try:
         # 加载配置
         config = config_manager.load_config()
-
-        if not config.get('api_key'):
-            raise HTTPException(status_code=400, detail="请先配置OpenAI API密钥")
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
 
         # 创建OpenAI服务实例
         openai_service = OpenAIService()
@@ -68,6 +68,8 @@ async def generate_outline(request: OutlineRequest):
 
         return sse_response(generate())
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"目录生成失败: {str(e)}")
 
@@ -78,52 +80,50 @@ async def generate_outline_stream(request: OutlineRequest):
     try:
         # 加载配置
         config = config_manager.load_config()
-
-        if not config.get('api_key'):
-            raise HTTPException(status_code=400, detail="请先配置OpenAI API密钥")
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
 
         # 创建OpenAI服务实例
         openai_service = OpenAIService()
-        # request.uploadedExpand
+
         async def generate():
-            if request.uploaded_expand:
-                system_prompt, user_prompt = prompt_manager.generate_outline_with_old_prompt(request.overview, request.requirements, request.old_outline)
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
-                
-                full_content = ""
-                async for chunk in openai_service.stream_chat_completion(messages, temperature=0.7, response_format={"type": "json_object"}):
-                    full_content += chunk
-                print(full_content)
-                # 流式返回目录生成结果
-                # async for chunk in openai_service.stream_chat_completion(messages, temperature=0.7, response_format={"type": "json_object"}):
-                #     yield f"data: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
-                
-                # 发送结束信号
-                # yield "data: [DONE]\n\n"
-            
-            else:
-                system_prompt, user_prompt = prompt_manager.generate_outline_prompt(request.overview, request.requirements)
-            
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
-                
-                # 流式返回目录生成结果
-                async for chunk in openai_service.stream_chat_completion(messages, temperature=0.7, response_format={"type": "json_object"}):
-                    yield f"data: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
-                
-                # 发送结束信号
-                yield "data: [DONE]\n\n"
+            try:
+                merged_requirements = request.requirements
+                if request.uploaded_expand and request.old_outline:
+                    merged_requirements = (
+                        f"{request.requirements}\n\n"
+                        f"用户已有目录参考：\n{request.old_outline}"
+                    )
+
+                compute_task = asyncio.create_task(
+                    openai_service.generate_outline_v2(
+                        overview=request.overview,
+                        requirements=merged_requirements,
+                    )
+                )
+
+                while not compute_task.done():
+                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(1)
+
+                outline_json = json.dumps(await compute_task, ensure_ascii=False)
+                chunk_size = 256
+                for index in range(0, len(outline_json), chunk_size):
+                    piece = outline_json[index:index + chunk_size]
+                    yield f"data: {json.dumps({'chunk': piece}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                payload = {
+                    "chunk": "",
+                    "error": True,
+                    "message": f"目录生成失败: {str(e)}",
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            yield "data: [DONE]\n\n"
         
         return sse_response(generate())
-        
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"目录生成失败: {str(e)}")
-
-
-
-

@@ -4,13 +4,15 @@
 import { useState, useCallback } from 'react';
 import { AppState, ConfigData, OutlineData } from '../types';
 import { draftStorage } from '../utils/draftStorage';
+import { DEFAULT_PROVIDER_ID } from '../constants/providers';
 
 const initialState: AppState = {
   currentStep: 0,
   config: {
+    provider: DEFAULT_PROVIDER_ID,
     api_key: '',
     base_url: '',
-    model_name: 'gpt-3.5-turbo',
+    model_name: 'gpt-4.1-mini',
   },
   fileContent: '',
   projectOverview: '',
@@ -21,11 +23,9 @@ const initialState: AppState = {
 
 export const useAppState = () => {
   const [state, setState] = useState<AppState>(() => {
-    const draft = draftStorage.loadDraft();
-    return {
-      ...initialState,
-      ...(draft || {}),
-    };
+    // 按当前需求：页面刷新后回到全新工作台，不自动恢复旧草稿
+    draftStorage.clearAll();
+    return { ...initialState };
   });
 
   const updateConfig = useCallback((config: ConfigData) => {
