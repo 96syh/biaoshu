@@ -29,7 +29,12 @@ async def generate_outline(request: OutlineRequest):
                 # 后台计算主任务
                 compute_task = asyncio.create_task(openai_service.generate_outline_v2(
                     overview=request.overview,
-                    requirements=request.requirements
+                    requirements=request.requirements,
+                    analysis_report=(
+                        request.analysis_report.model_dump(mode="json")
+                        if request.analysis_report else None
+                    ),
+                    bid_mode=request.bid_mode.value if request.bid_mode else None,
                 ))
 
                 # 在等待计算完成期间发送心跳，保持连接（发送空字符串chunk）
@@ -100,6 +105,11 @@ async def generate_outline_stream(request: OutlineRequest):
                     openai_service.generate_outline_v2(
                         overview=request.overview,
                         requirements=merged_requirements,
+                        analysis_report=(
+                            request.analysis_report.model_dump(mode="json")
+                            if request.analysis_report else None
+                        ),
+                        bid_mode=request.bid_mode.value if request.bid_mode else None,
                     )
                 )
 

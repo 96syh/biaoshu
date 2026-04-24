@@ -1,0 +1,75 @@
+{
+  "id": "prompt-json-reliability",
+  "name": "prompt-json-reliability",
+  "title": "Harden prompt and JSON output reliability",
+  "description": "Review prompt construction, JSON extraction, schema validation, retries, and local model compatibility for outline and content generation.",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P1",
+  "creator": "songyuheng",
+  "assignee": "songyuheng",
+  "createdAt": "2026-04-24",
+  "completedAt": "2026-04-24",
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "current_phase": 6,
+  "next_action": [
+    {
+      "phase": 1,
+      "action": "brainstorm"
+    },
+    {
+      "phase": 2,
+      "action": "research"
+    },
+    {
+      "phase": 3,
+      "action": "implement"
+    },
+    {
+      "phase": 4,
+      "action": "check"
+    },
+    {
+      "phase": 5,
+      "action": "update-spec"
+    },
+    {
+      "phase": 6,
+      "action": "record-session"
+    }
+  ],
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "04-24-define-analysis-report-schema",
+    "04-24-add-analysis-report-endpoint",
+    "04-24-map-outline-to-requirements",
+    "04-24-pass-analysis-report-to-chapter-generation",
+    "04-24-add-compliance-review-step"
+  ],
+  "parent": null,
+  "relatedFiles": [
+    "docs/prompt-workflow.md",
+    "backend/app/utils/prompt_manager.py",
+    "backend/app/services/openai_service.py",
+    "backend/app/models/schemas.py",
+    "backend/app/routers/document.py",
+    "backend/app/routers/outline.py",
+    "backend/app/routers/content.py",
+    "backend/app/utils/outline_util.py",
+    "frontend/src/services/api.ts",
+    "frontend/src/types/index.ts",
+    "frontend/src/pages/DocumentAnalysis.tsx",
+    "frontend/src/pages/OutlineEdit.tsx",
+    "frontend/src/pages/ContentEdit.tsx",
+    "frontend/src/hooks/useAppState.ts",
+    "frontend/src/App.tsx"
+  ],
+  "notes": "Completed the structured prompt workflow: AnalysisReport schema and endpoint, outline requirement mappings, chapter-generation structured context, and pre-export ReviewReport compliance review. Verified backend syntax/imports and frontend production build.",
+  "meta": {}
+}

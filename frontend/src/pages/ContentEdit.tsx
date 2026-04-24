@@ -3,7 +3,7 @@
  */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { ConfigData, OutlineData, OutlineItem } from '../types';
+import { ConfigData, OutlineData, OutlineItem, ReviewReport } from '../types';
 import {
   DocumentTextIcon,
   PlayIcon,
@@ -13,6 +13,8 @@ import {
   SparklesIcon,
   ChevronRightIcon,
   ClockIcon,
+  ExclamationTriangleIcon,
+  ShieldCheckIcon,
 } from '@heroicons/react/24/outline';
 import { configApi, contentApi, ChapterContentRequest, documentApi } from '../services/api';
 import { saveAs } from 'file-saver';
@@ -51,6 +53,60 @@ const truncateText = (text: string, maxLength: number) => {
     return '';
   }
   return text.length > maxLength ? `${text.slice(0, maxLength).trim()}...` : text;
+};
+
+const extractJsonPayload = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith('```')) {
+    return trimmed
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+  }
+
+  const objectStart = trimmed.indexOf('{');
+  const arrayStart = trimmed.indexOf('[');
+  const starts = [objectStart, arrayStart].filter(index => index >= 0);
+  if (starts.length === 0) {
+    return trimmed;
+  }
+
+  const start = Math.min(...starts);
+  const opening = trimmed[start];
+  const closing = opening === '{' ? '}' : ']';
+  const end = trimmed.lastIndexOf(closing);
+  return end > start ? trimmed.slice(start, end + 1).trim() : trimmed;
+};
+
+const buildReviewBlockingText = (report: ReviewReport): string => {
+  const contractIssues = [
+    ...(report.fixed_format_issues || []),
+    ...(report.signature_issues || []),
+    ...(report.price_rule_issues || []),
+    ...(report.evidence_chain_issues || []),
+    ...(report.page_reference_issues || []),
+  ]
+    .filter(item => item.blocking)
+    .map(item => `${item.item_id || '未编号问题'}：${item.issue}`);
+
+  const issues = [
+    ...report.coverage
+      .filter(item => !item.covered)
+      .map(item => `${item.item_id || '未编号要求'}未覆盖${item.issue ? `：${item.issue}` : ''}`),
+    ...report.rejection_risks
+      .filter(item => !item.handled)
+      .map(item => `${item.risk_id || '未编号风险'}未处理${item.issue ? `：${item.issue}` : ''}`),
+    ...report.fabrication_risks
+      .map(item => `${item.chapter_id || '未定位章节'}疑似虚构：${item.reason || item.text}`),
+    ...contractIssues,
+  ].filter(Boolean);
+
+  const summary = `审校未通过：${report.summary.blocking_issues} 个阻塞问题，${report.summary.warnings} 个警告。`;
+  return issues.length > 0 ? `${summary}${issues.slice(0, 3).join('；')}` : summary;
 };
 
 const buildPreviewPlaceholder = (item: OutlineItem, projectName: string) => {
@@ -95,6 +151,64 @@ const getBatchStrategy = (config?: ConfigData | null) => {
   };
 };
 
+const buildReviewGroups = (report: ReviewReport) => [
+  {
+    title: '覆盖性',
+    count: report.coverage.filter(item => !item.covered).length,
+    items: report.coverage
+      .filter(item => !item.covered)
+      .map(item => `${item.item_id || '未编号要求'}：${item.issue || '未覆盖'}`),
+  },
+  {
+    title: '缺料',
+    count: report.missing_materials.length,
+    items: report.missing_materials
+      .map(item => `${item.material_id || '未编号材料'}：${item.placeholder || item.chapter_ids.join('、')}`),
+  },
+  {
+    title: '废标风险',
+    count: report.rejection_risks.filter(item => !item.handled).length,
+    items: report.rejection_risks
+      .filter(item => !item.handled)
+      .map(item => `${item.risk_id || '未编号风险'}：${item.issue || '未处理'}`),
+  },
+  {
+    title: '固定格式',
+    count: (report.fixed_format_issues || []).length,
+    items: (report.fixed_format_issues || []).map(item => `${item.item_id || '格式项'}：${item.issue}`),
+  },
+  {
+    title: '签章',
+    count: (report.signature_issues || []).length,
+    items: (report.signature_issues || []).map(item => `${item.item_id || '签章项'}：${item.issue}`),
+  },
+  {
+    title: '报价',
+    count: (report.price_rule_issues || []).length,
+    items: (report.price_rule_issues || []).map(item => `${item.item_id || '报价项'}：${item.issue}`),
+  },
+  {
+    title: '证据链',
+    count: (report.evidence_chain_issues || []).length,
+    items: (report.evidence_chain_issues || []).map(item => `${item.item_id || '证据链'}：${item.issue}`),
+  },
+  {
+    title: '页码索引',
+    count: (report.page_reference_issues || []).length,
+    items: (report.page_reference_issues || []).map(item => `${item.item_id || '页码项'}：${item.issue}`),
+  },
+  {
+    title: '疑似虚构',
+    count: report.fabrication_risks.length,
+    items: report.fabrication_risks.map(item => `${item.chapter_id || '未定位章节'}：${item.reason || item.text}`),
+  },
+  {
+    title: '重复',
+    count: report.duplication_issues.length,
+    items: report.duplication_issues.map(item => `${item.chapter_ids.join('、')}：${item.issue}`),
+  },
+].filter(group => group.count > 0 || group.items.length > 0);
+
 
 const ContentEdit: React.FC<ContentEditProps> = ({
   outlineData,
@@ -111,6 +225,8 @@ const ContentEdit: React.FC<ContentEditProps> = ({
   });
   const [message, setMessage] = useState<StatusMessage | null>(null);
   const [leafItems, setLeafItems] = useState<OutlineItem[]>([]);
+  const [reviewing, setReviewing] = useState(false);
+  const [lastReviewReport, setLastReviewReport] = useState<ReviewReport | null>(null);
   const [showScrollToTop, setShowScrollToTop] = useState(false);
   const previewScrollRef = useRef<HTMLDivElement | null>(null);
   const previewNodeRefs = useRef<Record<string, HTMLElement | null>>({});
@@ -287,12 +403,25 @@ const ContentEdit: React.FC<ContentEditProps> = ({
       // 获取上级章节和同级章节信息
       const parentChapters = getParentChapters(item.id, outlineData.outline);
       const siblingChapters = getSiblingChapters(item.id, outlineData.outline);
+      const generatedSummaries = leafItems
+        .filter(leaf => leaf.id !== item.id && leaf.content?.trim())
+        .slice(-20)
+        .map(leaf => ({
+          chapter_id: leaf.id,
+          summary: truncateText(`${leaf.title}：${leaf.content || ''}`, 300),
+        }));
 
       const request: ChapterContentRequest = {
         chapter: item,
         parent_chapters: parentChapters,
         sibling_chapters: siblingChapters,
-        project_overview: projectOverview
+        project_overview: projectOverview,
+        analysis_report: outlineData.analysis_report,
+        bid_mode: outlineData.bid_mode || outlineData.analysis_report?.bid_mode_recommendation,
+        generated_summaries: generatedSummaries,
+        enterprise_materials: (outlineData.analysis_report?.required_materials || [])
+          .filter(material => material.status === 'provided'),
+        missing_materials: outlineData.analysis_report?.missing_company_materials || [],
       };
 
       const response = await contentApi.generateChapterContentStream(request);
@@ -364,6 +493,7 @@ const ContentEdit: React.FC<ContentEditProps> = ({
 
     setIsGenerating(true);
     setMessage(null);
+    setLastReviewReport(null);
     setProgress({
       total: leafItems.length,
       completed: 0,
@@ -492,10 +622,49 @@ const ContentEdit: React.FC<ContentEditProps> = ({
         });
       };
 
+      const exportOutline = buildExportOutline(outlineData.outline);
+
+      if (outlineData.analysis_report) {
+        setReviewing(true);
+        setMessage(null);
+
+        const reviewResponse = await documentApi.reviewComplianceStream({
+          outline: exportOutline,
+          project_overview: outlineData.project_overview,
+          analysis_report: outlineData.analysis_report,
+          bid_mode: outlineData.bid_mode || outlineData.analysis_report.bid_mode_recommendation,
+        });
+
+        let reviewJson = '';
+        await consumeSseStream(reviewResponse, (parsed) => {
+          if (parsed.error) {
+            throw new Error(parsed.message || '导出前合规审校失败');
+          }
+          if (typeof parsed.chunk === 'string') {
+            reviewJson += parsed.chunk;
+          }
+        });
+
+        const reviewReport = JSON.parse(extractJsonPayload(reviewJson)) as ReviewReport;
+        setLastReviewReport(reviewReport);
+        if (!reviewReport.summary.ready_to_export) {
+          setMessage({
+            type: 'error',
+            text: buildReviewBlockingText(reviewReport),
+          });
+          return;
+        }
+
+        setMessage({
+          type: 'success',
+          text: `导出前审校通过：${reviewReport.summary.warnings} 个提示项。`,
+        });
+      }
+
       const exportPayload = {
         project_name: outlineData.project_name,
         project_overview: outlineData.project_overview,
-        outline: buildExportOutline(outlineData.outline),
+        outline: exportOutline,
       };
 
       const response = await documentApi.exportWord(exportPayload);
@@ -507,7 +676,10 @@ const ContentEdit: React.FC<ContentEditProps> = ({
       
     } catch (error) {
       console.error('导出失败:', error);
-      alert('导出失败，请重试');
+      const text = error instanceof Error ? error.message : '导出失败，请重试';
+      setMessage({ type: 'error', text });
+    } finally {
+      setReviewing(false);
     }
   };
 
@@ -522,6 +694,8 @@ const ContentEdit: React.FC<ContentEditProps> = ({
   const completedItems = leafItems.filter(item => item.content).length;
   const completionRate = leafItems.length > 0 ? Math.round((completedItems / leafItems.length) * 100) : 0;
   const totalWords = leafItems.reduce((sum, item) => sum + (item.content?.length || 0), 0);
+  const analysisReport = outlineData?.analysis_report;
+  const reviewGroups = lastReviewReport ? buildReviewGroups(lastReviewReport) : [];
 
   const openTopSection = (topSectionId: string) => {
     const firstEntry = chapterEntries.find((entry) => entry.topSection.id === topSectionId);
@@ -643,7 +817,7 @@ const ContentEdit: React.FC<ContentEditProps> = ({
                   </p>
                 </div>
 
-                <div className="grid gap-3 sm:grid-cols-3">
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                   <div className="soft-stat">
                     <span className="soft-stat__label">已完成章节</span>
                     <span className="soft-stat__value">{completedItems} / {leafItems.length}</span>
@@ -651,6 +825,14 @@ const ContentEdit: React.FC<ContentEditProps> = ({
                   <div className="soft-stat">
                     <span className="soft-stat__label">累计字数</span>
                     <span className="soft-stat__value">{totalWords}</span>
+                  </div>
+                  <div className="soft-stat">
+                    <span className="soft-stat__label">风控项</span>
+                    <span className="soft-stat__value">
+                      {analysisReport
+                        ? `${(analysisReport.fixed_format_forms || []).length + (analysisReport.signature_requirements || []).length + (analysisReport.evidence_chain_requirements || []).length} 项`
+                        : '未启用'}
+                    </span>
                   </div>
                   <div className="soft-stat">
                     <span className="soft-stat__label">当前预览</span>
@@ -664,7 +846,7 @@ const ContentEdit: React.FC<ContentEditProps> = ({
               <div className="flex flex-wrap items-center gap-3">
                 <button
                   onClick={handleGenerateContent}
-                  disabled={isGenerating}
+                  disabled={isGenerating || reviewing}
                   className="primary-button"
                 >
                   <PlayIcon className="mr-2 h-4 w-4" />
@@ -673,11 +855,11 @@ const ContentEdit: React.FC<ContentEditProps> = ({
 
                 <button
                   onClick={handleExportWord}
-                  disabled={isGenerating}
+                  disabled={isGenerating || reviewing}
                   className="secondary-button"
                 >
                   <DocumentArrowDownIcon className="mr-2 h-4 w-4" />
-                  导出Word
+                  {reviewing ? '审校中...' : '导出Word'}
                 </button>
               </div>
             </div>
@@ -711,6 +893,82 @@ const ContentEdit: React.FC<ContentEditProps> = ({
             >
               {message.text}
             </div>
+          )}
+
+          {(lastReviewReport || analysisReport) && (
+            <section className="surface-panel">
+              <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                <div>
+                  <p className="workspace-kicker">Compliance Review</p>
+                  <h3 className="mt-2 text-xl font-semibold tracking-[-0.03em] text-slate-950">导出前审校</h3>
+                  <p className="mt-2 text-sm leading-6 text-slate-600">
+                    {lastReviewReport
+                      ? `最近一次审校：${lastReviewReport.summary.blocking_issues} 个阻塞问题，${lastReviewReport.summary.warnings} 个警告。`
+                      : '生成结构化正文后，导出 Word 前会检查评分覆盖、固定格式、签章、报价、证据链和虚构风险。'}
+                  </p>
+                </div>
+                <div className={`inline-flex items-center gap-2 self-start rounded-full px-3 py-2 text-xs font-semibold ${
+                  lastReviewReport?.summary.ready_to_export
+                    ? 'border border-emerald-200 bg-emerald-50 text-emerald-700'
+                    : lastReviewReport
+                      ? 'border border-rose-200 bg-rose-50 text-rose-700'
+                      : 'border border-slate-200 bg-white/80 text-slate-500'
+                }`}>
+                  {lastReviewReport?.summary.ready_to_export ? (
+                    <ShieldCheckIcon className="h-4 w-4" />
+                  ) : (
+                    <ExclamationTriangleIcon className="h-4 w-4" />
+                  )}
+                  {lastReviewReport
+                    ? lastReviewReport.summary.ready_to_export ? '可导出' : '需处理'
+                    : '待审校'}
+                </div>
+              </div>
+
+              {lastReviewReport ? (
+                <div className="mt-5 grid gap-3 md:grid-cols-2">
+                  {reviewGroups.length > 0 ? reviewGroups.map(group => (
+                    <div key={group.title} className="surface-panel-soft">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <h4 className="text-sm font-semibold text-slate-900">{group.title}</h4>
+                        <span className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-slate-500">
+                          {group.count}
+                        </span>
+                      </div>
+                      <div className="space-y-2">
+                        {group.items.slice(0, 3).map((item, index) => (
+                          <p key={`${group.title}-${index}`} className="border-t border-slate-200/80 pt-2 text-xs leading-5 text-slate-600 first:border-t-0 first:pt-0">
+                            {item}
+                          </p>
+                        ))}
+                        {group.items.length > 3 && (
+                          <p className="text-xs font-medium text-slate-400">还有 {group.items.length - 3} 项未展开</p>
+                        )}
+                      </div>
+                    </div>
+                  )) : (
+                    <div className="surface-panel-soft md:col-span-2">
+                      <p className="text-sm text-slate-600">未发现阻塞或提示问题。</p>
+                    </div>
+                  )}
+                </div>
+              ) : analysisReport ? (
+                <div className="mt-5 grid gap-3 sm:grid-cols-3">
+                  <div className="soft-stat">
+                    <span className="soft-stat__label">固定格式</span>
+                    <span className="soft-stat__value">{(analysisReport.fixed_format_forms || []).length} 项</span>
+                  </div>
+                  <div className="soft-stat">
+                    <span className="soft-stat__label">签章要求</span>
+                    <span className="soft-stat__value">{(analysisReport.signature_requirements || []).length} 项</span>
+                  </div>
+                  <div className="soft-stat">
+                    <span className="soft-stat__label">证据链</span>
+                    <span className="soft-stat__value">{(analysisReport.evidence_chain_requirements || []).length} 项</span>
+                  </div>
+                </div>
+              ) : null}
+            </section>
           )}
 
           <section className="surface-panel">

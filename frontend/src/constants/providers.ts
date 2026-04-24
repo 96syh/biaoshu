@@ -5,6 +5,7 @@ export interface ProviderPreset {
   baseUrl: string;
   models: string[];
   requiresApiKey: boolean;
+  apiMode: 'auto' | 'chat' | 'responses' | 'anthropic';
   keyPlaceholder: string;
   note: string;
 }
@@ -17,6 +18,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://api.openai.com/v1',
     models: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini'],
     requiresApiKey: true,
+    apiMode: 'chat',
     keyPlaceholder: '输入 OpenAI API Key',
     note: '适合英文能力、长上下文与高稳定性场景。',
   },
@@ -27,6 +29,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://api.openai.com/v1',
     models: ['gpt-5.2-codex', 'gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1-codex-max'],
     requiresApiKey: true,
+    apiMode: 'responses',
     keyPlaceholder: '输入 OpenAI API Key',
     note: '通过 OpenAI 官方接口接入，后端会自动切到 Responses API，适合代码、脚本和结构化生成任务。',
   },
@@ -37,6 +40,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://api.deepseek.com/v1',
     models: ['deepseek-chat', 'deepseek-reasoner'],
     requiresApiKey: true,
+    apiMode: 'chat',
     keyPlaceholder: '输入 DeepSeek API Key',
     note: '适合中文长文生成、技术方案和高性价比部署。',
   },
@@ -47,6 +51,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://api.anthropic.com',
     models: ['claude-sonnet-4-6', 'claude-opus-4-6'],
     requiresApiKey: true,
+    apiMode: 'anthropic',
     keyPlaceholder: '输入 Anthropic API Key',
     note: '支持官方 Claude 接口，也支持自定义 Claude 网关地址；模型同步走 /v1/models，生成走 /v1/messages。',
   },
@@ -57,6 +62,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/',
     models: ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-pro'],
     requiresApiKey: true,
+    apiMode: 'chat',
     keyPlaceholder: '输入 Gemini API Key',
     note: '适合速度优先、多模态工作流与 Google 生态调用。',
   },
@@ -67,6 +73,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     models: ['qwen-plus', 'qwen-max', 'qwen3-max'],
     requiresApiKey: true,
+    apiMode: 'chat',
     keyPlaceholder: '输入阿里云 DashScope API Key',
     note: '适合中文场景、本地政企客户以及通义模型栈。',
   },
@@ -77,6 +84,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://api.moonshot.cn/v1',
     models: ['kimi-k2.5', 'kimi-k2', 'kimi-k2-thinking'],
     requiresApiKey: true,
+    apiMode: 'chat',
     keyPlaceholder: '输入 Moonshot API Key',
     note: '适合中文长文本、资料梳理与提案生成。',
   },
@@ -87,8 +95,20 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://openrouter.ai/api/v1',
     models: ['openai/gpt-4.1-mini', 'anthropic/claude-sonnet-4-6', 'google/gemini-2.5-flash'],
     requiresApiKey: true,
+    apiMode: 'chat',
     keyPlaceholder: '输入 OpenRouter API Key',
     note: '适合需要统一切换 GPT / Claude / Gemini 的团队。',
+  },
+  {
+    id: 'litellm',
+    label: 'LiteLLM Proxy',
+    caption: '统一 OpenAI 格式网关',
+    baseUrl: 'http://localhost:4000',
+    models: ['gpt-4.1-mini', 'anthropic/claude-sonnet-4-5', 'gemini/gemini-2.5-flash', 'ollama/qwen3:8b'],
+    requiresApiKey: false,
+    apiMode: 'auto',
+    keyPlaceholder: 'LiteLLM master key / virtual key，可选',
+    note: '把 OpenAI、Claude、Gemini、Ollama、OpenRouter 等统一成 OpenAI 格式；推荐团队部署为统一模型网关。',
   },
   {
     id: 'ollama',
@@ -97,6 +117,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'http://localhost:11434/v1',
     models: ['llama3.2', 'qwen3:8b', 'gpt-oss:20b'],
     requiresApiKey: false,
+    apiMode: 'chat',
     keyPlaceholder: '本地模式通常不需要 API Key',
     note: '适合离线内网、私有部署与本地推理实验。',
   },
@@ -107,6 +128,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: '',
     models: [],
     requiresApiKey: false,
+    apiMode: 'auto',
     keyPlaceholder: '代理 / 网关 / 本地兼容层可选填',
     note: '支持 OpenAI 兼容网关，也会在失败后自动尝试 Claude 原生协议。若同步失败，通常是 API Key 无效或网关未开放模型列表。',
   },

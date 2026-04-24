@@ -73,6 +73,19 @@ PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "requires_api_key": True,
         "supports_model_listing": True,
     },
+    "litellm": {
+        "label": "LiteLLM Proxy",
+        "base_url": "http://localhost:4000",
+        "models": [
+            "gpt-4.1-mini",
+            "anthropic/claude-sonnet-4-5",
+            "gemini/gemini-2.5-flash",
+            "ollama/qwen3:8b",
+        ],
+        "requires_api_key": False,
+        "supports_model_listing": True,
+        "api_mode": "auto",
+    },
     "ollama": {
         "label": "Ollama",
         "base_url": "http://localhost:11434/v1",
@@ -124,23 +137,47 @@ def provider_supports_model_listing(provider: str | None) -> bool:
     return bool(get_provider_preset(provider).get("supports_model_listing", False))
 
 
-def provider_uses_responses_api(provider: str | None, model_name: str | None) -> bool:
-    """判断当前 provider / model 是否应该走 Responses API"""
-    preset = get_provider_preset(provider)
-    if preset.get("api_mode") == "responses":
-        return True
+def normalize_api_mode(api_mode: str | None) -> str:
+    """规范化 API 协议模式"""
+    normalized = (api_mode or "auto").strip().lower()
+    return normalized if normalized in {"auto", "chat", "responses", "anthropic"} else "auto"
 
-    if (provider or "").lower() == "custom":
+
+def get_provider_api_mode(provider: str | None, api_mode: str | None = None) -> str:
+    """解析供应商最终 API 协议模式"""
+    explicit_mode = normalize_api_mode(api_mode)
+    if explicit_mode != "auto":
+        return explicit_mode
+
+    preset_mode = get_provider_preset(provider).get("api_mode")
+    if preset_mode in {"chat", "responses", "anthropic"}:
+        return preset_mode
+    return "auto"
+
+
+def provider_uses_responses_api(
+    provider: str | None,
+    model_name: str | None,
+    api_mode: str | None = None,
+) -> bool:
+    """判断当前 provider / model 是否应该走 Responses API"""
+    resolved_mode = get_provider_api_mode(provider, api_mode)
+    if resolved_mode == "responses":
+        return True
+    if resolved_mode in {"chat", "anthropic"}:
         return False
 
     normalized_model = (model_name or "").lower()
     return "codex" in normalized_model
 
 
-def provider_uses_anthropic_api(provider: str | None, model_name: str | None) -> bool:
+def provider_uses_anthropic_api(
+    provider: str | None,
+    model_name: str | None,
+    api_mode: str | None = None,
+) -> bool:
     """判断当前 provider 是否应直接走 Anthropic 原生接口"""
-    preset = get_provider_preset(provider)
-    return preset.get("api_mode") == "anthropic"
+    return get_provider_api_mode(provider, api_mode) == "anthropic"
 
 
 def normalize_base_url(provider: str | None, base_url: str | None) -> str:
@@ -179,7 +216,7 @@ def normalize_base_url(provider: str | None, base_url: str | None) -> str:
         return normalized
 
     path = parsed.path.rstrip("/")
-    for suffix in ("/chat/completions", "/completions", "/responses", "/models"):
+    for suffix in ("/chat/completions", "/completions", "/responses", "/messages", "/models"):
         if path.endswith(suffix):
             path = path[: -len(suffix)]
             break

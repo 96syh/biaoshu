@@ -3,17 +3,20 @@ import openai
 from typing import Dict, Any, List, AsyncGenerator
 import json
 import asyncio
-import aiohttp
 import re
+import aiohttp
 
 from ..utils.outline_util import get_random_indexes, calculate_nodes_distribution, generate_one_outline_json_by_level1
-from ..utils.json_util import check_json, extract_json_string
+from ..utils import prompt_manager
+from ..utils.json_util import check_json
 from ..utils.config_manager import config_manager
+from ..models.schemas import AnalysisReport, ReviewReport
 from ..utils.provider_registry import (
     DEFAULT_PROVIDER,
     get_base_url_candidates,
     get_default_base_url,
     get_default_models,
+    get_provider_api_mode,
     normalize_base_url,
     provider_supports_model_listing,
     provider_uses_anthropic_api,
@@ -25,14 +28,14 @@ from ..utils.provider_registry import (
 class OpenAIService:
     """多模型服务类"""
     
-    def __init__(self):
-        """初始化模型服务，从 config_manager 读取配置"""
-        # 从配置管理器加载配置
-        config = config_manager.load_config()
-        self.provider = config.get('provider', DEFAULT_PROVIDER)
-        self.api_key = config.get('api_key', '')
-        self.base_url = config.get('base_url', '')
-        self.model_name = config.get('model_name', 'gpt-4.1-mini')
+    def __init__(self, config: Dict[str, Any] | None = None):
+        """初始化模型服务，支持传入运行时配置覆盖已保存配置"""
+        runtime_config = dict(config or config_manager.load_config())
+        self.provider = runtime_config.get('provider', DEFAULT_PROVIDER)
+        self.api_key = runtime_config.get('api_key', '')
+        self.base_url = runtime_config.get('base_url', '')
+        self.model_name = runtime_config.get('model_name', 'gpt-4.1-mini')
+        self.api_mode = get_provider_api_mode(self.provider, runtime_config.get('api_mode', 'auto'))
         self.normalized_base_url = normalize_base_url(self.provider, self.base_url)
         self.base_url_candidates = get_base_url_candidates(self.provider, self.base_url)
         self.resolved_base_url = (
@@ -40,8 +43,16 @@ class OpenAIService:
             if self.base_url_candidates
             else (self.normalized_base_url or get_default_base_url(self.provider))
         )
-        self.uses_anthropic_api = provider_uses_anthropic_api(self.provider, self.model_name)
-        self.uses_responses_api = provider_uses_responses_api(self.provider, self.model_name)
+        self.uses_anthropic_api = provider_uses_anthropic_api(
+            self.provider,
+            self.model_name,
+            self.api_mode,
+        )
+        self.uses_responses_api = provider_uses_responses_api(
+            self.provider,
+            self.model_name,
+            self.api_mode,
+        )
 
         # 统一走 OpenAI SDK，兼容 OpenAI / Claude / Gemini / DeepSeek / Ollama 等兼容端点
         self.client = self._create_client(self.resolved_base_url)
@@ -68,71 +79,81 @@ class OpenAIService:
             normalized_base = f"{normalized_base}/v1"
         return f"{normalized_base}{normalized_path}"
 
-    def _get_openai_http_headers(self) -> dict[str, str]:
-        """构造 OpenAI 兼容协议所需请求头"""
-        return {
-            "Authorization": f"Bearer {resolve_api_key(self.provider, self.api_key)}",
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
+    @staticmethod
+    def _response_format_requires_json_guard(response_format: dict | None) -> bool:
+        """判断当前响应格式是否需要额外的 JSON 输出约束"""
+        if not response_format:
+            return False
+        return response_format.get("type") in {"json_object", "json_schema"}
+
+    def _augment_messages_for_json_output(self, messages: list, response_format: dict | None) -> list:
+        """为不支持 response_format 的本地兼容端点追加 JSON 纯输出约束"""
+        if not self._response_format_requires_json_guard(response_format):
+            return messages
+
+        json_guard = (
+            "你必须只输出合法 JSON，不要输出 markdown 代码块，不要输出解释性文字，"
+            "不要在 JSON 前后添加任何多余内容。"
+        )
+
+        augmented_messages: list[dict[str, Any]] = []
+        appended_to_system = False
+        for message in messages:
+            cloned = dict(message)
+            if not appended_to_system and cloned.get("role") == "system":
+                original_content = str(cloned.get("content", "")).strip()
+                cloned["content"] = f"{original_content}\n\n{json_guard}" if original_content else json_guard
+                appended_to_system = True
+            augmented_messages.append(cloned)
+
+        if not appended_to_system:
+            augmented_messages.insert(0, {"role": "system", "content": json_guard})
+
+        return augmented_messages
 
     @staticmethod
-    def _extract_openai_content(payload: dict[str, Any]) -> str:
-        """从 OpenAI 兼容响应中提取文本内容"""
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
+    def _extract_json_payload(full_content: str) -> str:
+        """尽量从模型返回中提取纯 JSON 文本，兼容本地模型常见的代码块包裹"""
+        if not isinstance(full_content, str):
+            return full_content
 
-        choice = choices[0] or {}
-        delta = choice.get("delta") or {}
-        if delta.get("content"):
-            return str(delta["content"])
+        candidate = full_content.strip()
+        if not candidate:
+            return candidate
 
-        message = choice.get("message") or {}
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            text_parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
-                    text_parts.append(str(item["text"]))
-            return "".join(text_parts)
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s*```$", "", candidate)
+            candidate = candidate.strip()
 
-        return ""
+        first_positions = [pos for pos in (candidate.find("{"), candidate.find("[")) if pos != -1]
+        if first_positions:
+            start = min(first_positions)
+            opening = candidate[start]
+            closing = "}" if opening == "{" else "]"
+            end = candidate.rfind(closing)
+            if end != -1 and end > start:
+                sliced = candidate[start:end + 1].strip()
+                if sliced:
+                    return sliced
 
-    async def _resolve_custom_model_name(self) -> str:
-        """为 custom provider 自动纠正失效模型名，避免沿用陈旧配置"""
-        if self.provider != "custom":
-            return self.model_name
+        return candidate
 
-        try:
-            available_models = await self._get_openai_compatible_models_http()
-        except Exception:
-            return self.model_name
+    @staticmethod
+    def _raise_if_gateway_error(payload: Any) -> None:
+        """识别 OpenAI 兼容网关用 200 响应包裹的业务错误"""
+        if not hasattr(payload, "model_dump"):
+            return
 
-        if not available_models or self.model_name in available_models:
-            return self.model_name
+        data = payload.model_dump()
+        base_resp = data.get("base_resp")
+        if not isinstance(base_resp, dict):
+            return
 
-        normalized_requested = (self.model_name or "").lower()
-        family_tokens = [token for token in re.split(r"[-_/.:]", normalized_requested) if len(token) >= 3]
-
-        fallback_model = next(
-            (
-                model
-                for model in available_models
-                if any(token in model.lower() for token in family_tokens)
-            ),
-            None,
-        )
-        if fallback_model is None:
-            fallback_model = next((model for model in available_models if "sonnet" in model.lower()), None)
-        if fallback_model is None:
-            fallback_model = available_models[0]
-
-        print(f"custom provider 检测到无效模型 {self.model_name}，自动切换为 {fallback_model}")
-        self.model_name = fallback_model
-        return self.model_name
+        status_code = base_resp.get("status_code")
+        status_msg = base_resp.get("status_msg") or base_resp.get("message") or "unknown error"
+        if status_code not in (None, 0, "0"):
+            raise Exception(f"模型网关返回错误: {status_msg} ({status_code})")
     
     async def get_available_models(self) -> List[str]:
         """获取可用的模型列表"""
@@ -168,11 +189,7 @@ class OpenAIService:
             except Exception as e:
                 last_error = e
 
-        if self.provider == "custom":
-            try:
-                return await self._get_openai_compatible_models_http()
-            except Exception as http_error:
-                last_error = http_error
+        if self.provider == "custom" and self.api_mode == "auto":
             try:
                 return await self._get_anthropic_models()
             except Exception as anthropic_error:
@@ -200,9 +217,6 @@ class OpenAIService:
         response_format: dict = None
     ) -> AsyncGenerator[str, None]:
         """流式聊天完成请求 - 真正的异步实现"""
-        if self.provider == "custom":
-            await self._resolve_custom_model_name()
-
         if self.uses_anthropic_api:
             async for chunk in self._stream_anthropic_completion(
                 messages=messages,
@@ -228,33 +242,44 @@ class OpenAIService:
                         yield chunk
                     return
 
-                stream = await self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=temperature,
-                    stream=True,
-                    **({"response_format": response_format} if response_format is not None else {})
-                )
+                request_kwargs: Dict[str, Any] = {}
+                if response_format is not None:
+                    request_kwargs["response_format"] = response_format
 
+                try:
+                    stream = await self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=messages,
+                        temperature=temperature,
+                        stream=True,
+                        **request_kwargs,
+                    )
+                except Exception:
+                    if response_format is None:
+                        raise
+                    fallback_messages = self._augment_messages_for_json_output(messages, response_format)
+                    stream = await self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=fallback_messages,
+                        temperature=temperature,
+                        stream=True,
+                    )
+
+                received_content = False
                 async for chunk in stream:
+                    self._raise_if_gateway_error(chunk)
+                    if not chunk.choices:
+                        continue
                     if chunk.choices[0].delta.content is not None:
+                        received_content = True
                         yield chunk.choices[0].delta.content
+                if not received_content:
+                    raise Exception("模型返回空流式内容，请确认 Base URL 指向真实 API 路径而不是管理后台页面")
                 return
             except Exception as e:
                 last_error = e
 
-        if self.provider == "custom":
-            try:
-                async for chunk in self._stream_openai_compatible_completion(
-                    messages=messages,
-                    temperature=temperature,
-                    response_format=response_format,
-                ):
-                    yield chunk
-                return
-            except Exception as http_error:
-                last_error = http_error
-
+        if self.provider == "custom" and self.api_mode == "auto":
             try:
                 async for chunk in self._stream_anthropic_completion(
                     messages=messages,
@@ -307,43 +332,6 @@ class OpenAIService:
                 last_error = e
 
         raise Exception(f"获取 Claude 模型列表失败: {str(last_error)}") from last_error
-
-    async def _get_openai_compatible_models_http(self) -> List[str]:
-        """使用原生 HTTP 获取 OpenAI 兼容模型列表，兼容被 SDK 拦截的网关"""
-        headers = self._get_openai_http_headers()
-        last_error: Exception | None = None
-
-        for candidate in self._iter_base_urls():
-            endpoint = self._join_endpoint(candidate or "", "/models", force_v1=True)
-            try:
-                timeout = aiohttp.ClientTimeout(total=30)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(endpoint, headers=headers) as response:
-                        payload = await response.text()
-                        if response.status >= 400:
-                            raise Exception(payload[:500])
-
-                        data = json.loads(payload)
-                        models = []
-                        for item in data.get("data", []):
-                            model_id = item.get("id", "")
-                            normalized_id = model_id.lower()
-                            if any(keyword in normalized_id for keyword in [
-                                "gpt", "claude", "chat", "llama", "qwen", "deepseek",
-                                "gemini", "moonshot", "kimi", "glm", "mistral", "codex", "gpt-5",
-                            ]):
-                                models.append(model_id)
-
-                        normalized_models = sorted(list(set(models)))
-                        if normalized_models:
-                            self.resolved_base_url = candidate or ""
-                            return normalized_models
-
-                        raise Exception("未找到可用的对话模型")
-            except Exception as e:
-                last_error = e
-
-        raise Exception(f"HTTP 模型列表获取失败: {str(last_error)}") from last_error
 
     async def _stream_anthropic_completion(
         self,
@@ -416,66 +404,6 @@ class OpenAIService:
 
         raise Exception(f"Claude 接口调用失败: {str(last_error)}") from last_error
 
-    async def _stream_openai_compatible_completion(
-        self,
-        messages: list,
-        temperature: float = 0.7,
-        response_format: dict | None = None,
-    ) -> AsyncGenerator[str, None]:
-        """使用原生 HTTP 调用 OpenAI 兼容聊天接口，兼容被 SDK 拦截的网关"""
-        headers = self._get_openai_http_headers()
-        body: Dict[str, Any] = {
-            "model": self.model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": True,
-        }
-        if response_format is not None:
-            body["response_format"] = response_format
-
-        last_error: Exception | None = None
-        for candidate in self._iter_base_urls():
-            endpoint = self._join_endpoint(candidate or "", "/chat/completions", force_v1=True)
-            try:
-                timeout = aiohttp.ClientTimeout(total=300)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(endpoint, headers=headers, json=body) as response:
-                        payload = await response.text() if response.content_type == "application/json" else None
-                        if response.status >= 400:
-                            error_text = payload if payload is not None else await response.text()
-                            raise Exception(error_text[:1000])
-
-                        if payload is not None:
-                            data = json.loads(payload)
-                            content = self._extract_openai_content(data)
-                            if not content:
-                                raise Exception("OpenAI 兼容接口返回内容为空")
-                            self.resolved_base_url = candidate or ""
-                            yield content
-                            return
-
-                        async for raw_line in response.content:
-                            line = raw_line.decode("utf-8", errors="ignore").strip()
-                            if not line or not line.startswith("data: "):
-                                continue
-
-                            data_line = line[6:]
-                            if data_line == "[DONE]":
-                                self.resolved_base_url = candidate or ""
-                                return
-
-                            chunk_payload = json.loads(data_line)
-                            content = self._extract_openai_content(chunk_payload)
-                            if content:
-                                yield content
-
-                        self.resolved_base_url = candidate or ""
-                        return
-            except Exception as e:
-                last_error = e
-
-        raise Exception(f"OpenAI 兼容接口调用失败: {str(last_error)}") from last_error
-
     @staticmethod
     def _build_responses_text_config(response_format: dict | None) -> dict | None:
         """将 Chat Completions 的 response_format 映射为 Responses API 的 text.format"""
@@ -540,19 +468,82 @@ class OpenAIService:
             full_content += chunk
         return full_content
 
-    @staticmethod
-    def _ensure_json_only_messages(messages: list) -> list:
-        """为不支持 response_format 的模型补一层纯 JSON 输出约束"""
-        json_rule = "输出要求：只返回合法 JSON，不要输出 ```json 代码块，不要输出任何解释、前言或结语。"
-        normalized_messages = [dict(message) for message in messages]
+    async def verify_current_endpoint(self) -> Dict[str, Any]:
+        """验证当前供应商配置是否可列模型并可发起一次对话"""
+        checks: list[dict[str, Any]] = []
+        visible_candidates = [candidate for candidate in self.base_url_candidates if candidate]
+        models_ok = False
+        chat_ok = False
+        models_error = ""
+        chat_error = ""
 
-        for index, message in enumerate(normalized_messages):
-            if message.get("role") in {"system", "developer"}:
-                content = str(message.get("content", "")).strip()
-                normalized_messages[index]["content"] = f"{content}\n\n{json_rule}" if content else json_rule
-                return normalized_messages
+        try:
+            models = await self.get_available_models()
+            models_ok = True
+            checks.append({
+                "stage": "models",
+                "success": True,
+                "detail": f"获取到 {len(models)} 个模型",
+                "url": self.resolved_base_url or self.normalized_base_url or "",
+                "model_name": self.model_name,
+                "models": models[:20],
+            })
+        except Exception as exc:
+            models_error = str(exc)
+            checks.append({
+                "stage": "models",
+                "success": False,
+                "detail": models_error,
+                "url": self.resolved_base_url or self.normalized_base_url or "",
+                "model_name": self.model_name,
+            })
 
-        return [{"role": "system", "content": json_rule}, *normalized_messages]
+        try:
+            sample = await self._collect_stream_text(
+                messages=[{"role": "user", "content": "请只回复 OK"}],
+                temperature=0,
+            )
+            if not sample.strip():
+                raise Exception("模型返回空内容，请确认 Base URL、模型名和 API Key 是否正确")
+            chat_ok = True
+            checks.append({
+                "stage": "chat",
+                "success": True,
+                "detail": "对话请求成功",
+                "url": self.resolved_base_url or self.normalized_base_url or "",
+                "model_name": self.model_name,
+                "sample": sample.strip()[:200],
+            })
+        except Exception as exc:
+            chat_error = str(exc)
+            checks.append({
+                "stage": "chat",
+                "success": False,
+                "detail": chat_error,
+                "url": self.resolved_base_url or self.normalized_base_url or "",
+                "model_name": self.model_name,
+            })
+
+        if models_ok and chat_ok:
+            message = "端点验证成功"
+        elif chat_ok:
+            message = f"模型列表验证失败，但对话请求成功: {models_error}"
+        elif models_ok:
+            message = f"对话请求验证失败: {chat_error}"
+        else:
+            message = f"模型列表与对话请求均失败: {chat_error or models_error}"
+
+        return {
+            "success": chat_ok,
+            "message": message,
+            "provider": self.provider,
+            "normalized_base_url": self.normalized_base_url or "",
+            "resolved_base_url": self.resolved_base_url or "",
+            "base_url_candidates": visible_candidates,
+            "model_name": self.model_name,
+            "api_mode": self.api_mode,
+            "checks": checks,
+        }
 
     async def _generate_with_json_check(
         self,
@@ -571,29 +562,16 @@ class OpenAIService:
         """
         attempt = 0
         last_error_msg = ""
-        active_messages = messages
-        active_response_format = response_format
-        response_format_fallback_used = False
 
         while True:
-            try:
-                full_content = await self._collect_stream_text(
-                    active_messages,
-                    temperature=temperature,
-                    response_format=active_response_format,
-                )
-            except Exception as e:
-                if active_response_format is not None and not response_format_fallback_used:
-                    response_format_fallback_used = True
-                    active_response_format = None
-                    active_messages = self._ensure_json_only_messages(messages)
-                    last_error_msg = str(e)
-                    print(f"{log_prefix or 'JSON生成'} response_format 不兼容，回退到纯提示词 JSON 模式：{last_error_msg}")
-                    continue
-                raise
+            full_content = await self._collect_stream_text(
+                messages,
+                temperature=temperature,
+                response_format=response_format,
+            )
 
-            normalized_content = extract_json_string(str(full_content))
-            isok, error_msg = check_json(normalized_content, schema)
+            normalized_content = self._extract_json_payload(str(full_content))
+            isok, error_msg = check_json(str(normalized_content), schema)
             if isok:
                 return normalized_content
 
@@ -611,7 +589,90 @@ class OpenAIService:
             print(f"{prefix}check_json 校验失败，进行第 {attempt}/{max_retries} 次重试：{last_error_msg}")
             await asyncio.sleep(0.5)
 
-    async def generate_content_for_outline(self, outline: Dict[str, Any], project_overview: str = "") -> Dict[str, Any]:
+    async def _generate_pydantic_json(
+        self,
+        messages: list,
+        model_cls: type,
+        max_retries: int = 3,
+        temperature: float = 0.3,
+        response_format: dict | None = None,
+        log_prefix: str = "",
+    ) -> Dict[str, Any]:
+        """生成 JSON 并使用 Pydantic 模型校验，适合允许空数组的结构化结果"""
+        attempt = 0
+        last_error_msg = ""
+
+        while True:
+            full_content = await self._collect_stream_text(
+                messages,
+                temperature=temperature,
+                response_format=response_format,
+            )
+            normalized_content = self._extract_json_payload(str(full_content))
+
+            try:
+                parsed = model_cls.model_validate_json(str(normalized_content))
+                return parsed.model_dump(mode="json")
+            except Exception as e:
+                last_error_msg = str(e)
+                prefix = f"{log_prefix} " if log_prefix else ""
+
+                if attempt >= max_retries:
+                    print(f"{prefix}Pydantic JSON 校验失败，已达到最大重试次数({max_retries})：{last_error_msg}")
+                    raise Exception(f"{prefix}Pydantic JSON 校验失败: {last_error_msg}") from e
+
+                attempt += 1
+                print(f"{prefix}Pydantic JSON 校验失败，进行第 {attempt}/{max_retries} 次重试：{last_error_msg}")
+                await asyncio.sleep(0.5)
+
+    async def generate_analysis_report(self, file_content: str) -> Dict[str, Any]:
+        """从招标文件全文生成结构化标准解析报告"""
+        system_prompt, user_prompt = prompt_manager.generate_analysis_report_prompt(file_content)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return await self._generate_pydantic_json(
+            messages=messages,
+            model_cls=AnalysisReport,
+            max_retries=3,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            log_prefix="标准解析报告",
+        )
+
+    async def generate_compliance_review(
+        self,
+        outline: list,
+        analysis_report: Dict[str, Any] | None = None,
+        project_overview: str = "",
+    ) -> Dict[str, Any]:
+        """生成导出前合规审校报告"""
+        system_prompt, user_prompt = prompt_manager.generate_compliance_review_prompt(
+            analysis_report=analysis_report,
+            outline=outline,
+            project_overview=project_overview,
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return await self._generate_pydantic_json(
+            messages=messages,
+            model_cls=ReviewReport,
+            max_retries=3,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            log_prefix="合规审校",
+        )
+
+    async def generate_content_for_outline(
+        self,
+        outline: Dict[str, Any],
+        project_overview: str = "",
+        analysis_report: Dict[str, Any] | None = None,
+        bid_mode: str | None = None,
+    ) -> Dict[str, Any]:
         """为目录结构生成内容"""
         try:
             if not isinstance(outline, dict) or 'outline' not in outline:
@@ -622,14 +683,27 @@ class OpenAIService:
             result_outline = copy.deepcopy(outline)
             
             # 递归处理目录
-            await self._process_outline_recursive(result_outline['outline'], [], project_overview)
+            await self._process_outline_recursive(
+                result_outline['outline'],
+                [],
+                project_overview,
+                analysis_report=analysis_report,
+                bid_mode=bid_mode,
+            )
             
             return result_outline
             
         except Exception as e:
             raise Exception(f"处理过程中发生错误: {str(e)}")
     
-    async def _process_outline_recursive(self, chapters: list, parent_chapters: list = None, project_overview: str = ""):
+    async def _process_outline_recursive(
+        self,
+        chapters: list,
+        parent_chapters: list = None,
+        project_overview: str = "",
+        analysis_report: Dict[str, Any] | None = None,
+        bid_mode: str | None = None,
+    ):
         """递归处理章节列表"""
         for chapter in chapters:
             chapter_id = chapter.get('id', 'unknown')
@@ -658,16 +732,35 @@ class OpenAIService:
                     chapter, 
                     current_parent_chapters[:-1],  # 上级章节列表（排除当前章节）
                     chapters,  # 同级章节列表
-                    project_overview
+                    project_overview,
+                    analysis_report=analysis_report,
+                    bid_mode=bid_mode,
                 ):
                     content += chunk
                 if content:
                     chapter['content'] = content
             else:
                 # 递归处理子章节
-                await self._process_outline_recursive(chapter['children'], current_parent_chapters, project_overview)
+                await self._process_outline_recursive(
+                    chapter['children'],
+                    current_parent_chapters,
+                    project_overview,
+                    analysis_report=analysis_report,
+                    bid_mode=bid_mode,
+                )
     
-    async def _generate_chapter_content(self, chapter: dict, parent_chapters: list = None, sibling_chapters: list = None, project_overview: str = "") -> AsyncGenerator[str, None]:
+    async def _generate_chapter_content(
+        self,
+        chapter: dict,
+        parent_chapters: list = None,
+        sibling_chapters: list = None,
+        project_overview: str = "",
+        analysis_report: Dict[str, Any] | None = None,
+        bid_mode: str | None = None,
+        generated_summaries: list | None = None,
+        enterprise_materials: list | None = None,
+        missing_materials: list | None = None,
+    ) -> AsyncGenerator[str, None]:
         """
         为单个章节流式生成内容
 
@@ -684,17 +777,30 @@ class OpenAIService:
             chapter_id = chapter.get('id', 'unknown')
             chapter_title = chapter.get('title', '未命名章节')
             chapter_description = chapter.get('description', '')
+            rulebook = prompt_manager.get_full_bid_rulebook()
 
             # 构建提示词
-            system_prompt = """你是一个专业的标书编写专家，负责为投标文件的技术标部分生成具体内容。
+            system_prompt = f"""你是一个专业的标书编制工程师，负责在“开始生成标书”阶段，依据已完成的《标准解析报告》与既定目录，逐章生成正式投标文件内容。
 
-要求：
-1. 内容要专业、准确，与章节标题和描述保持一致
-2. 这是技术方案，不是宣传报告，注意朴实无华，不要假大空
-3. 语言要正式、规范，符合标书写作要求，但不要使用奇怪的连接词，不要让人觉得内容像是AI生成的
-4. 内容要详细具体，避免空泛的描述
-5. 注意避免与同级章节内容重复，保持内容的独特性和互补性
-6. 直接返回章节内容，不生成标题，不要任何额外说明或格式标记
+你必须先在内部完成以下动作，但不要把过程写出来：
+1. 回顾《标准解析报告》中的项目基础信息、否决投标条款、资格审查要求、评分项、正式投标文件结构、证明材料要求、待补资料清单和高风险废标点。
+2. 判断当前章节属于哪一类：函件类、承诺类、表格类、报价类、证明材料类、资格商务类、技术方案类、索引表类、其他资料类。
+3. 依据章节类型选择对应写法，再生成可直接用于正式投标文件的正文。
+
+硬性要求：
+1. 只输出当前章节正文，不输出标题、说明、前言、总结、markdown 代码块。
+2. 严禁编造企业名称、金额、日期、证书编号、业绩名称、人员姓名、联系方式、发票信息、查询结果、合同信息。
+3. 若上下文未提供且无法确认，必须使用【待补充：具体资料名称】或【以招标文件/企业资料为准】标注，不得猜测。
+4. 对营业执照、资质证书、身份证、社保、审计报告、合同、发票、税务查验截图、信誉查询截图等证明材料类章节，如缺少资料，不要写空泛叙述，直接输出“本节应附材料清单 + 核验要点”或保留规范占位内容。
+5. 对投标函、附录、承诺函、授权委托书、偏离表、一览表、基本情况表、人员表、业绩表等正式文件章节，必须使用正式标书语言，字段完整、格式严谨、可直接落地。
+6. 对技术方案类章节，必须围绕评审点展开，突出可执行性、组织安排、进度管理、质量安全、数字化、协调配合、现场服务、应急响应等内容，避免宣传式空话。
+7. 与同级章节不得重复；与上级章节保持逻辑承接；与正式投标文件结构保持一致。
+8. 不得写“作为 AI”“根据你的要求”“以下内容”等元话术。
+9. 对固定格式表、报价表、费用明细表、承诺函、偏离表，只能生成待填内容或材料清单，不得擅自改变招标文件要求的表头、列名、固定文字、行列数量。
+10. 对索引表或响应页码，未最终排版前统一使用【页码待编排】。
+11. 对业绩、人员、社保、发票、税务查验、信用截图等证据链章节，必须写出应附材料和核验要点；缺失时保留明确占位，不得写成已满足。
+
+{rulebook}
 """
 
             # 构建上下文信息
@@ -713,19 +819,66 @@ class OpenAIService:
                     if sibling.get('id') != chapter_id:  # 排除当前章节
                         context_info += f"- {sibling.get('id', 'unknown')} {sibling.get('title', '未命名')}\n  {sibling.get('description', '')}\n"
 
+            structured_context: list[str] = []
+            if bid_mode:
+                structured_context.append(f"标书生成模式：{bid_mode}")
+            if analysis_report:
+                structured_context.append(
+                    "标准解析报告(JSON)：\n"
+                    f"{json.dumps(analysis_report, ensure_ascii=False)}"
+                )
+            chapter_links = {
+                "scoring_item_ids": chapter.get("scoring_item_ids", []),
+                "requirement_ids": chapter.get("requirement_ids", []),
+                "risk_ids": chapter.get("risk_ids", []),
+                "material_ids": chapter.get("material_ids", []),
+            }
+            if any(chapter_links.values()):
+                structured_context.append(
+                    "当前章节关联项(JSON)：\n"
+                    f"{json.dumps(chapter_links, ensure_ascii=False)}"
+                )
+            if generated_summaries:
+                structured_context.append(
+                    "已生成章节摘要(JSON，用于避免重复)：\n"
+                    f"{json.dumps(generated_summaries, ensure_ascii=False)}"
+                )
+            if enterprise_materials:
+                structured_context.append(
+                    "已提供企业材料(JSON)：\n"
+                    f"{json.dumps(enterprise_materials, ensure_ascii=False)}"
+                )
+            if missing_materials:
+                structured_context.append(
+                    "待补企业资料(JSON，正文必须保留占位)：\n"
+                    f"{json.dumps(missing_materials, ensure_ascii=False)}"
+                )
+
             # 构建用户提示词
             project_info = ""
             if project_overview.strip():
                 project_info = f"项目概述信息：\n{project_overview}\n\n"
             
-            user_prompt = f"""请为以下标书章节生成具体内容：
+            user_prompt = f"""当前已完成前两步：
+第一步：标准解析报告；
+第二步：目录生成。
+本次调用视为用户已明确下达“开始生成标书”指令。
 
-{project_info}{context_info if context_info else ''}当前章节信息：
+请先结合项目概述、上级章节、同级章节和当前章节信息，判断本章节类型，再按正式投标文件写法生成正文。
+若企业资料仍有缺失，请在正文中用【待补充：...】明确标注，不得虚构。
+
+{project_info}{context_info if context_info else ''}{chr(10).join(structured_context)}
+
+当前章节信息：
 章节ID: {chapter_id}
 章节标题: {chapter_title}
 章节描述: {chapter_description}
 
-请根据项目概述信息和上述章节层级关系，生成详细的专业内容，确保与上级章节的内容逻辑相承，同时避免与同级章节内容重复，突出本章节的独特性和技术方案的优势。"""
+输出要求：
+1. 只输出当前章节正文。
+2. 不输出章节标题。
+3. 不输出解释、提示语、前后说明。
+4. 不输出 markdown 代码块。"""
 
             # 调用AI流式生成内容
             messages = [
@@ -734,179 +887,148 @@ class OpenAIService:
             ]
 
             # 流式返回生成的文本
-            async for chunk in self.stream_chat_completion(messages, temperature=0.7):
+            async for chunk in self.stream_chat_completion(messages, temperature=0.4):
                 yield chunk
 
         except Exception as e:
             print(f"生成章节内容时出错: {str(e)}")
             raise Exception(f"生成章节内容时出错: {str(e)}") from e
-
-    def _preferred_json_response_format(self) -> dict[str, str] | None:
-        """自定义网关优先使用纯提示词约束，减少对 response_format 的依赖"""
-        if self.provider == "custom":
-            return None
-        return {"type": "json_object"}
-
-    @staticmethod
-    def _build_compact_chapter_schema(
-        level1_title: str,
-        level1_index: int,
-        level2_count: int,
-        level3_count: int,
+            
+    async def generate_outline_v2(
+        self,
+        overview: str,
+        requirements: str,
+        analysis_report: Dict[str, Any] | None = None,
+        bid_mode: str | None = None,
     ) -> Dict[str, Any]:
-        """构建轻量化单章目录骨架，降低单次生成复杂度"""
-        chapter = {
-            "id": str(level1_index),
-            "title": level1_title,
-            "description": "",
-            "children": [],
-        }
-
-        for level2_index in range(1, level2_count + 1):
-            section = {
-                "id": f"{level1_index}.{level2_index}",
-                "title": "",
-                "description": "",
-                "children": [],
-            }
-            for level3_index in range(1, level3_count + 1):
-                section["children"].append({
-                    "id": f"{level1_index}.{level2_index}.{level3_index}",
-                    "title": "",
-                    "description": "",
-                })
-            chapter["children"].append(section)
-
-        return chapter
-
-    async def _generate_compact_level1_titles(self, overview: str, requirements: str) -> list[dict[str, str]]:
-        """使用短提示词生成一级目录，兼容稳定性较差的代理网关"""
-        schema = [
+        scope_instruction = (
+            "生成完整投标文件一级提纲，覆盖资格、商务、报价、承诺、技术、附件和组卷自检。"
+            if bid_mode == "full_bid"
+            else "生成技术标一级提纲，优先覆盖技术评分项和技术响应要求。"
+        )
+        schema_json = json.dumps([
             {
-                "rating_item": "",
-                "new_title": "",
+                "rating_item": "原评分项",
+                "new_title": "根据评分项修改的标题",
+                "scoring_item_ids": [],
+                "requirement_ids": [],
+                "risk_ids": [],
+                "material_ids": [],
             }
-        ]
+        ])
+
+        system_prompt = f"""
+            ### 角色
+            你是专业的标书解析与编制专家，尤其适配本地 DeepSeek 类大模型。
+
+            ### 工作流（必须先在内部完成，但不要外显）
+            1. 先做《标准解析报告》：识别项目基础信息、评分项、否决投标条款、实质性条款、资格审查项、证明材料要求、正式投标文件结构、待补资料清单和高风险废标点。
+            2. 再依据解析报告生成一级目录。
+            3. 只有等企业资料补齐且用户明确说“开始生成标书”时，才进入正文生成阶段。
+
+            ### 当前任务
+            {scope_instruction}
+            当前只生成一级提纲，不生成正文，不输出解析报告。
+
+            ### 说明
+            1. 一级标题数量必须服务于 bid_mode：technical_only 时与技术评分/技术响应要求对应；full_bid 时与招标文件要求的完整投标文件结构对应。
+            2. 一级标题名称应改写为正式目录标题，不能简单照抄评分项原文。
+            3. 标题应服务于后续正式标书写作，避免口语化和空泛表述。
+            4. scoring_item_ids 可引用 T/B/P/E/F/Q/C 等相关 ID；requirement_ids / risk_ids / material_ids 必须来自标准解析报告中的 ID；无法对应时输出空数组。
+            5. 只输出 JSON，不要输出 markdown 代码块，不要输出解释。
+
+            ### Output Format in JSON
+            {schema_json}
+
+            """
+        user_prompt = f"""
+            ### 项目信息
+            
+            <overview>
+            {overview}
+            </overview>
+
+            <requirements>
+            {requirements}
+            </requirements>
+
+            <bid_mode>
+            {bid_mode or ""}
+            </bid_mode>
+
+            <analysis_report_json>
+            {json.dumps(analysis_report, ensure_ascii=False) if analysis_report else ""}
+            </analysis_report_json>
+
+            请先在内部完成《标准解析报告》，再输出一级目录 JSON。
+            当前只执行“先做标准解析报告；然后生成目录”这一步，不要开始生成标书正文。
+            直接返回 json，不要任何额外说明或格式标记。
+
+            """
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是标书专家。只输出 JSON 数组。"
-                    "每个元素必须包含 rating_item 和 new_title 两个字段。"
-                    "根据评分要求，为每个评分点生成一个更专业的一级章节标题。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"overview:\n{overview}\n\n"
-                    f"requirements:\n{requirements}\n\n"
-                    "要求：标题数量与核心评分点对应；标题专业、简洁；不要输出任何解释。"
-                ),
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
         ]
 
+        # 使用通用方法进行 JSON 校验与重试（失败时抛出异常）
         full_content = await self._generate_with_json_check(
             messages=messages,
-            schema=json.dumps(schema, ensure_ascii=False),
-            max_retries=2,
-            temperature=0.2,
-            response_format=self._preferred_json_response_format(),
-            log_prefix="一级目录",
+            schema=schema_json,
+            max_retries=3,
+            temperature=0.3,
+            response_format={"type": "json_object"},
+            log_prefix="一级提纲",
             raise_on_fail=True,
         )
 
-        level1_nodes = json.loads(full_content.strip())
-        if not isinstance(level1_nodes, list) or not level1_nodes:
-            raise Exception("一级目录生成结果为空")
-        return level1_nodes
+        # 通过校验后再进行 JSON 解析
+        level_l1 = json.loads(full_content.strip())
 
-    async def _generate_compact_level1_outline(
-        self,
-        level1_index: int,
-        level1_title: str,
-        overview: str,
-        requirements: str,
-        other_titles: list[str],
-    ) -> Dict[str, Any]:
-        """逐章补全二三级目录，避免一次性生成整棵目录导致代理 502"""
-        schema_variants = [
-            self._build_compact_chapter_schema(level1_title, level1_index, 3 if level1_index <= 2 else 2, 2),
-            self._build_compact_chapter_schema(level1_title, level1_index, 2, 2),
-            self._build_compact_chapter_schema(level1_title, level1_index, 2, 1),
-        ]
-        other_outline = "\n".join(f"- {title}" for title in other_titles if title != level1_title) or "无"
-        last_error: Exception | None = None
+        expected_word_count = 100000
+        leaf_node_count = expected_word_count // 1500
+        
+        # 随机重点章节
+        index1, index2 = get_random_indexes(len(level_l1))
 
-        for schema in schema_variants:
-            schema_json = json.dumps(schema, ensure_ascii=False)
-            messages = [
-                {
-                    "role": "system",
-                    "content": "你是标书专家。只输出合法 JSON，不要代码块，不要解释。",
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "请在给定 JSON 结构中补全空的 title 和 description，保持 id 和层级结构不变，"
-                        "不要修改一级标题。二级标题要围绕一级标题展开，三级标题要细化二级标题，"
-                        "并尽量避免与其他章节重复。\n\n"
-                        f"overview:\n{overview}\n\n"
-                        f"requirements:\n{requirements}\n\n"
-                        f"other_titles:\n{other_outline}\n\n"
-                        f"json:\n{schema_json}"
-                    ),
-                },
-            ]
-
-            try:
-                full_content = await self._generate_with_json_check(
-                    messages=messages,
-                    schema=schema_json,
-                    max_retries=2,
-                    temperature=0.2,
-                    response_format=self._preferred_json_response_format(),
-                    log_prefix=f"第{level1_index}章目录",
-                    raise_on_fail=True,
-                )
-                return json.loads(full_content.strip())
-            except Exception as error:
-                last_error = error
-
-        raise Exception(f"第{level1_index}章目录生成失败: {str(last_error)}") from last_error
-
-    async def generate_outline_compact(self, overview: str, requirements: str) -> Dict[str, Any]:
-        """轻量化分步生成目录，优先保证跨模型/跨网关稳定性"""
-        level1_nodes = await self._generate_compact_level1_titles(overview, requirements)
-        normalized_titles = [
-            (node.get("new_title") or node.get("rating_item") or f"第{index + 1}章").strip()
-            for index, node in enumerate(level1_nodes)
-        ]
-
-        outline: list[dict[str, Any]] = []
-        for index, title in enumerate(normalized_titles, start=1):
-            outline.append(
-                await self._generate_compact_level1_outline(
-                    level1_index=index,
-                    level1_title=title,
-                    overview=overview,
-                    requirements=requirements,
-                    other_titles=normalized_titles,
-                )
+        nodes_distribution = calculate_nodes_distribution(len(level_l1), (index1, index2), leaf_node_count)
+        
+        # 并发生成每个一级节点的提纲，保持结果顺序
+        tasks = [
+            self.process_level1_node(
+                i,
+                level1_node,
+                nodes_distribution,
+                level_l1,
+                overview,
+                requirements,
+                analysis_report=analysis_report,
+                bid_mode=bid_mode,
             )
-            if self.provider == "custom":
-                await asyncio.sleep(0.2)
-
+            for i, level1_node in enumerate(level_l1)
+        ]
+        outline = await asyncio.gather(*tasks)
+        
+        
+        
         return {"outline": outline}
-
-    async def generate_outline_v2(self, overview: str, requirements: str) -> Dict[str, Any]:
-        return await self.generate_outline_compact(overview, requirements)
     
-    async def process_level1_node(self, i, level1_node, nodes_distribution, level_l1, overview, requirements):
+    async def process_level1_node(
+        self,
+        i,
+        level1_node,
+        nodes_distribution,
+        level_l1,
+        overview,
+        requirements,
+        analysis_report: Dict[str, Any] | None = None,
+        bid_mode: str | None = None,
+    ):
         """处理单个一级节点的函数"""
 
         # 生成json
         json_outline = generate_one_outline_json_by_level1(level1_node["new_title"], i + 1, nodes_distribution)
+        for key in ("scoring_item_ids", "requirement_ids", "risk_ids", "material_ids"):
+            json_outline[key] = level1_node.get(key, [])
         print(f"正在处理第{i+1}章: {level1_node['new_title']}")
         
         # 其他标题
@@ -916,19 +1038,30 @@ class OpenAIService:
 
         system_prompt = f"""
     ### 角色
-    你是专业的标书编写专家，擅长根据项目需求编写标书。
-    
-    ### 任务
-    1. 根据得到项目概述(overview)、评分要求(requirements)补全标书的提纲的二三级目录
-    
+    你是专业的标书解析与编制专家，尤其适配本地 DeepSeek 类大模型。
+
+    ### 工作流（必须先在内部完成，但不要外显）
+    1. 先做《标准解析报告》：识别项目基础信息、评分项、否决投标条款、实质性条款、证明材料要求、正式投标文件结构、待补资料清单和高风险废标点。
+    2. 再基于解析报告补全当前一级章节下的二三级目录。
+    3. 只有等企业资料补齐且用户明确说“开始生成标书”时，才进入正文生成阶段。
+
+    ### 当前任务
+    1. 根据项目概述(overview)、评分要求(requirements)补全标书提纲的二三级目录。
+    2. 当前只生成目录，不生成正文，不输出解析报告。
+
     ### 说明
-    1. 你将会得到一段json，这是提纲的其中一个章节，你需要再原结构上补全标题(title)和描述(description)
-    2. 二级标题根据一级标题撰写,三级标题根据二级标题撰写
-    3. 补全的内容要参考项目概述(overview)、评分要求(requirements)等项目信息
-    4. 你还会收到其他章节的标题(other_outline)，你需要确保本章节的内容不会包含其他章节的内容
-    
+    1. 你将得到一段 json，这是提纲中的一个一级章节，你需要在原结构上补全 title 和 description。
+    2. 二级标题根据一级标题撰写，三级标题根据二级标题撰写。
+    3. 补全内容必须参考项目概述、评分要求、标准解析报告、正式投标文件写法和后续正文生成需要。
+    4. 你还会收到其他一级章节标题(other_outline)，你必须确保本章节不与其他章节重复。
+    5. description 要写清本节点拟写内容、对应评分点/审查点、应附材料或支撑内容。
+    6. scoring_item_ids 可引用 T/B/P/E/F/Q/C 等相关 ID；requirement_ids / risk_ids / material_ids 必须来自标准解析报告中的 ID；一级节点既有映射必须保留，二三级节点可细化继承。
+    7. 如 bid_mode=full_bid，必须补全资格、商务、报价、承诺、技术、附件等正式投标文件结构；如 bid_mode=technical_only，则聚焦技术评分和技术响应章节。
+    8. 对固定格式、签字盖章、报价规则、证据链和页码占位要求，要体现在 title/description 或映射字段中。
+
     ### 注意事项
-    在原json上补全信息，禁止修改json结构，禁止修改一级标题
+    1. 在原 json 上补全信息，禁止修改 json 结构，禁止修改一级标题。
+    2. 只输出 JSON，不要输出 markdown 代码块，不要输出解释。
 
     ### Output Format in JSON
     {json_outline}
@@ -944,13 +1077,22 @@ class OpenAIService:
     <requirements>
     {requirements}
     </requirements>
+
+    <bid_mode>
+    {bid_mode or ""}
+    </bid_mode>
+
+    <analysis_report_json>
+    {json.dumps(analysis_report, ensure_ascii=False) if analysis_report else ""}
+    </analysis_report_json>
     
     <other_outline>
     {other_outline}
     </other_outline>
 
-
-    直接返回json，不要任何额外说明或格式标记
+    请先在内部完成《标准解析报告》，再补全当前一级章节的二三级目录。
+    当前只执行“先做标准解析报告；然后生成目录”这一步，不要开始生成标书正文。
+    直接返回 json，不要任何额外说明或格式标记。
 
     """
         messages = [
@@ -963,7 +1105,7 @@ class OpenAIService:
             messages=messages,
             schema=json_outline,
             max_retries=3,
-            temperature=0.7,
+            temperature=0.3,
             response_format={"type": "json_object"},
             log_prefix=f"第{i+1}章",
             raise_on_fail=False,

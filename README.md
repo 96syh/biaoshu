@@ -155,6 +155,11 @@ docker run --rm -p 8000:8000 \
 
 启动应用后访问 `http://localhost:8000/docs` 查看完整的FastAPI自动生成的API文档。
 
+补充文档：
+
+- [本地大模型调用 API 文档](./docs/local-model-api.md)
+- [LiteLLM Proxy 统一模型网关接入说明](./docs/litellm-proxy.md)
+
 
 ## 📌代办任务
 - [ ] 录入预期字数

@@ -13,7 +13,13 @@ const WORKSPACE_DRAFT_ENABLED = false;
 
 export type DraftState = Pick<
   AppState,
-  'currentStep' | 'fileContent' | 'projectOverview' | 'techRequirements' | 'outlineData' | 'selectedChapter'
+  | 'currentStep'
+  | 'fileContent'
+  | 'projectOverview'
+  | 'techRequirements'
+  | 'analysisReport'
+  | 'outlineData'
+  | 'selectedChapter'
 >;
 
 export type ContentById = Record<string, string>; // 章节id -> content

@@ -2,6 +2,25 @@
  * API服务
  */
 import axios from 'axios';
+import type {
+  AnalysisReport,
+  BidMode,
+  ComplianceReviewRequest,
+  GeneratedSummary,
+  MissingCompanyMaterial,
+  OutlineData,
+  OutlineItem,
+  RequiredMaterial,
+} from '../types';
+
+export type {
+  AnalysisReport,
+  BidMode,
+  ComplianceReviewRequest,
+  GeneratedSummary,
+  MissingCompanyMaterial,
+  ReviewReport,
+} from '../types';
 
 const getDefaultApiBaseUrl = () => {
   if (process.env.REACT_APP_API_URL) {
@@ -36,6 +55,7 @@ export interface ConfigData {
   api_key: string;
   base_url?: string;
   model_name: string;
+  api_mode?: 'auto' | 'chat' | 'responses' | 'anthropic';
 }
 
 export interface FileUploadResponse {
@@ -45,9 +65,36 @@ export interface FileUploadResponse {
   old_outline?: string;
 }
 
+export interface ProviderCheckItem {
+  stage: string;
+  success: boolean;
+  detail: string;
+  url?: string;
+  http_status?: number;
+  model_name?: string;
+  models?: string[];
+  sample?: string;
+}
+
+export interface ProviderVerifyResponse {
+  success: boolean;
+  message: string;
+  provider: string;
+  normalized_base_url: string;
+  resolved_base_url: string;
+  base_url_candidates: string[];
+  model_name: string;
+  api_mode: 'auto' | 'chat' | 'responses' | 'anthropic';
+  checks: ProviderCheckItem[];
+}
+
 export interface AnalysisRequest {
   file_content: string;
   analysis_type: 'overview' | 'requirements';
+}
+
+export interface AnalysisReportRequest {
+  file_content: string;
 }
 
 export interface OutlineRequest {
@@ -56,18 +103,25 @@ export interface OutlineRequest {
   uploaded_expand?: boolean;
   old_outline?: string;
   old_document?: string;
+  analysis_report?: AnalysisReport;
+  bid_mode?: BidMode;
 }
 
 export interface ContentGenerationRequest {
-  outline: { outline: any[] };
+  outline: OutlineData;
   project_overview: string;
 }
 
 export interface ChapterContentRequest {
-  chapter: any;
-  parent_chapters?: any[];
-  sibling_chapters?: any[];
+  chapter: OutlineItem;
+  parent_chapters?: OutlineItem[];
+  sibling_chapters?: OutlineItem[];
   project_overview: string;
+  analysis_report?: AnalysisReport;
+  bid_mode?: BidMode;
+  generated_summaries?: GeneratedSummary[];
+  enterprise_materials?: RequiredMaterial[];
+  missing_materials?: MissingCompanyMaterial[];
 }
 
 // 配置相关API
@@ -83,6 +137,10 @@ export const configApi = {
   // 获取可用模型
   getModels: (config: ConfigData) =>
     api.post('/api/config/models', config),
+
+  // 验证当前模型端点
+  verifyProvider: (config: ConfigData) =>
+    api.post<ProviderVerifyResponse>('/api/config/verify', config),
 };
 
 // 文档相关API
@@ -102,6 +160,26 @@ export const documentApi = {
   // 流式分析文档
   analyzeDocumentStream: (data: AnalysisRequest) =>
     fetch(`${API_BASE_URL}/api/document/analyze-stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(data),
+    }),
+
+  // 流式生成结构化标准解析报告
+  analyzeReportStream: (data: AnalysisReportRequest) =>
+    fetch(`${API_BASE_URL}/api/document/analyze-report-stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(data),
+    }),
+
+  // 流式执行导出前合规审校
+  reviewComplianceStream: (data: ComplianceReviewRequest) =>
+    fetch(`${API_BASE_URL}/api/document/review-compliance-stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

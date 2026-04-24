@@ -29,7 +29,21 @@ async def generate_chapter_content(request: ChapterContentRequest):
             chapter=request.chapter,
             parent_chapters=request.parent_chapters,
             sibling_chapters=request.sibling_chapters,
-            project_overview=request.project_overview
+            project_overview=request.project_overview,
+            analysis_report=(
+                request.analysis_report.model_dump(mode="json")
+                if request.analysis_report else None
+            ),
+            bid_mode=request.bid_mode.value if request.bid_mode else None,
+            generated_summaries=[
+                item.model_dump(mode="json") for item in request.generated_summaries
+            ],
+            enterprise_materials=[
+                item.model_dump(mode="json") for item in request.enterprise_materials
+            ],
+            missing_materials=[
+                item.model_dump(mode="json") for item in request.missing_materials
+            ],
         ):
             content += chunk
         
@@ -65,7 +79,21 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
                     chapter=request.chapter,
                     parent_chapters=request.parent_chapters,
                     sibling_chapters=request.sibling_chapters,
-                    project_overview=request.project_overview
+                    project_overview=request.project_overview,
+                    analysis_report=(
+                        request.analysis_report.model_dump(mode="json")
+                        if request.analysis_report else None
+                    ),
+                    bid_mode=request.bid_mode.value if request.bid_mode else None,
+                    generated_summaries=[
+                        item.model_dump(mode="json") for item in request.generated_summaries
+                    ],
+                    enterprise_materials=[
+                        item.model_dump(mode="json") for item in request.enterprise_materials
+                    ],
+                    missing_materials=[
+                        item.model_dump(mode="json") for item in request.missing_materials
+                    ],
                 ):
                     full_content += chunk
                     # 实时发送内容片段

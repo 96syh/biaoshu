@@ -1,7 +1,14 @@
 """文档处理相关API路由"""
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
-from ..models.schemas import FileUploadResponse, AnalysisRequest, AnalysisType, WordExportRequest
+from ..models.schemas import (
+    AnalysisReportRequest,
+    AnalysisRequest,
+    AnalysisType,
+    ComplianceReviewRequest,
+    FileUploadResponse,
+    WordExportRequest,
+)
 from ..services.file_service import FileService
 from ..services.openai_service import OpenAIService
 from ..utils.config_manager import config_manager
@@ -11,6 +18,7 @@ import json
 import io
 import re
 import docx
+import asyncio
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
@@ -157,6 +165,99 @@ async def analyze_document_stream(request: AnalysisRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文档分析失败: {str(e)}")
+
+
+@router.post("/analyze-report-stream")
+async def analyze_report_stream(request: AnalysisReportRequest):
+    """流式生成结构化标准解析报告"""
+    try:
+        config = config_manager.load_config()
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
+
+        openai_service = OpenAIService()
+
+        async def generate():
+            try:
+                compute_task = asyncio.create_task(
+                    openai_service.generate_analysis_report(request.file_content)
+                )
+
+                while not compute_task.done():
+                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(1)
+
+                report_json = json.dumps(await compute_task, ensure_ascii=False)
+                chunk_size = 256
+                for index in range(0, len(report_json), chunk_size):
+                    piece = report_json[index:index + chunk_size]
+                    yield f"data: {json.dumps({'chunk': piece}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                payload = {
+                    "chunk": "",
+                    "error": True,
+                    "message": f"结构化解析报告生成失败: {str(e)}",
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        return sse_response(generate())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"结构化解析报告生成失败: {str(e)}")
+
+
+@router.post("/review-compliance-stream")
+async def review_compliance_stream(request: ComplianceReviewRequest):
+    """导出前执行覆盖性、缺料、废标风险和虚构风险审校"""
+    try:
+        config = config_manager.load_config()
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
+
+        openai_service = OpenAIService()
+
+        async def generate():
+            try:
+                compute_task = asyncio.create_task(
+                    openai_service.generate_compliance_review(
+                        outline=[item.model_dump(mode="json") for item in request.outline],
+                        analysis_report=(
+                            request.analysis_report.model_dump(mode="json")
+                            if request.analysis_report else None
+                        ),
+                        project_overview=request.project_overview or "",
+                    )
+                )
+
+                while not compute_task.done():
+                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(1)
+
+                review_json = json.dumps(await compute_task, ensure_ascii=False)
+                chunk_size = 256
+                for index in range(0, len(review_json), chunk_size):
+                    piece = review_json[index:index + chunk_size]
+                    yield f"data: {json.dumps({'chunk': piece}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                payload = {
+                    "chunk": "",
+                    "error": True,
+                    "message": f"导出前合规审校失败: {str(e)}",
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        return sse_response(generate())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"导出前合规审校失败: {str(e)}")
 
 
 @router.post("/export-word")

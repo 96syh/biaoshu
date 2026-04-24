@@ -1,10 +1,12 @@
 """配置相关API路由"""
 from fastapi import APIRouter, HTTPException
-from ..models.schemas import ConfigRequest, ConfigResponse, ModelListResponse
+from ..models.schemas import ConfigRequest, ConfigResponse, ModelListResponse, ProviderVerifyResponse
 from ..services.openai_service import OpenAIService
 from ..utils.config_manager import config_manager
 from ..utils.provider_registry import (
     get_default_models,
+    get_provider_auth_error,
+    get_provider_api_mode,
     normalize_base_url,
     provider_requires_api_key,
 )
@@ -21,7 +23,8 @@ async def save_config(config: ConfigRequest):
             provider=config.provider,
             api_key=config.api_key,
             base_url=normalized_base_url,
-            model_name=config.model_name
+            model_name=config.model_name,
+            api_mode=get_provider_api_mode(config.provider, config.api_mode),
         )
         
         if success:
@@ -61,7 +64,8 @@ async def get_available_models(config: ConfigRequest):
             provider=config.provider,
             api_key=config.api_key,
             base_url=normalized_base_url,
-            model_name=config.model_name
+            model_name=config.model_name,
+            api_mode=get_provider_api_mode(config.provider, config.api_mode),
         )
 
         if not temp_saved:
@@ -102,3 +106,41 @@ async def get_available_models(config: ConfigRequest):
             success=False,
             message=f"获取模型列表失败: {str(e)}"
         )
+
+
+@router.post("/verify", response_model=ProviderVerifyResponse)
+async def verify_provider(config: ConfigRequest):
+    """验证当前供应商配置是否真的可连通、可取模型、可发起对话请求"""
+    try:
+        auth_error = get_provider_auth_error(config.provider, config.api_key)
+        if auth_error:
+            return ProviderVerifyResponse(
+                success=False,
+                message=auth_error,
+                provider=config.provider,
+                normalized_base_url=normalize_base_url(config.provider, config.base_url or ""),
+                resolved_base_url="",
+                base_url_candidates=[],
+                model_name=config.model_name,
+                api_mode=get_provider_api_mode(config.provider, config.api_mode),
+                checks=[],
+            )
+
+        normalized_base_url = normalize_base_url(config.provider, config.base_url or "")
+        runtime_config = {
+            "provider": config.provider,
+            "api_key": config.api_key,
+            "base_url": normalized_base_url,
+            "model_name": config.model_name,
+            "api_mode": get_provider_api_mode(config.provider, config.api_mode),
+        }
+
+        openai_service = OpenAIService(config=runtime_config)
+        result = await openai_service.verify_current_endpoint()
+        result["success"] = any(
+            check.get("stage") == "chat" and check.get("success")
+            for check in result.get("checks", [])
+        )
+        return ProviderVerifyResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"验证模型端点时发生错误: {str(e)}")

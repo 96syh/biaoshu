@@ -4,6 +4,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { documentApi } from '../services/api';
+import { AnalysisReport } from '../types';
 import { CloudArrowUpIcon, DocumentIcon } from '@heroicons/react/24/outline';
 import { draftStorage } from '../utils/draftStorage';
 import { consumeSseStream } from '../utils/sse';
@@ -12,14 +13,16 @@ interface DocumentAnalysisProps {
   fileContent: string;
   projectOverview: string;
   techRequirements: string;
+  analysisReport?: AnalysisReport;
   onFileUpload: (content: string) => void;
-  onAnalysisComplete: (overview: string, requirements: string) => void;
+  onAnalysisComplete: (overview: string, requirements: string, analysisReport?: AnalysisReport) => void;
 }
 
 const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
   fileContent,
   projectOverview,
   techRequirements,
+  analysisReport,
   onFileUpload,
   onAnalysisComplete,
 }) => {
@@ -51,11 +54,81 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
       .replace(/\r\n/g, '\n') // Windows换行符
       .replace(/\r/g, '\n');  // Mac换行符
   };
+
+  const extractJsonPayload = (raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return trimmed;
+    }
+
+    const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    const candidate = fencedMatch ? fencedMatch[1].trim() : trimmed;
+    const startIndexes = [candidate.indexOf('{'), candidate.indexOf('[')].filter((index) => index >= 0);
+    if (startIndexes.length === 0) {
+      return candidate;
+    }
+
+    const start = Math.min(...startIndexes);
+    const opening = candidate[start];
+    const closing = opening === '{' ? '}' : ']';
+    const end = candidate.lastIndexOf(closing);
+    return end > start ? candidate.slice(start, end + 1).trim() : candidate;
+  };
   
   // 流式显示状态
-  const [currentAnalysisStep, setCurrentAnalysisStep] = useState<'overview' | 'requirements' | null>(null);
+  const [currentAnalysisStep, setCurrentAnalysisStep] = useState<'overview' | 'requirements' | 'report' | null>(null);
   const [streamingOverview, setStreamingOverview] = useState('');
   const [streamingRequirements, setStreamingRequirements] = useState('');
+
+  const activeReport = analysisReport;
+  const totalReviewItems = activeReport
+    ? (activeReport.formal_review_items || []).length
+      + (activeReport.qualification_review_items || []).length
+      + (activeReport.responsiveness_review_items || []).length
+    : 0;
+  const totalScoringItems = activeReport
+    ? (activeReport.business_scoring_items || []).length
+      + (activeReport.technical_scoring_items || []).length
+      + (activeReport.price_scoring_items || []).length
+    : 0;
+
+  const renderReportList = (
+    title: string,
+    items: Array<{ id?: string; name?: string; risk?: string; source?: string; target?: string; required_evidence?: string[] }>,
+    emptyText: string,
+  ) => (
+    <div className="surface-panel-soft min-h-[180px]">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h4 className="text-sm font-semibold text-slate-900">{title}</h4>
+        <span className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-slate-500">
+          {items.length}
+        </span>
+      </div>
+      {items.length > 0 ? (
+        <div className="space-y-3">
+          {items.slice(0, 5).map((item, index) => (
+            <div key={`${item.id || item.name || item.target || title}-${index}`} className="border-t border-slate-200/80 pt-3 first:border-t-0 first:pt-0">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-slate-800">
+                    {item.id ? `${item.id} ` : ''}{item.name || item.target || '未命名项'}
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">
+                    {item.risk || item.source || item.required_evidence?.join('、') || '待模型补全'}
+                  </p>
+                </div>
+              </div>
+            </div>
+          ))}
+          {items.length > 5 && (
+            <div className="text-xs font-medium text-slate-400">还有 {items.length - 5} 项未展开</div>
+          )}
+        </div>
+      ) : (
+        <p className="text-sm leading-6 text-slate-500">{emptyText}</p>
+      )}
+    </div>
+  );
 
   // 公共的 ReactMarkdown 组件配置
   const markdownComponents = {
@@ -200,8 +273,27 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
       }
       setLocalRequirements(finalRequirements);
 
+      // 第三步：生成后续目录、正文和审校共用的结构化标准解析报告
+      setCurrentAnalysisStep('report');
+      const reportResponse = await documentApi.analyzeReportStream({
+        file_content: fileContent,
+      });
+
+      let reportResult = '';
+      await consumeSseStream(reportResponse, (payload) => {
+        if (payload.error) {
+          throw new Error(payload.message || '结构化标准解析报告生成失败');
+        }
+        if (typeof payload.chunk !== 'string' || !payload.chunk) {
+          return;
+        }
+        reportResult += payload.chunk;
+      });
+
+      const analysisReport = JSON.parse(extractJsonPayload(reportResult)) as AnalysisReport;
+
       // 完成后更新父组件状态
-      onAnalysisComplete(finalOverview, finalRequirements);
+      onAnalysisComplete(finalOverview, finalRequirements, analysisReport);
       setMessage({ type: 'success', text: '标书解析完成' });
       
       // 清空流式内容
@@ -300,6 +392,7 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
                   </div>
                   {currentAnalysisStep === 'overview' ? '正在分析项目概述...' : 
                    currentAnalysisStep === 'requirements' ? '正在分析技术评分要求...' : 
+                   currentAnalysisStep === 'report' ? '正在生成标准解析报告...' :
                    '正在解析标书...'}
                 </>
               ) : (
@@ -357,6 +450,96 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
               </div>
             </div>
           </div>
+
+          {activeReport && (
+            <section className="mt-6 space-y-4">
+              <div className="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
+                <div>
+                  <p className="workspace-kicker">AnalysisReport</p>
+                  <h3 className="mt-2 text-xl font-semibold tracking-[-0.03em] text-slate-950">采标分析报告摘要</h3>
+                  <p className="mt-2 text-sm leading-6 text-slate-600">
+                    {activeReport.project.name || '未识别项目名称'} · {activeReport.bid_mode_recommendation === 'full_bid' ? '完整投标文件' : '技术标优先'}
+                  </p>
+                </div>
+                <div className="rounded-full border border-slate-200 bg-white/80 px-3 py-2 text-xs font-semibold text-slate-600">
+                  {activeReport.project.number || activeReport.project.package_name || '项目编号待识别'}
+                </div>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                <div className="soft-stat">
+                  <span className="soft-stat__label">投标结构</span>
+                  <span className="soft-stat__value">{(activeReport.bid_structure || []).length} 项</span>
+                </div>
+                <div className="soft-stat">
+                  <span className="soft-stat__label">评审条款</span>
+                  <span className="soft-stat__value">{totalReviewItems} 项</span>
+                </div>
+                <div className="soft-stat">
+                  <span className="soft-stat__label">评分项</span>
+                  <span className="soft-stat__value">{totalScoringItems} 项</span>
+                </div>
+                <div className="soft-stat">
+                  <span className="soft-stat__label">风险点</span>
+                  <span className="soft-stat__value">{(activeReport.rejection_risks || []).length} 项</span>
+                </div>
+                <div className="soft-stat">
+                  <span className="soft-stat__label">待补资料</span>
+                  <span className="soft-stat__value">{(activeReport.missing_company_materials || []).length} 项</span>
+                </div>
+              </div>
+
+              <div className="grid gap-4 xl:grid-cols-3">
+                {renderReportList(
+                  '废标与高风险',
+                  (activeReport.rejection_risks || []).map(item => ({
+                    id: item.id,
+                    name: item.risk,
+                    risk: item.mitigation,
+                    source: item.source,
+                  })),
+                  '未提取到单独废标风险。',
+                )}
+                {renderReportList(
+                  '固定格式与签章',
+                  [
+                    ...(activeReport.fixed_format_forms || []).map(item => ({
+                      id: item.id,
+                      name: item.name,
+                      risk: item.fill_rules || item.fixed_text,
+                      source: item.source,
+                    })),
+                    ...(activeReport.signature_requirements || []).map(item => ({
+                      id: item.id,
+                      name: item.target,
+                      risk: item.risk || `${item.signer} ${item.seal}`.trim(),
+                      source: item.source,
+                    })),
+                  ],
+                  '未提取到固定格式或签章要求。',
+                )}
+                {renderReportList(
+                  '证据链与补料',
+                  [
+                    ...(activeReport.evidence_chain_requirements || []).map(item => ({
+                      id: item.id,
+                      target: item.target,
+                      required_evidence: item.required_evidence,
+                      risk: item.risk || item.validation_rule,
+                      source: item.source,
+                    })),
+                    ...(activeReport.missing_company_materials || []).map(item => ({
+                      id: item.id,
+                      name: item.name,
+                      risk: item.placeholder,
+                      source: item.used_by.join('、'),
+                    })),
+                  ],
+                  '暂无证据链或补料项。',
+                )}
+              </div>
+            </section>
+          )}
         </div>
       )}
 

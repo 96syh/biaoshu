@@ -121,6 +121,10 @@ def generate_one_outline_json_by_level1(level1_title: str, level1_index: int, no
         "id":f"{level1_index}",
         "title": level1_title,
         "description": "",
+        "scoring_item_ids": [],
+        "requirement_ids": [],
+        "risk_ids": [],
+        "material_ids": [],
         "children": []
     }
     
@@ -130,6 +134,10 @@ def generate_one_outline_json_by_level1(level1_title: str, level1_index: int, no
             "id":f"{level1_index}.{j+1}",
             "title": "",  # 二级标题留空
             "description": "",
+            "scoring_item_ids": [],
+            "requirement_ids": [],
+            "risk_ids": [],
+            "material_ids": [],
             "children": []
         }
         
@@ -139,7 +147,11 @@ def generate_one_outline_json_by_level1(level1_title: str, level1_index: int, no
             level2_node["children"].append({
                 "id":f"{level1_index}.{j+1}.{k+1}",
                 "title": "",  # 三级标题留空
-                "description": ""
+                "description": "",
+                "scoring_item_ids": [],
+                "requirement_ids": [],
+                "risk_ids": [],
+                "material_ids": []
             })
         
         level1_node["children"].append(level2_node)

@@ -21,7 +21,8 @@ class ConfigManager:
             'provider': 'openai',
             'api_key': '',
             'base_url': '',
-            'model_name': 'gpt-4.1-mini'
+            'model_name': 'gpt-4.1-mini',
+            'api_mode': 'auto',
         }
         
         if os.path.exists(self.config_file):
@@ -34,13 +35,21 @@ class ConfigManager:
         
         return default_config
     
-    def save_config(self, provider: str, api_key: str, base_url: str, model_name: str) -> bool:
+    def save_config(
+        self,
+        provider: str,
+        api_key: str,
+        base_url: str,
+        model_name: str,
+        api_mode: str = "auto",
+    ) -> bool:
         """保存配置到本地JSON文件"""
         config = {
             'provider': provider,
             'api_key': api_key,
             'base_url': base_url,
-            'model_name': model_name
+            'model_name': model_name,
+            'api_mode': api_mode or 'auto',
         }
         
         try:

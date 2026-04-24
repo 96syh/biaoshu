@@ -2,7 +2,7 @@
  * 应用状态管理Hook
  */
 import { useState, useCallback } from 'react';
-import { AppState, ConfigData, OutlineData } from '../types';
+import { AnalysisReport, AppState, ConfigData, OutlineData } from '../types';
 import { draftStorage } from '../utils/draftStorage';
 import { DEFAULT_PROVIDER_ID } from '../constants/providers';
 
@@ -13,10 +13,12 @@ const initialState: AppState = {
     api_key: '',
     base_url: '',
     model_name: 'gpt-4.1-mini',
+    api_mode: 'auto',
   },
   fileContent: '',
   projectOverview: '',
   techRequirements: '',
+  analysisReport: undefined,
   outlineData: null,
   selectedChapter: '',
 };
@@ -48,16 +50,22 @@ export const useAppState = () => {
     });
   }, []);
 
-  const updateAnalysisResults = useCallback((overview: string, requirements: string) => {
+  const updateAnalysisResults = useCallback((
+    overview: string,
+    requirements: string,
+    analysisReport?: AnalysisReport,
+  ) => {
     setState(prev => {
       const next = {
         ...prev,
         projectOverview: overview,
         techRequirements: requirements,
+        analysisReport,
       };
       draftStorage.saveDraft({
         projectOverview: overview,
         techRequirements: requirements,
+        analysisReport,
       });
       return next;
     });

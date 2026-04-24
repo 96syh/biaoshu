@@ -2,7 +2,7 @@
  * 目录编辑页面
  */
 import React, { useState } from 'react';
-import { OutlineData, OutlineItem } from '../types';
+import { AnalysisReport, OutlineData, OutlineItem } from '../types';
 import { outlineApi, expandApi } from '../services/api';
 import { ChevronRightIcon, ChevronDownIcon, DocumentTextIcon, PencilIcon, TrashIcon, PlusIcon } from '@heroicons/react/24/outline';
 import { consumeSseStream } from '../utils/sse';
@@ -10,6 +10,7 @@ import { consumeSseStream } from '../utils/sse';
 interface OutlineEditProps {
   projectOverview: string;
   techRequirements: string;
+  analysisReport?: AnalysisReport;
   outlineData: OutlineData | null;
   onOutlineGenerated: (outline: OutlineData) => void;
 }
@@ -17,6 +18,7 @@ interface OutlineEditProps {
 const OutlineEdit: React.FC<OutlineEditProps> = ({
   projectOverview,
   techRequirements,
+  analysisReport,
   outlineData,
   onOutlineGenerated,
 }) => {
@@ -32,6 +34,52 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
   const [uploadedExpand, setuploadedExpand] = useState(false);
   const [oldOutline, setOldOutline] = useState<string | null>(null);
   const [oldDocument, setOldDocument] = useState<string | null>(null);
+  const activeAnalysisReport = analysisReport || outlineData?.analysis_report;
+
+  const countMappedNodes = (items: OutlineItem[]): number => items.reduce((sum, item) => {
+    const mapped = Boolean(
+      item.scoring_item_ids?.length
+      || item.requirement_ids?.length
+      || item.risk_ids?.length
+      || item.material_ids?.length,
+    );
+    return sum + (mapped ? 1 : 0) + (item.children ? countMappedNodes(item.children) : 0);
+  }, 0);
+
+  const countOutlineNodes = (items: OutlineItem[]): number => items.reduce(
+    (sum, item) => sum + 1 + (item.children ? countOutlineNodes(item.children) : 0),
+    0,
+  );
+
+  const renderMappingChips = (item: OutlineItem) => {
+    const chips = [
+      { label: '评分', value: item.scoring_item_ids?.length || 0 },
+      { label: '要求', value: item.requirement_ids?.length || 0 },
+      { label: '风险', value: item.risk_ids?.length || 0 },
+      { label: '材料', value: item.material_ids?.length || 0 },
+    ].filter(chip => chip.value > 0);
+
+    if (chips.length === 0) {
+      return (
+        <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-400">
+          未映射
+        </span>
+      );
+    }
+
+    return (
+      <div className="flex flex-wrap gap-1.5">
+        {chips.map(chip => (
+          <span
+            key={chip.label}
+            className="rounded-full border border-sky-100 bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-700"
+          >
+            {chip.label} {chip.value}
+          </span>
+        ))}
+      </div>
+    );
+  };
 
   const extractJsonPayload = (raw: string) => {
     const trimmed = raw.trim();
@@ -146,6 +194,8 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
         uploaded_expand: uploadedExpand,
         old_outline: oldOutline || undefined,
         old_document: oldDocument || undefined,
+        analysis_report: analysisReport,
+        bid_mode: analysisReport?.bid_mode_recommendation,
       });
 
       let result = '';
@@ -167,7 +217,11 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
       // 解析最终结果
       try {
         const outlineJson = JSON.parse(extractJsonPayload(result));
-        onOutlineGenerated(outlineJson);
+        onOutlineGenerated({
+          ...outlineJson,
+          analysis_report: analysisReport,
+          bid_mode: analysisReport?.bid_mode_recommendation,
+        });
         setMessage({ type: 'success', text: '目录结构生成完成' });
         setStreamingContent(''); // 清空流式内容
         
@@ -332,7 +386,11 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
     const newItem: OutlineItem = {
       id: newId,
       title: '新目录项',
-      description: '请编辑描述'
+      description: '请编辑描述',
+      scoring_item_ids: [],
+      requirement_ids: [],
+      risk_ids: [],
+      material_ids: [],
     };
 
     const addToItems = (items: OutlineItem[]): OutlineItem[] => {
@@ -394,7 +452,11 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
     const newItem: OutlineItem = {
       id: newId,
       title: '新目录项',
-      description: '请编辑描述'
+      description: '请编辑描述',
+      scoring_item_ids: [],
+      requirement_ids: [],
+      risk_ids: [],
+      material_ids: [],
     };
 
     const updatedData = {
@@ -486,6 +548,7 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
                         已生成内容
                       </span>
                     )}
+                    {renderMappingChips(item)}
                   </div>
                   
                   {/* 操作按钮组 */}
@@ -551,6 +614,31 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
           <p className="workspace-kicker">Outline Studio</p>
           <h2 className="mt-2 text-xl font-semibold tracking-[-0.03em] text-slate-950">目录管理</h2>
         </div>
+
+        {activeAnalysisReport && (
+          <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="soft-stat">
+              <span className="soft-stat__label">生成模式</span>
+              <span className="soft-stat__value">
+                {activeAnalysisReport.bid_mode_recommendation === 'full_bid' ? '完整投标文件' : '技术标优先'}
+              </span>
+            </div>
+            <div className="soft-stat">
+              <span className="soft-stat__label">采标结构</span>
+              <span className="soft-stat__value">{(activeAnalysisReport.bid_structure || []).length} 项</span>
+            </div>
+            <div className="soft-stat">
+              <span className="soft-stat__label">固定格式/签章</span>
+              <span className="soft-stat__value">
+                {(activeAnalysisReport.fixed_format_forms || []).length + (activeAnalysisReport.signature_requirements || []).length} 项
+              </span>
+            </div>
+            <div className="soft-stat">
+              <span className="soft-stat__label">证据链</span>
+              <span className="soft-stat__value">{(activeAnalysisReport.evidence_chain_requirements || []).length} 项</span>
+            </div>
+          </div>
+        )}
         
         <div className="flex space-x-4">
           {/* 方案扩写按钮 */}
@@ -646,7 +734,12 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
       {outlineData && (
         <div className="surface-panel">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-medium text-gray-900">目录结构</h3>
+            <div>
+              <h3 className="text-lg font-medium text-gray-900">目录结构</h3>
+              <p className="mt-1 text-sm text-slate-500">
+                已映射 {countMappedNodes(outlineData.outline)} / {countOutlineNodes(outlineData.outline)} 个节点
+              </p>
+            </div>
             <button
               onClick={addRootItem}
               className="secondary-button"

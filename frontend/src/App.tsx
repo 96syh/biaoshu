@@ -34,6 +34,7 @@ function App() {
             fileContent={state.fileContent}
             projectOverview={state.projectOverview}
             techRequirements={state.techRequirements}
+            analysisReport={state.analysisReport}
             onFileUpload={updateFileContent}
             onAnalysisComplete={updateAnalysisResults}
           />
@@ -43,6 +44,7 @@ function App() {
           <OutlineEdit
             projectOverview={state.projectOverview}
             techRequirements={state.techRequirements}
+            analysisReport={state.analysisReport}
             outlineData={state.outlineData}
             onOutlineGenerated={updateOutline}
           />

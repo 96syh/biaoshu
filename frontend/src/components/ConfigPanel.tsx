@@ -14,12 +14,20 @@ interface ConfigPanelProps {
 const mergeModelOptions = (presetModels: string[], remoteModels: string[]) =>
   Array.from(new Set([...remoteModels, ...presetModels]));
 
+const API_MODE_OPTIONS = [
+  { value: 'auto', label: '自动识别', description: '按供应商预设和模型名选择协议' },
+  { value: 'chat', label: 'OpenAI Chat', description: '/v1/chat/completions 兼容接口' },
+  { value: 'responses', label: 'OpenAI Responses', description: '/v1/responses，适合 Codex/Responses 网关' },
+  { value: 'anthropic', label: 'Claude Messages', description: '/v1/messages 原生 Claude 网关' },
+] as const;
+
 const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => {
   const normalizedConfig: ConfigData = {
     provider: config.provider || DEFAULT_PROVIDER_ID,
     api_key: config.api_key || '',
     base_url: config.base_url || '',
     model_name: config.model_name || 'gpt-4.1-mini',
+    api_mode: config.api_mode || 'auto',
   };
 
   const [localConfig, setLocalConfig] = useState<ConfigData>(normalizedConfig);
@@ -47,6 +55,7 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => 
           api_key: response.data.api_key || '',
           base_url: response.data.base_url || preset.baseUrl,
           model_name: response.data.model_name || preset.models[0] || 'gpt-4.1-mini',
+          api_mode: response.data.api_mode || preset.apiMode || 'auto',
         };
         syncConfigState(nextConfig);
       }
@@ -72,6 +81,7 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => 
       provider: providerId,
       base_url: providerId === 'custom' ? prev.base_url : preset.baseUrl,
       model_name: preset.models.includes(prev.model_name) ? prev.model_name : (preset.models[0] || prev.model_name),
+      api_mode: providerId === 'custom' ? (prev.api_mode || 'auto') : preset.apiMode,
     }));
   };
 
@@ -139,6 +149,30 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => 
     }
   };
 
+  const handleVerifyProvider = async () => {
+    if (currentPreset.requiresApiKey && !localConfig.api_key) {
+      setMessage({ type: 'error', text: '当前供应商需要先填写 API Key' });
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const response = await configApi.verifyProvider(localConfig);
+      const result = response.data;
+      const checkText = result.checks
+        .map((check) => `${check.stage}:${check.success ? 'OK' : '失败'}`)
+        .join('，');
+      setMessage({
+        type: result.success ? 'success' : 'error',
+        text: `${result.message}${checkText ? `（${checkText}）` : ''}`,
+      });
+    } catch (error: any) {
+      setMessage({ type: 'error', text: error.response?.data?.detail || '端点验证失败' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <aside className="glass-sidebar w-[360px] shrink-0 overflow-y-auto">
       <div className="space-y-8 p-6">
@@ -183,7 +217,7 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => 
             <div className="config-section__header">
               <span className="config-section__eyebrow">Provider Matrix</span>
               <h2 className="config-section__title">选择模型供应商</h2>
-              <p className="config-section__desc">支持 OpenAI、Codex、Claude、Gemini、DeepSeek、Qwen、Kimi、OpenRouter 和本地 Ollama。</p>
+              <p className="config-section__desc">支持 OpenAI、Codex、Claude、Gemini、DeepSeek、Qwen、Kimi、OpenRouter、LiteLLM Proxy 和本地 Ollama。</p>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -243,6 +277,30 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => 
                   placeholder={currentPreset.baseUrl || '输入兼容 OpenAI 的服务地址'}
                 />
               </div>
+
+              <div className="field-group">
+                <label htmlFor="api_mode" className="field-group__label">
+                  API 协议模式
+                </label>
+                <select
+                  id="api_mode"
+                  value={localConfig.api_mode || currentPreset.apiMode}
+                  onChange={(event) => updateConfigField({
+                    api_mode: event.target.value as ConfigData['api_mode'],
+                  })}
+                  className="field-input"
+                  disabled={!['custom', 'litellm'].includes(localConfig.provider)}
+                >
+                  {API_MODE_OPTIONS.map((mode) => (
+                    <option key={mode.value} value={mode.value}>
+                      {mode.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-2 text-xs leading-5 text-slate-500">
+                  {API_MODE_OPTIONS.find((mode) => mode.value === (localConfig.api_mode || currentPreset.apiMode))?.description}
+                </p>
+              </div>
             </div>
           </section>
 
@@ -261,6 +319,14 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => 
               >
                 {loading ? '同步中...' : '同步模型列表'}
               </button>
+              <button
+                type="button"
+                onClick={handleVerifyProvider}
+                disabled={loading}
+                className="secondary-button whitespace-nowrap"
+              >
+                验证端点
+              </button>
               <a
                 href="/client-demo.html"
                 target="_blank"
@@ -276,18 +342,34 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => 
                 模型名称
               </label>
               {models.length > 0 ? (
-                <select
-                  id="model_name"
-                  value={localConfig.model_name}
-                  onChange={(event) => updateConfigField({ model_name: event.target.value })}
-                  className="field-input"
-                >
-                  {models.map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))}
-                </select>
+                <div className="space-y-2">
+                  <select
+                    id="model_name"
+                    value={models.includes(localConfig.model_name) ? localConfig.model_name : '__custom__'}
+                    onChange={(event) => {
+                      if (event.target.value !== '__custom__') {
+                        updateConfigField({ model_name: event.target.value });
+                      }
+                    }}
+                    className="field-input"
+                  >
+                    {models.map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))}
+                    <option value="__custom__">手动输入模型名称</option>
+                  </select>
+                  {(!models.includes(localConfig.model_name) || localConfig.provider === 'custom') && (
+                    <input
+                      type="text"
+                      value={localConfig.model_name}
+                      onChange={(event) => updateConfigField({ model_name: event.target.value })}
+                      className="field-input"
+                      placeholder="输入模型名称，例如 gpt-4.1-mini / claude-sonnet-4-6 / 本地模型名"
+                    />
+                  )}
+                </div>
               ) : (
                 <input
                   type="text"
@@ -341,8 +423,8 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, onConfigChange }) => 
           </div>
           <div className="space-y-2 text-sm leading-6 text-slate-600">
             <p>1. 先选供应商，再同步模型列表或点选推荐模型。</p>
-            <p>2. 现场演示时推荐切到 DeepSeek、Claude 或 Gemini 形成对比。</p>
-            <p>3. 客户展示可直接打开 <code>/client-demo.html</code> 作为独立讲解页。</p>
+            <p>2. 推荐团队统一部署 LiteLLM Proxy，再用一套 OpenAI 格式接入多家模型。</p>
+            <p>3. 自定义端点先选择协议模式，再点击“验证端点”确认模型列表和对话请求。</p>
           </div>
         </section>
 
