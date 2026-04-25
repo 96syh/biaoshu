@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 3
-- **Last Active**: 2026-04-24
+- **Total Sessions**: 4
+- **Last Active**: 2026-04-25
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~100 | Active |
+| `journal-1.md` | ~131 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 4 | 2026-04-25 | 端到端 smoke 与解析兜底 | - | `master` |
 | 3 | 2026-04-24 | Define AnalysisReport schema contracts | - | `master` |
 | 2 | 2026-04-24 | Document prompt workflow optimization | - | `master` |
 | 1 | 2026-04-24 | Bootstrap Trellis guidelines and task queue | - | `master` |

@@ -98,3 +98,34 @@ Added AnalysisReport and BidMode contracts to backend Pydantic schemas and match
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: 端到端 smoke 与解析兜底
+
+**Date**: 2026-04-25
+**Task**: 端到端 smoke 与解析兜底
+**Branch**: `master`
+
+### Summary
+
+修复结构化解析长 JSON 超时；增加本地兜底解析、目录、正文、审校与安全验证模式；使用福建招标文件跑通上传到 Word 导出链路。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+(No commits - planning session)
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
