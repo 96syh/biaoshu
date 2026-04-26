@@ -3,102 +3,16 @@ from typing import Dict, Any
 from urllib.parse import urlparse, urlunparse
 
 
-DEFAULT_PROVIDER = "openai"
+DEFAULT_PROVIDER = "litellm"
 
 PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
-    "openai": {
-        "label": "OpenAI",
-        "base_url": "https://api.openai.com/v1",
-        "models": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
-        "requires_api_key": True,
-        "supports_model_listing": True,
-    },
-    "codex": {
-        "label": "OpenAI Codex",
-        "base_url": "https://api.openai.com/v1",
-        "models": [
-            "gpt-5.2-codex",
-            "gpt-5.1-codex",
-            "gpt-5.1-codex-mini",
-            "gpt-5.1-codex-max",
-        ],
-        "requires_api_key": True,
-        "supports_model_listing": True,
-        "api_mode": "responses",
-    },
-    "deepseek": {
-        "label": "DeepSeek",
-        "base_url": "https://api.deepseek.com/v1",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-        "requires_api_key": True,
-        "supports_model_listing": True,
-    },
-    "anthropic": {
-        "label": "Claude API",
-        "base_url": "https://api.anthropic.com",
-        "models": ["claude-sonnet-4-6", "claude-opus-4-6"],
-        "requires_api_key": True,
-        "supports_model_listing": True,
-        "api_mode": "anthropic",
-    },
-    "gemini": {
-        "label": "Gemini API",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "models": ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-pro"],
-        "requires_api_key": True,
-        "supports_model_listing": False,
-    },
-    "dashscope": {
-        "label": "阿里云百炼",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "models": ["qwen-plus", "qwen-max", "qwen3-max"],
-        "requires_api_key": True,
-        "supports_model_listing": False,
-    },
-    "moonshot": {
-        "label": "Moonshot Kimi",
-        "base_url": "https://api.moonshot.cn/v1",
-        "models": ["kimi-k2.5", "kimi-k2", "kimi-k2-thinking"],
-        "requires_api_key": True,
-        "supports_model_listing": False,
-    },
-    "openrouter": {
-        "label": "OpenRouter",
-        "base_url": "https://openrouter.ai/api/v1",
-        "models": [
-            "openai/gpt-4.1-mini",
-            "anthropic/claude-sonnet-4-6",
-            "google/gemini-2.5-flash",
-        ],
-        "requires_api_key": True,
-        "supports_model_listing": True,
-    },
     "litellm": {
         "label": "LiteLLM Proxy",
-        "base_url": "http://localhost:4000",
-        "models": [
-            "gpt-4.1-mini",
-            "anthropic/claude-sonnet-4-5",
-            "gemini/gemini-2.5-flash",
-            "ollama/qwen3:8b",
-        ],
-        "requires_api_key": False,
-        "supports_model_listing": True,
-        "api_mode": "auto",
-    },
-    "ollama": {
-        "label": "Ollama",
-        "base_url": "http://localhost:11434/v1",
-        "models": ["llama3.2", "qwen3:8b", "gpt-oss:20b"],
-        "requires_api_key": False,
-        "supports_model_listing": True,
-    },
-    "custom": {
-        "label": "自定义兼容端点",
-        "base_url": "",
+        "base_url": "http://localhost:4000/v1",
         "models": [],
         "requires_api_key": False,
         "supports_model_listing": True,
+        "api_mode": "chat",
     },
 }
 
@@ -145,6 +59,9 @@ def normalize_api_mode(api_mode: str | None) -> str:
 
 def get_provider_api_mode(provider: str | None, api_mode: str | None = None) -> str:
     """解析供应商最终 API 协议模式"""
+    if (provider or DEFAULT_PROVIDER).lower() == "litellm":
+        return "chat"
+
     explicit_mode = normalize_api_mode(api_mode)
     if explicit_mode != "auto":
         return explicit_mode
@@ -162,6 +79,8 @@ def provider_uses_responses_api(
 ) -> bool:
     """判断当前 provider / model 是否应该走 Responses API"""
     resolved_mode = get_provider_api_mode(provider, api_mode)
+    if (provider or DEFAULT_PROVIDER).lower() == "litellm":
+        return False
     if resolved_mode == "responses":
         return True
     if resolved_mode in {"chat", "anthropic"}:
@@ -177,6 +96,8 @@ def provider_uses_anthropic_api(
     api_mode: str | None = None,
 ) -> bool:
     """判断当前 provider 是否应直接走 Anthropic 原生接口"""
+    if (provider or DEFAULT_PROVIDER).lower() == "litellm":
+        return False
     return get_provider_api_mode(provider, api_mode) == "anthropic"
 
 
@@ -208,7 +129,7 @@ def normalize_base_url(provider: str | None, base_url: str | None) -> str:
         )
         return urlunparse(cleaned).rstrip("/")
 
-    if provider_id != "custom":
+    if provider_id not in {"custom", "litellm"}:
         return normalized
 
     parsed = urlparse(normalized)
@@ -239,7 +160,7 @@ def get_base_url_candidates(provider: str | None, base_url: str | None) -> list[
 
     candidates = [normalized]
     provider_id = (provider or "").lower()
-    if provider_id not in {"custom", "anthropic"}:
+    if provider_id not in {"custom", "anthropic", "litellm"}:
         return candidates
 
     parsed = urlparse(normalized)

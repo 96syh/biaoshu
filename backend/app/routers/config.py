@@ -4,6 +4,7 @@ from ..models.schemas import ConfigRequest, ConfigResponse, ModelListResponse, P
 from ..services.openai_service import OpenAIService
 from ..utils.config_manager import config_manager
 from ..utils.provider_registry import (
+    DEFAULT_PROVIDER,
     get_default_models,
     get_provider_auth_error,
     get_provider_api_mode,
@@ -14,17 +15,28 @@ from ..utils.provider_registry import (
 router = APIRouter(prefix="/api/config", tags=["配置管理"])
 
 
+def _litellm_config_payload(config: ConfigRequest) -> dict:
+    """将所有模型配置统一收敛到 LiteLLM Proxy + OpenAI Chat Completions。"""
+    return {
+        "provider": DEFAULT_PROVIDER,
+        "api_key": config.api_key,
+        "base_url": normalize_base_url(DEFAULT_PROVIDER, config.base_url or ""),
+        "model_name": config.model_name,
+        "api_mode": get_provider_api_mode(DEFAULT_PROVIDER, "chat"),
+    }
+
+
 @router.post("/save", response_model=ConfigResponse)
 async def save_config(config: ConfigRequest):
     """保存模型配置"""
     try:
-        normalized_base_url = normalize_base_url(config.provider, config.base_url or "")
+        runtime_config = _litellm_config_payload(config)
         success = config_manager.save_config(
-            provider=config.provider,
-            api_key=config.api_key,
-            base_url=normalized_base_url,
-            model_name=config.model_name,
-            api_mode=get_provider_api_mode(config.provider, config.api_mode),
+            provider=runtime_config["provider"],
+            api_key=runtime_config["api_key"],
+            base_url=runtime_config["base_url"],
+            model_name=runtime_config["model_name"],
+            api_mode=runtime_config["api_mode"],
         )
         
         if success:
@@ -40,7 +52,10 @@ async def save_config(config: ConfigRequest):
 async def load_config():
     """加载保存的配置"""
     try:
-        config = config_manager.load_config()
+        config = dict(config_manager.load_config())
+        config["provider"] = DEFAULT_PROVIDER
+        config["base_url"] = normalize_base_url(DEFAULT_PROVIDER, config.get("base_url") or "")
+        config["api_mode"] = get_provider_api_mode(DEFAULT_PROVIDER, "chat")
         return config
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"加载配置时发生错误: {str(e)}")
@@ -50,33 +65,15 @@ async def load_config():
 async def get_available_models(config: ConfigRequest):
     """获取可用的模型列表"""
     try:
-        if provider_requires_api_key(config.provider) and not config.api_key:
+        runtime_config = _litellm_config_payload(config)
+        if provider_requires_api_key(runtime_config["provider"]) and not runtime_config["api_key"]:
             return ModelListResponse(
                 models=[],
                 success=False,
                 message="当前供应商需要先输入 API Key"
             )
 
-        normalized_base_url = normalize_base_url(config.provider, config.base_url or "")
-
-        # 临时保存配置以供OpenAI服务使用
-        temp_saved = config_manager.save_config(
-            provider=config.provider,
-            api_key=config.api_key,
-            base_url=normalized_base_url,
-            model_name=config.model_name,
-            api_mode=get_provider_api_mode(config.provider, config.api_mode),
-        )
-
-        if not temp_saved:
-            return ModelListResponse(
-                models=[],
-                success=False,
-                message="保存临时配置失败"
-            )
-
-        # 创建OpenAI服务实例
-        openai_service = OpenAIService()
+        openai_service = OpenAIService(config=runtime_config)
         
         # 获取模型列表
         models = await openai_service.get_available_models()
@@ -88,13 +85,7 @@ async def get_available_models(config: ConfigRequest):
         )
         
     except Exception as e:
-        if config.provider == "custom":
-            return ModelListResponse(
-                models=[],
-                success=False,
-                message=f"未能从自定义端点同步模型列表：{str(e)}"
-            )
-        fallback_models = get_default_models(config.provider)
+        fallback_models = get_default_models(DEFAULT_PROVIDER)
         if fallback_models:
             return ModelListResponse(
                 models=fallback_models,
@@ -112,28 +103,20 @@ async def get_available_models(config: ConfigRequest):
 async def verify_provider(config: ConfigRequest):
     """验证当前供应商配置是否真的可连通、可取模型、可发起对话请求"""
     try:
-        auth_error = get_provider_auth_error(config.provider, config.api_key)
+        runtime_config = _litellm_config_payload(config)
+        auth_error = get_provider_auth_error(runtime_config["provider"], runtime_config["api_key"])
         if auth_error:
             return ProviderVerifyResponse(
                 success=False,
                 message=auth_error,
-                provider=config.provider,
-                normalized_base_url=normalize_base_url(config.provider, config.base_url or ""),
+                provider=runtime_config["provider"],
+                normalized_base_url=runtime_config["base_url"],
                 resolved_base_url="",
                 base_url_candidates=[],
-                model_name=config.model_name,
-                api_mode=get_provider_api_mode(config.provider, config.api_mode),
+                model_name=runtime_config["model_name"],
+                api_mode=runtime_config["api_mode"],
                 checks=[],
             )
-
-        normalized_base_url = normalize_base_url(config.provider, config.base_url or "")
-        runtime_config = {
-            "provider": config.provider,
-            "api_key": config.api_key,
-            "base_url": normalized_base_url,
-            "model_name": config.model_name,
-            "api_mode": get_provider_api_mode(config.provider, config.api_mode),
-        }
 
         openai_service = OpenAIService(config=runtime_config)
         result = await openai_service.verify_current_endpoint()

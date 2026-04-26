@@ -8,11 +8,11 @@ class ConfigRequest(BaseModel):
     """模型配置请求"""
     model_config = {"protected_namespaces": ()}
     
-    provider: str = Field("openai", description="模型供应商")
+    provider: str = Field("litellm", description="模型供应商，当前固定为 LiteLLM Proxy")
     api_key: str = Field("", description="API密钥")
     base_url: Optional[str] = Field(None, description="Base URL")
-    model_name: str = Field("gpt-4.1-mini", description="模型名称")
-    api_mode: str = Field("auto", description="API协议模式：auto/chat/responses/anthropic")
+    model_name: str = Field("", description="模型名称")
+    api_mode: str = Field("chat", description="API协议模式，当前固定为 OpenAI Chat Completions")
 
 
 class ConfigResponse(BaseModel):

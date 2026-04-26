@@ -11,9 +11,9 @@ const initialState: AppState = {
   config: {
     provider: DEFAULT_PROVIDER_ID,
     api_key: '',
-    base_url: '',
-    model_name: 'gpt-4.1-mini',
-    api_mode: 'auto',
+    base_url: 'http://localhost:4000/v1',
+    model_name: '',
+    api_mode: 'chat',
   },
   fileContent: '',
   projectOverview: '',

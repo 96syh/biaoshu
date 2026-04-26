@@ -28,6 +28,13 @@ const getDefaultApiBaseUrl = () => {
   }
 
   if (typeof window !== 'undefined' && window.location.origin) {
+    if (
+      window.location.hostname === 'localhost'
+      && ['3000', '3001'].includes(window.location.port)
+    ) {
+      return 'http://localhost:8000';
+    }
+
     return window.location.origin;
   }
 

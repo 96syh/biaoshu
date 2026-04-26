@@ -5,6 +5,7 @@ import json
 import asyncio
 import re
 import aiohttp
+import os
 
 from ..utils.outline_util import get_random_indexes, calculate_nodes_distribution, generate_one_outline_json_by_level1
 from ..utils import prompt_manager
@@ -19,8 +20,6 @@ from ..utils.provider_registry import (
     get_provider_api_mode,
     normalize_base_url,
     provider_supports_model_listing,
-    provider_uses_anthropic_api,
-    provider_uses_responses_api,
     resolve_api_key,
 )
 
@@ -31,7 +30,8 @@ class OpenAIService:
     def __init__(self, config: Dict[str, Any] | None = None):
         """初始化模型服务，支持传入运行时配置覆盖已保存配置"""
         runtime_config = dict(config or config_manager.load_config())
-        self.provider = runtime_config.get('provider', DEFAULT_PROVIDER)
+        # 模型接入统一收敛到 LiteLLM Proxy，由 LiteLLM 负责把各厂商协议转换成 OpenAI 格式。
+        self.provider = DEFAULT_PROVIDER
         self.api_key = runtime_config.get('api_key', '')
         self.base_url = runtime_config.get('base_url', '')
         self.model_name = runtime_config.get('model_name', 'gpt-4.1-mini')
@@ -43,18 +43,10 @@ class OpenAIService:
             if self.base_url_candidates
             else (self.normalized_base_url or get_default_base_url(self.provider))
         )
-        self.uses_anthropic_api = provider_uses_anthropic_api(
-            self.provider,
-            self.model_name,
-            self.api_mode,
-        )
-        self.uses_responses_api = provider_uses_responses_api(
-            self.provider,
-            self.model_name,
-            self.api_mode,
-        )
+        self.uses_anthropic_api = False
+        self.uses_responses_api = False
 
-        # 统一走 OpenAI SDK，兼容 OpenAI / Claude / Gemini / DeepSeek / Ollama 等兼容端点
+        # 统一走 LiteLLM Proxy 暴露的 OpenAI Chat Completions 兼容接口。
         self.client = self._create_client(self.resolved_base_url)
 
     def _create_client(self, base_url: str | None) -> openai.AsyncOpenAI:
@@ -64,9 +56,14 @@ class OpenAIService:
             base_url=base_url if base_url else None
         )
 
+    @staticmethod
+    def _force_local_fallback() -> bool:
+        """端到端本地验证开关，避免测试时把用户招标文件外传到第三方模型。"""
+        return os.getenv("YIBIAO_FORCE_LOCAL_FALLBACK") == "1"
+
     def _iter_base_urls(self) -> list[str | None]:
         """获取本次请求应尝试的 Base URL 列表"""
-        if self.provider in {"custom", "anthropic"} and self.base_url_candidates:
+        if self.provider in {"custom", "anthropic", "litellm"} and self.base_url_candidates:
             return list(self.base_url_candidates)
         return [self.resolved_base_url]
 
@@ -140,6 +137,592 @@ class OpenAIService:
         return candidate
 
     @staticmethod
+    def _compact_text(text: str, limit: int = 120) -> str:
+        """压缩模型/文本抽取内容，避免兜底报告继续制造超长 JSON。"""
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        return normalized[:limit]
+
+    @staticmethod
+    def _clean_extracted_value(value: str, limit: int = 80) -> str:
+        """清洗从段落或表格中抽出的字段值。"""
+        cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" |:：\t")
+        if "||" in cleaned:
+            cleaned = cleaned.split("||", 1)[0].strip()
+        if "|" in cleaned:
+            cleaned = cleaned.split("|", 1)[0].strip()
+        return cleaned[:limit]
+
+    @staticmethod
+    def _extract_table_value(text: str, labels: list[str], limit: int = 80) -> str:
+        """从 file_service 扁平化后的 Word 表格行中抽取字段。"""
+        for raw_line in str(text or "").splitlines():
+            if "||" not in raw_line and "|" not in raw_line:
+                continue
+            cells = [cell.strip() for cell in re.split(r"\s*\|\|?\s*", raw_line) if cell.strip()]
+            for index, cell in enumerate(cells[:-1]):
+                normalized_cell = re.sub(r"^\d+(?:\.\d+)*\s*", "", cell).strip()
+                for label in labels:
+                    colon_match = re.match(rf"^{re.escape(label)}\s*[：:]\s*(.+)$", normalized_cell)
+                    if colon_match:
+                        return OpenAIService._clean_extracted_value(colon_match.group(1), limit)
+                if any(label == normalized_cell for label in labels):
+                    for candidate in cells[index + 1:]:
+                        if candidate and candidate not in {"编列内容", "要求", "评审标准"}:
+                            return OpenAIService._clean_extracted_value(candidate, limit)
+        return ""
+
+    @staticmethod
+    def _extract_labeled_value(text: str, labels: list[str], limit: int = 80) -> str:
+        """从招标文本中按常见标签抽取一行字段。"""
+        table_value = OpenAIService._extract_table_value(text, labels, limit)
+        if table_value:
+            return table_value
+        for label in labels:
+            pattern = rf"{re.escape(label)}\s*[：:]\s*([^\n\r。；;]{{1,120}})"
+            match = re.search(pattern, text)
+            if match:
+                return OpenAIService._clean_extracted_value(match.group(1), limit)
+        return ""
+
+    @staticmethod
+    def _extract_project_name(text: str) -> str:
+        """优先从封面、公告标题或须知表抽取项目名称。"""
+        table_value = OpenAIService._extract_table_value(text, ["招标项目名称", "项目名称", "采购项目名称"], 100)
+        if table_value and not table_value.startswith("见"):
+            return table_value
+        cover_match = re.search(r"([^|\n\r]{4,100}?(?:服务框架|项目|工程|采购))\s*\|\s*招标文件", str(text or ""))
+        if cover_match:
+            return OpenAIService._clean_extracted_value(cover_match.group(1), 100)
+        for raw_line in str(text or "").splitlines()[:40]:
+            line = raw_line.strip()
+            if not line or line in {"招标文件", "采购文件"}:
+                continue
+            if "招标文件" in line:
+                candidate = line.replace("招标文件", "").strip()
+                if candidate:
+                    return OpenAIService._clean_extracted_value(candidate, 100)
+            if re.search(r"服务框架|项目|工程|采购", line) and len(line) <= 80:
+                return OpenAIService._clean_extracted_value(line, 100)
+        match = re.search(r"本招标项目\s*([^\n\r，。]{4,100}?)(?:已|，|。)", text)
+        if match:
+            return OpenAIService._clean_extracted_value(match.group(1), 100)
+        return table_value
+
+    @staticmethod
+    def _extract_project_number(text: str) -> str:
+        """抽取招标/采购编号，避免表格残片误识别。"""
+        match = re.search(r"(?:招标编号|项目编号|采购编号)\s*[：:]\s*([A-Za-z0-9_\-]+)", str(text or ""))
+        if match:
+            return OpenAIService._clean_extracted_value(match.group(1), 80)
+        return OpenAIService._extract_labeled_value(text, ["项目编号", "招标编号", "采购编号"])
+
+    @staticmethod
+    def _keyword_source(text: str, keyword: str) -> str:
+        """为兜底条目生成可追溯的粗粒度出处。"""
+        index = text.find(keyword)
+        if index == -1:
+            return ""
+        prefix = text[max(0, index - 80):index]
+        chapter_match = re.findall(r"(第[一二三四五六七八九十\d]+章[^。\n\r]{0,30}|[一二三四五六七八九十\d]+[\.、][^。\n\r]{0,30})", prefix)
+        return OpenAIService._compact_text(chapter_match[-1] if chapter_match else "招标文件相关条款", 60)
+
+    @staticmethod
+    def _fallback_analysis_report(file_content: str, reason: str = "") -> Dict[str, Any]:
+        """模型结构化输出失败时的保底 AnalysisReport。
+
+        该兜底只使用招标文件原文可见信息，不虚构企业材料，目标是让后续目录、
+        正文、审校、导出流程继续可执行，并在 UI 上暴露待补与风险。
+        """
+        text = str(file_content or "")
+        project_name = OpenAIService._extract_project_name(text)
+        project_number = OpenAIService._extract_project_number(text)
+        purchaser = OpenAIService._extract_labeled_value(text, ["招标人", "采购人", "建设单位"])
+        budget = OpenAIService._extract_labeled_value(text, ["预算金额", "最高限价", "招标控制价", "最高投标限价"])
+        service_period = OpenAIService._extract_labeled_value(text, ["服务期限", "工期", "合同履行期限"])
+        deadline = OpenAIService._extract_labeled_value(text, ["投标截止时间", "递交截止时间", "开标时间"])
+        signature_req = "按招标文件格式完成法定代表人/授权代表签字或盖章并加盖公章" if re.search(r"签字|盖章|公章|法定代表人", text) else ""
+
+        score_blocks = re.findall(
+            r"【评分项名称】[：:]\s*(.*?)\s*【权重/分值】[：:]\s*(.*?)\s*【评分标准】[：:]\s*(.*?)(?=【评分项名称】|【数据来源】|$)",
+            text,
+            flags=re.S,
+        )
+        if not score_blocks:
+            score_blocks = re.findall(
+                r"([^\n\r。；;]{2,30})\s*([0-9]+(?:\.[0-9]+)?\s*分)\s*([^\n\r]{20,240})",
+                text,
+            )
+
+        technical_items = []
+        business_items = []
+        required_materials = []
+        missing_materials = []
+        evidence_requirements = []
+        for index, block in enumerate(score_blocks[:8], start=1):
+            name, score, standard = (OpenAIService._compact_text(part, 80) for part in block[:3])
+            material_id = f"M-{index:02d}"
+            evidence = []
+            for keyword in ["证书", "合同", "业绩", "社保", "发票", "截图", "承诺函", "名单"]:
+                if keyword in standard:
+                    evidence.append(keyword)
+            if evidence:
+                required_materials.append({
+                    "id": material_id,
+                    "name": f"{name}证明材料",
+                    "purpose": name,
+                    "source": OpenAIService._keyword_source(text, name),
+                    "status": "unknown",
+                })
+                missing_materials.append({
+                    "id": f"X-{index:02d}",
+                    "name": f"{name}相关企业材料",
+                    "used_by": [f"T-{index:02d}"],
+                    "placeholder": f"待补充：{name}相关证明材料",
+                })
+                evidence_requirements.append({
+                    "id": f"EV-{index:02d}",
+                    "target": name,
+                    "required_evidence": evidence[:4],
+                    "validation_rule": "按招标文件评分标准逐项核验",
+                    "source": OpenAIService._keyword_source(text, name),
+                    "risk": "证明材料缺失或专业不匹配会影响得分",
+                })
+
+            item = {
+                "id": f"T-{index:02d}",
+                "name": name or f"技术评分项{index}",
+                "score": score,
+                "standard": OpenAIService._compact_text(standard, 140),
+                "source": OpenAIService._keyword_source(text, name) or "评分办法",
+                "writing_focus": "正文需逐条响应评分标准并引用证明材料",
+                "evidence_requirements": evidence[:4],
+                "easy_loss_points": ["未按评分标准逐项响应", "证明材料缺失或不一致"],
+            }
+            if re.search(r"报价|价格|商务|业绩|资信|信誉", name):
+                business_items.append({**item, "id": f"B-{len(business_items) + 1:02d}"})
+            else:
+                technical_items.append(item)
+
+        if not technical_items:
+            technical_items.append({
+                "id": "T-01",
+                "name": "技术服务方案",
+                "score": "",
+                "standard": "按招标文件技术评审要求响应",
+                "source": OpenAIService._keyword_source(text, "技术") or "技术评审条款",
+                "writing_focus": "围绕项目理解、实施方案、质量安全和服务保障展开",
+                "evidence_requirements": [],
+                "easy_loss_points": ["响应不完整", "缺少针对性"],
+            })
+
+        bid_structure = [
+            {"id": "S-01", "parent_id": "", "title": "投标函及投标函附录", "purpose": "正式响应招标要求", "category": "承诺", "required": True, "fixed_format": True, "signature_required": True, "attachment_required": False, "source": OpenAIService._keyword_source(text, "投标函")},
+            {"id": "S-02", "parent_id": "", "title": "资格审查资料", "purpose": "证明投标资格", "category": "资格", "required": True, "fixed_format": False, "signature_required": True, "attachment_required": True, "source": OpenAIService._keyword_source(text, "资格")},
+            {"id": "S-03", "parent_id": "", "title": "技术服务方案", "purpose": "响应技术评分项", "category": "技术", "required": True, "fixed_format": False, "signature_required": False, "attachment_required": False, "source": OpenAIService._keyword_source(text, "技术")},
+            {"id": "S-04", "parent_id": "", "title": "商务响应与报价文件", "purpose": "响应商务和报价要求", "category": "商务/报价", "required": True, "fixed_format": True, "signature_required": True, "attachment_required": True, "source": OpenAIService._keyword_source(text, "报价")},
+        ]
+
+        formal_review = [{
+            "id": "E-01",
+            "review_type": "形式评审",
+            "requirement": "投标文件格式、签字盖章、递交方式需符合招标文件要求",
+            "criterion": "格式完整且签章齐全",
+            "required_materials": [],
+            "risk": "格式或签章缺失可能导致否决",
+            "target_chapters": ["投标函及投标函附录"],
+            "source": OpenAIService._keyword_source(text, "形式评审"),
+        }]
+        qualification_review = [{
+            "id": "E-02",
+            "review_type": "资格评审",
+            "requirement": "按招标文件提交企业资质、业绩、人员等资格证明",
+            "criterion": "资格证明真实、有效、覆盖要求",
+            "required_materials": [item["id"] for item in required_materials[:4]],
+            "risk": "资格证明缺失或过期可能导致否决",
+            "target_chapters": ["资格审查资料"],
+            "source": OpenAIService._keyword_source(text, "资格评审"),
+        }]
+        responsiveness_review = [{
+            "id": "E-03",
+            "review_type": "响应性评审",
+            "requirement": "服务期限、质量、报价、实质性条款需无偏离响应",
+            "criterion": "未出现重大偏离",
+            "required_materials": [],
+            "risk": "实质性条款未响应可能导致否决",
+            "target_chapters": ["技术服务方案", "商务响应与报价文件"],
+            "source": OpenAIService._keyword_source(text, "响应性评审"),
+        }]
+
+        if not required_materials:
+            required_materials.append({
+                "id": "M-01",
+                "name": "企业资格与评分证明材料",
+                "purpose": "资格审查和评分佐证",
+                "source": OpenAIService._keyword_source(text, "证明材料"),
+                "status": "unknown",
+            })
+            missing_materials.append({
+                "id": "X-01",
+                "name": "企业资格与评分证明材料",
+                "used_by": ["Q-01", "T-01"],
+                "placeholder": "待补充：企业资质、业绩、人员、承诺等证明材料",
+            })
+
+        report = {
+            "project": {
+                "name": project_name,
+                "number": project_number,
+                "package_name": "",
+                "purchaser": purchaser,
+                "project_type": "",
+                "budget": budget,
+                "service_scope": OpenAIService._extract_labeled_value(text, ["服务范围", "采购内容", "招标范围"], 100),
+                "service_period": service_period,
+                "service_location": OpenAIService._extract_labeled_value(text, ["服务地点", "项目地点", "建设地点"]),
+                "quality_requirements": OpenAIService._extract_labeled_value(text, ["质量要求", "服务质量"]),
+                "bid_validity": OpenAIService._extract_labeled_value(text, ["投标有效期"]),
+                "bid_bond": OpenAIService._extract_labeled_value(text, ["投标保证金"]),
+                "performance_bond": OpenAIService._extract_labeled_value(text, ["履约担保", "履约保证金"]),
+                "bid_deadline": deadline,
+                "submission_requirements": OpenAIService._extract_labeled_value(text, ["递交要求", "投标文件递交", "电子投标"]),
+                "signature_requirements": signature_req,
+            },
+            "bid_mode_recommendation": "full_bid" if re.search(r"报价|商务|资格|投标函|开标一览表", text) else "technical_only",
+            "bid_structure": bid_structure,
+            "formal_review_items": formal_review,
+            "qualification_review_items": qualification_review,
+            "responsiveness_review_items": responsiveness_review,
+            "business_scoring_items": business_items[:8],
+            "technical_scoring_items": technical_items[:8],
+            "price_scoring_items": [{
+                "id": "P-01",
+                "name": "报价评分",
+                "score": "",
+                "logic": "按招标文件价格评分办法执行",
+                "source": OpenAIService._keyword_source(text, "报价"),
+                "risk": "报价口径、税费或格式错误会影响评审",
+            }] if "报价" in text or "价格" in text else [],
+            "price_rules": {
+                "quote_method": OpenAIService._extract_labeled_value(text, ["报价方式", "报价要求"]),
+                "tax_requirement": "按招标文件要求含税/不含税报价" if re.search(r"含税|税率|不含税", text) else "",
+                "decimal_places": OpenAIService._extract_labeled_value(text, ["小数位", "精确到"]),
+                "uniqueness_requirement": "投标报价应唯一" if "唯一" in text and "报价" in text else "",
+                "form_requirements": "按开标一览表或报价表格式填写" if re.search(r"开标一览表|报价表", text) else "",
+                "arithmetic_correction_rule": OpenAIService._extract_labeled_value(text, ["算术错误", "修正"]),
+                "missing_item_rule": OpenAIService._extract_labeled_value(text, ["缺漏项", "漏项"]),
+                "prohibited_format_changes": ["不得擅自修改固定格式"] if re.search(r"不得.*修改|格式.*不得", text) else [],
+            },
+            "qualification_requirements": [{
+                "id": "Q-01",
+                "name": "投标人资格要求",
+                "requirement": "满足招标文件资格审查要求并提供有效证明",
+                "source": OpenAIService._keyword_source(text, "资格"),
+                "required_materials": [item["id"] for item in required_materials[:4]],
+            }],
+            "formal_response_requirements": [{
+                "id": "F-01",
+                "name": "投标文件格式与签章",
+                "requirement": "使用招标文件规定格式，按要求签字盖章",
+                "source": OpenAIService._keyword_source(text, "签字"),
+                "fixed_format": True,
+                "signature_required": bool(signature_req),
+                "attachment_required": False,
+            }],
+            "mandatory_clauses": [{
+                "id": "C-01",
+                "clause": "服务期限、质量、报价、资格及实质性条款需逐项响应",
+                "source": OpenAIService._keyword_source(text, "实质性"),
+                "response_strategy": "在目录和正文中设置专门响应章节并避免负偏离",
+            }],
+            "rejection_risks": [{
+                "id": "R-01",
+                "risk": "签字盖章、资格证明、实质性响应或报价格式缺失可能导致否决",
+                "source": OpenAIService._keyword_source(text, "否决") or OpenAIService._keyword_source(text, "废标"),
+                "mitigation": "生成正文后执行合规审校，逐项补齐材料和格式",
+            }],
+            "fixed_format_forms": [{
+                "id": "FF-01",
+                "name": "投标函/报价表等固定格式",
+                "source": OpenAIService._keyword_source(text, "格式"),
+                "required_columns": [],
+                "fixed_text": "",
+                "fill_rules": "按招标文件模板填写，不擅自改动格式",
+            }],
+            "signature_requirements": [{
+                "id": "SIG-01",
+                "target": "投标函、授权委托书、报价表及承诺文件",
+                "signer": "法定代表人或授权代表",
+                "seal": "按格式要求加盖投标人公章",
+                "source": OpenAIService._keyword_source(text, "盖章"),
+                "risk": "漏签漏盖可能导致形式评审不通过",
+            }],
+            "evidence_chain_requirements": evidence_requirements[:8],
+            "required_materials": required_materials[:8],
+            "missing_company_materials": missing_materials[:8],
+        }
+        if reason:
+            report["rejection_risks"].append({
+                "id": "R-02",
+                "risk": f"结构化模型输出未完整返回，已启用文本兜底解析：{OpenAIService._compact_text(reason, 80)}",
+                "source": "系统解析状态",
+                "mitigation": "可换用更快模型后重跑标准解析以获得更完整映射",
+            })
+        return AnalysisReport.model_validate(report).model_dump(mode="json")
+
+    @staticmethod
+    def fallback_overview(file_content: str) -> str:
+        """本地提取项目概述，用于安全 smoke 或模型异常兜底。"""
+        report = OpenAIService._fallback_analysis_report(file_content)
+        project = report.get("project", {})
+        lines = [
+            f"项目名称：{project.get('name') or '待模型解析'}",
+            f"项目编号：{project.get('number') or '待模型解析'}",
+            f"招标/采购人：{project.get('purchaser') or '待模型解析'}",
+            f"预算/限价：{project.get('budget') or '以招标文件为准'}",
+            f"服务期限：{project.get('service_period') or '以招标文件为准'}",
+            f"递交截止：{project.get('bid_deadline') or '以招标文件为准'}",
+            "项目概述：本项目需按招标文件要求完成资格、商务、报价和技术响应，正文应围绕评分项、实质性条款、材料清单和签字盖章要求逐项展开。",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def fallback_requirements(file_content: str) -> str:
+        """本地提取技术评分要求，用于安全 smoke 或模型异常兜底。"""
+        report = OpenAIService._fallback_analysis_report(file_content)
+        items = report.get("technical_scoring_items") or []
+        if not items:
+            return "【评分项名称】：技术服务方案\n【权重/分值】：以招标文件为准\n【评分标准】：围绕项目理解、实施方案、质量安全、进度保障、人员组织和服务响应逐项编写。\n【数据来源】：技术评审条款"
+        blocks = []
+        for item in items[:8]:
+            blocks.append(
+                "\n".join([
+                    f"【评分项名称】：{item.get('name') or '技术评分项'}",
+                    f"【权重/分值】：{item.get('score') or '以招标文件为准'}",
+                    f"【评分标准】：{item.get('standard') or '按招标文件评分标准响应'}",
+                    f"【数据来源】：{item.get('source') or '评分办法'}",
+                ])
+            )
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _fallback_outline(
+        analysis_report: Dict[str, Any] | None = None,
+        bid_mode: str | None = None,
+    ) -> Dict[str, Any]:
+        """目录生成失败时的保底目录，字段与 OutlineItem 对齐。"""
+        report = analysis_report or {}
+        technical_ids = [item.get("id") for item in report.get("technical_scoring_items", []) if item.get("id")]
+        material_ids = [item.get("id") for item in report.get("required_materials", []) if item.get("id")]
+        risk_ids = [item.get("id") for item in report.get("rejection_risks", []) if item.get("id")]
+        requirement_ids = []
+        for key in ("qualification_requirements", "formal_response_requirements", "mandatory_clauses"):
+            requirement_ids.extend([item.get("id") for item in report.get(key, []) if item.get("id")])
+
+        full_bid = bid_mode == "full_bid" or report.get("bid_mode_recommendation") == "full_bid"
+        outline = [
+            {
+                "id": "1",
+                "title": "投标函及资格商务响应",
+                "description": "按正式投标文件要求完成投标函、资格审查、商务响应、签字盖章和材料索引。",
+                "scoring_item_ids": [],
+                "requirement_ids": requirement_ids[:8],
+                "risk_ids": risk_ids[:4],
+                "material_ids": material_ids[:8],
+                "children": [
+                    {
+                        "id": "1.1",
+                        "title": "投标函及承诺响应",
+                        "description": "保留固定格式、签字盖章、报价和服务期限等关键字段。",
+                        "scoring_item_ids": [],
+                        "requirement_ids": requirement_ids[:4],
+                        "risk_ids": risk_ids[:2],
+                        "material_ids": [],
+                    },
+                    {
+                        "id": "1.2",
+                        "title": "资格审查资料清单",
+                        "description": "列明企业资质、业绩、人员、社保、证书等应附材料和核验要点。",
+                        "scoring_item_ids": [],
+                        "requirement_ids": requirement_ids[:8],
+                        "risk_ids": risk_ids[:4],
+                        "material_ids": material_ids[:8],
+                    },
+                ],
+            },
+            {
+                "id": "2",
+                "title": "项目理解与总体服务方案",
+                "description": "围绕项目背景、服务范围、总体思路、实施路径和成果交付展开。",
+                "scoring_item_ids": technical_ids[:4],
+                "requirement_ids": requirement_ids[:4],
+                "risk_ids": risk_ids[:2],
+                "material_ids": material_ids[:4],
+                "children": [
+                    {
+                        "id": "2.1",
+                        "title": "项目理解与需求分析",
+                        "description": "结合招标范围和评分标准说明项目目标、边界和重点难点。",
+                        "scoring_item_ids": technical_ids[:2],
+                        "requirement_ids": [],
+                        "risk_ids": [],
+                        "material_ids": [],
+                    },
+                    {
+                        "id": "2.2",
+                        "title": "总体实施方案",
+                        "description": "描述组织架构、工作流程、进度计划、质量安全和服务保障。",
+                        "scoring_item_ids": technical_ids[:6],
+                        "requirement_ids": [],
+                        "risk_ids": risk_ids[:2],
+                        "material_ids": [],
+                    },
+                ],
+            },
+            {
+                "id": "3",
+                "title": "评分项响应与证明材料",
+                "description": "逐项对齐技术评分、商务评分和材料要求，避免漏项和空泛响应。",
+                "scoring_item_ids": technical_ids[:8],
+                "requirement_ids": requirement_ids[:8],
+                "risk_ids": risk_ids[:4],
+                "material_ids": material_ids[:8],
+                "children": [
+                    {
+                        "id": "3.1",
+                        "title": "技术评分项逐项响应",
+                        "description": "按照评分项逐项写明响应措施、支撑材料和易失分控制。",
+                        "scoring_item_ids": technical_ids[:8],
+                        "requirement_ids": [],
+                        "risk_ids": risk_ids[:4],
+                        "material_ids": material_ids[:8],
+                    },
+                    {
+                        "id": "3.2",
+                        "title": "证明材料与页码索引",
+                        "description": "汇总待补材料、证据链和最终页码索引。",
+                        "scoring_item_ids": [],
+                        "requirement_ids": requirement_ids[:8],
+                        "risk_ids": risk_ids[:4],
+                        "material_ids": material_ids[:8],
+                    },
+                ],
+            },
+        ]
+        if full_bid:
+            outline.append({
+                "id": "4",
+                "title": "报价文件与组卷自检",
+                "description": "按报价规则、固定格式和导出前审校要求完成组卷检查。",
+                "scoring_item_ids": [],
+                "requirement_ids": requirement_ids[:8],
+                "risk_ids": risk_ids[:4],
+                "material_ids": material_ids[:8],
+                "children": [
+                    {
+                        "id": "4.1",
+                        "title": "报价规则响应",
+                        "description": "说明报价口径、税费、唯一报价、费用明细和格式要求。",
+                        "scoring_item_ids": [],
+                        "requirement_ids": requirement_ids[:4],
+                        "risk_ids": risk_ids[:4],
+                        "material_ids": [],
+                    },
+                    {
+                        "id": "4.2",
+                        "title": "导出前合规自检",
+                        "description": "检查覆盖率、缺失材料、签字盖章、固定格式和页码占位。",
+                        "scoring_item_ids": technical_ids[:8],
+                        "requirement_ids": requirement_ids[:8],
+                        "risk_ids": risk_ids[:4],
+                        "material_ids": material_ids[:8],
+                    },
+                ],
+            })
+        return {"outline": outline}
+
+    @staticmethod
+    def _fallback_chapter_content(
+        chapter: dict,
+        project_overview: str = "",
+        analysis_report: Dict[str, Any] | None = None,
+        missing_materials: list | None = None,
+    ) -> str:
+        """正文生成失败时的保底章节内容。"""
+        title = chapter.get("title") or "当前章节"
+        description = chapter.get("description") or "按招标文件要求编写。"
+        project = (analysis_report or {}).get("project", {})
+        missing = missing_materials or (analysis_report or {}).get("missing_company_materials", [])
+        missing_lines = "\n".join(
+            f"- 【待补充：{item.get('name') or '相关证明材料'}】{item.get('placeholder') or ''}"
+            for item in missing[:6]
+        ) or "- 暂未识别到企业侧已提供材料，最终组卷前需核验资格、商务、人员、业绩和签章材料。"
+        return (
+            f"本节围绕“{title}”进行响应。{description}\n\n"
+            f"项目名称：{project.get('name') or '以招标文件为准'}。\n"
+            f"响应原则：以招标文件、评分办法和标准解析报告为准，逐项覆盖当前章节关联的评分项、审查要求、风险点和材料要求。\n\n"
+            "实施与响应要点：\n"
+            "1. 对招标文件中的实质性条款、服务范围、进度安排、质量要求和成果交付要求逐项响应。\n"
+            "2. 对评分项设置专门小节，说明工作方法、组织安排、质量控制、风险防控和交付成果。\n"
+            "3. 对固定格式、报价表、承诺函、签字盖章和页码索引保留【页码待编排】等占位，不擅自改变格式。\n\n"
+            "应附材料及核验要点：\n"
+            f"{missing_lines}\n\n"
+            "组卷提示：正文完成后需执行合规审校，确认覆盖率、阻塞问题、警告问题和材料缺失项。"
+        )
+
+    @staticmethod
+    def _fallback_compliance_review(
+        outline: list,
+        analysis_report: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """合规审校失败时的保底审校结果。"""
+        report = analysis_report or {}
+        scoring_ids = [item.get("id") for item in report.get("technical_scoring_items", []) if item.get("id")]
+        material_ids = [item.get("id") for item in report.get("required_materials", []) if item.get("id")]
+        risk_ids = [item.get("id") for item in report.get("rejection_risks", []) if item.get("id")]
+        coverage = [
+            {"item_id": item_id, "covered": False, "chapter_ids": [], "issue": "需确认正文是否逐项覆盖评分标准"}
+            for item_id in scoring_ids[:8]
+        ]
+        missing = [
+            {"material_id": item_id, "chapter_ids": [], "placeholder": "待补充或核验证明材料"}
+            for item_id in material_ids[:8]
+        ]
+        risks = [
+            {"risk_id": item_id, "handled": False, "issue": "需在导出前核验签字盖章、格式、材料和实质性响应"}
+            for item_id in risk_ids[:8]
+        ]
+        warnings = len(coverage) + len(missing) + len(risks)
+        return ReviewReport.model_validate({
+            "coverage": coverage,
+            "missing_materials": missing,
+            "rejection_risks": risks,
+            "duplication_issues": [],
+            "fabrication_risks": [],
+            "fixed_format_issues": [],
+            "signature_issues": [{
+                "item_id": "SIG-01",
+                "chapter_ids": [],
+                "issue": "签字盖章需在最终 Word 组卷后人工核验",
+                "severity": "warning",
+                "blocking": False,
+            }],
+            "price_rule_issues": [],
+            "evidence_chain_issues": [],
+            "page_reference_issues": [{
+                "item_id": "PAGE-01",
+                "chapter_ids": [],
+                "issue": "最终排版前页码索引仍为待编排状态",
+                "severity": "warning",
+                "blocking": False,
+            }],
+            "summary": {
+                "ready_to_export": False,
+                "blocking_issues": 0,
+                "warnings": warnings + 2,
+            },
+        }).model_dump(mode="json")
+
+    @staticmethod
     def _raise_if_gateway_error(payload: Any) -> None:
         """识别 OpenAI 兼容网关用 200 响应包裹的业务错误"""
         if not hasattr(payload, "model_dump"):
@@ -154,14 +737,27 @@ class OpenAIService:
         status_msg = base_resp.get("status_msg") or base_resp.get("message") or "unknown error"
         if status_code not in (None, 0, "0"):
             raise Exception(f"模型网关返回错误: {status_msg} ({status_code})")
+
+    @staticmethod
+    def _is_model_selection_error(error: Exception | None) -> bool:
+        """判断 OpenAI 兼容调用失败是否由模型名不匹配导致。
+
+        这种情况下继续尝试 Claude 原生协议会掩盖真正的错误。
+        """
+        message = str(error or "").lower()
+        return any(marker in message for marker in (
+            "model",
+            "not found",
+            "not_found",
+            "available models",
+            "does not exist",
+            "invalid model",
+        ))
     
     async def get_available_models(self) -> List[str]:
         """获取可用的模型列表"""
         if not provider_supports_model_listing(self.provider):
             return get_default_models(self.provider)
-
-        if self.uses_anthropic_api:
-            return await self._get_anthropic_models()
 
         last_error: Exception | None = None
         for candidate in self._iter_base_urls():
@@ -170,15 +766,20 @@ class OpenAIService:
                 models = await client.models.list()
                 self.client = client
                 self.resolved_base_url = candidate or ""
-                chat_models = []
+                model_ids = []
                 for model in models.data:
+                    if not getattr(model, "id", None):
+                        continue
+                    if self.provider in {"custom", "litellm"}:
+                        model_ids.append(model.id)
+                        continue
                     model_id = model.id.lower()
                     if any(keyword in model_id for keyword in [
                         'gpt', 'claude', 'chat', 'llama', 'qwen', 'deepseek',
                         'gemini', 'moonshot', 'kimi', 'glm', 'mistral', 'codex', 'gpt-5',
                     ]):
-                        chat_models.append(model.id)
-                normalized_models = sorted(list(set(chat_models)))
+                        model_ids.append(model.id)
+                normalized_models = sorted(list(set(model_ids)))
                 if normalized_models:
                     return normalized_models
 
@@ -188,16 +789,6 @@ class OpenAIService:
                 raise Exception("未找到可用的对话模型")
             except Exception as e:
                 last_error = e
-
-        if self.provider == "custom" and self.api_mode == "auto":
-            try:
-                return await self._get_anthropic_models()
-            except Exception as anthropic_error:
-                last_error = anthropic_error
-            raise Exception(
-                "自定义端点没有返回可用模型列表。请确认 Base URL 指向兼容 OpenAI 的根路径（通常是 /v1），"
-                "或该地址本身是 Claude 原生网关。"
-            ) from last_error
 
         try:
             fallback_models = get_default_models(self.provider)
@@ -214,18 +805,10 @@ class OpenAIService:
         self, 
         messages: list, 
         temperature: float = 0.7,
-        response_format: dict = None
+        response_format: dict = None,
+        max_tokens: int | None = None,
     ) -> AsyncGenerator[str, None]:
         """流式聊天完成请求 - 真正的异步实现"""
-        if self.uses_anthropic_api:
-            async for chunk in self._stream_anthropic_completion(
-                messages=messages,
-                temperature=temperature,
-                response_format=response_format,
-            ):
-                yield chunk
-            return
-
         last_error: Exception | None = None
         for candidate in self._iter_base_urls():
             client = self._create_client(candidate)
@@ -233,18 +816,11 @@ class OpenAIService:
                 self.client = client
                 self.resolved_base_url = candidate or ""
 
-                if self.uses_responses_api:
-                    async for chunk in self._stream_responses_completion(
-                        messages=messages,
-                        temperature=temperature,
-                        response_format=response_format,
-                    ):
-                        yield chunk
-                    return
-
                 request_kwargs: Dict[str, Any] = {}
                 if response_format is not None:
                     request_kwargs["response_format"] = response_format
+                if max_tokens is not None:
+                    request_kwargs["max_tokens"] = max_tokens
 
                 try:
                     stream = await self.client.chat.completions.create(
@@ -263,6 +839,7 @@ class OpenAIService:
                         messages=fallback_messages,
                         temperature=temperature,
                         stream=True,
+                        **({"max_tokens": max_tokens} if max_tokens is not None else {}),
                     )
 
                 received_content = False
@@ -279,21 +856,10 @@ class OpenAIService:
             except Exception as e:
                 last_error = e
 
-        if self.provider == "custom" and self.api_mode == "auto":
-            try:
-                async for chunk in self._stream_anthropic_completion(
-                    messages=messages,
-                    temperature=temperature,
-                    response_format=response_format,
-                ):
-                    yield chunk
-                return
-            except Exception as anthropic_error:
-                last_error = anthropic_error
+        if self._is_model_selection_error(last_error):
             raise Exception(
-                "自定义端点调用失败，请确认它是 OpenAI 兼容根路径（通常是 /v1）或 Claude 原生 /v1/messages 网关，"
-                "并检查模型名与 API Key 是否正确。"
-                + (f" 原始错误: {str(last_error)}" if last_error else "")
+                "LiteLLM Proxy 已响应，但当前模型名不可用。请先同步模型列表并选择 LiteLLM 返回的模型 ID，"
+                f"或确认 LiteLLM 配置中的 model_name。原始错误: {str(last_error)}"
             ) from last_error
 
         raise Exception(f"模型调用失败: {str(last_error)}") from last_error
@@ -457,6 +1023,7 @@ class OpenAIService:
         messages: list,
         temperature: float = 0.7,
         response_format: dict | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """收集流式返回的文本到一个完整字符串"""
         full_content = ""
@@ -464,6 +1031,7 @@ class OpenAIService:
             messages,
             temperature=temperature,
             response_format=response_format,
+            max_tokens=max_tokens,
         ):
             full_content += chunk
         return full_content
@@ -489,6 +1057,7 @@ class OpenAIService:
                 "models": models[:20],
             })
         except Exception as exc:
+            models = []
             models_error = str(exc)
             checks.append({
                 "stage": "models",
@@ -498,31 +1067,45 @@ class OpenAIService:
                 "model_name": self.model_name,
             })
 
-        try:
-            sample = await self._collect_stream_text(
-                messages=[{"role": "user", "content": "请只回复 OK"}],
-                temperature=0,
+        if models_ok and models and self.provider in {"custom", "litellm"} and self.model_name not in models:
+            chat_error = (
+                f"模型名 '{self.model_name}' 不在当前端点返回的模型列表中。"
+                f"可用模型: {', '.join(models[:20])}"
             )
-            if not sample.strip():
-                raise Exception("模型返回空内容，请确认 Base URL、模型名和 API Key 是否正确")
-            chat_ok = True
-            checks.append({
-                "stage": "chat",
-                "success": True,
-                "detail": "对话请求成功",
-                "url": self.resolved_base_url or self.normalized_base_url or "",
-                "model_name": self.model_name,
-                "sample": sample.strip()[:200],
-            })
-        except Exception as exc:
-            chat_error = str(exc)
             checks.append({
                 "stage": "chat",
                 "success": False,
                 "detail": chat_error,
                 "url": self.resolved_base_url or self.normalized_base_url or "",
                 "model_name": self.model_name,
+                "models": models[:20],
             })
+        else:
+            try:
+                sample = await self._collect_stream_text(
+                    messages=[{"role": "user", "content": "请只回复 OK"}],
+                    temperature=0,
+                )
+                if not sample.strip():
+                    raise Exception("模型返回空内容，请确认 Base URL、模型名和 API Key 是否正确")
+                chat_ok = True
+                checks.append({
+                    "stage": "chat",
+                    "success": True,
+                    "detail": "对话请求成功",
+                    "url": self.resolved_base_url or self.normalized_base_url or "",
+                    "model_name": self.model_name,
+                    "sample": sample.strip()[:200],
+                })
+            except Exception as exc:
+                chat_error = str(exc)
+                checks.append({
+                    "stage": "chat",
+                    "success": False,
+                    "detail": chat_error,
+                    "url": self.resolved_base_url or self.normalized_base_url or "",
+                    "model_name": self.model_name,
+                })
 
         if models_ok and chat_ok:
             message = "端点验证成功"
@@ -596,6 +1179,7 @@ class OpenAIService:
         max_retries: int = 3,
         temperature: float = 0.3,
         response_format: dict | None = None,
+        max_tokens: int | None = None,
         log_prefix: str = "",
     ) -> Dict[str, Any]:
         """生成 JSON 并使用 Pydantic 模型校验，适合允许空数组的结构化结果"""
@@ -603,10 +1187,26 @@ class OpenAIService:
         last_error_msg = ""
 
         while True:
+            request_messages = messages
+            if attempt > 0:
+                request_messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "上一次输出不是可解析的完整 JSON，常见原因是输出过长被截断。"
+                            "请重新输出一个更精简但字段完整的合法 JSON：每个数组最多保留最关键 8 项，"
+                            "长文本压缩到 80 字以内，必须闭合所有对象和数组。"
+                            f"上次错误：{last_error_msg}"
+                        ),
+                    },
+                ]
+
             full_content = await self._collect_stream_text(
-                messages,
+                request_messages,
                 temperature=temperature,
                 response_format=response_format,
+                max_tokens=max_tokens,
             )
             normalized_content = self._extract_json_payload(str(full_content))
 
@@ -627,19 +1227,30 @@ class OpenAIService:
 
     async def generate_analysis_report(self, file_content: str) -> Dict[str, Any]:
         """从招标文件全文生成结构化标准解析报告"""
+        if self._force_local_fallback():
+            return self._fallback_analysis_report(file_content, "本地安全验证模式")
+
         system_prompt, user_prompt = prompt_manager.generate_analysis_report_prompt(file_content)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        return await self._generate_pydantic_json(
-            messages=messages,
-            model_cls=AnalysisReport,
-            max_retries=3,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            log_prefix="标准解析报告",
-        )
+        try:
+            return await asyncio.wait_for(
+                self._generate_pydantic_json(
+                    messages=messages,
+                    model_cls=AnalysisReport,
+                    max_retries=1,
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                    max_tokens=4096,
+                    log_prefix="标准解析报告",
+                ),
+                timeout=120,
+            )
+        except Exception as e:
+            print(f"标准解析报告模型输出不可用，启用文本兜底解析：{str(e)}")
+            return self._fallback_analysis_report(file_content, str(e))
 
     async def generate_compliance_review(
         self,
@@ -648,6 +1259,9 @@ class OpenAIService:
         project_overview: str = "",
     ) -> Dict[str, Any]:
         """生成导出前合规审校报告"""
+        if self._force_local_fallback():
+            return self._fallback_compliance_review(outline, analysis_report)
+
         system_prompt, user_prompt = prompt_manager.generate_compliance_review_prompt(
             analysis_report=analysis_report,
             outline=outline,
@@ -657,14 +1271,21 @@ class OpenAIService:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        return await self._generate_pydantic_json(
-            messages=messages,
-            model_cls=ReviewReport,
-            max_retries=3,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            log_prefix="合规审校",
-        )
+        try:
+            return await asyncio.wait_for(
+                self._generate_pydantic_json(
+                    messages=messages,
+                    model_cls=ReviewReport,
+                    max_retries=1,
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                    log_prefix="合规审校",
+                ),
+                timeout=120,
+            )
+        except Exception as e:
+            print(f"合规审校模型输出不可用，启用文本兜底审校：{str(e)}")
+            return self._fallback_compliance_review(outline, analysis_report)
 
     async def generate_content_for_outline(
         self,
@@ -774,6 +1395,15 @@ class OpenAIService:
             生成的内容流
         """
         try:
+            if self._force_local_fallback():
+                yield self._fallback_chapter_content(
+                    chapter,
+                    project_overview=project_overview,
+                    analysis_report=analysis_report,
+                    missing_materials=missing_materials,
+                )
+                return
+
             chapter_id = chapter.get('id', 'unknown')
             chapter_title = chapter.get('title', '未命名章节')
             chapter_description = chapter.get('description', '')
@@ -887,8 +1517,17 @@ class OpenAIService:
             ]
 
             # 流式返回生成的文本
-            async for chunk in self.stream_chat_completion(messages, temperature=0.4):
-                yield chunk
+            try:
+                async for chunk in self.stream_chat_completion(messages, temperature=0.4):
+                    yield chunk
+            except Exception as e:
+                print(f"章节模型输出不可用，启用文本兜底正文：{str(e)}")
+                yield self._fallback_chapter_content(
+                    chapter,
+                    project_overview=project_overview,
+                    analysis_report=analysis_report,
+                    missing_materials=missing_materials,
+                )
 
         except Exception as e:
             print(f"生成章节内容时出错: {str(e)}")
@@ -901,6 +1540,9 @@ class OpenAIService:
         analysis_report: Dict[str, Any] | None = None,
         bid_mode: str | None = None,
     ) -> Dict[str, Any]:
+        if self._force_local_fallback():
+            return self._fallback_outline(analysis_report, bid_mode)
+
         scope_instruction = (
             "生成完整投标文件一级提纲，覆盖资格、商务、报价、承诺、技术、附件和组卷自检。"
             if bid_mode == "full_bid"
@@ -971,15 +1613,22 @@ class OpenAIService:
         ]
 
         # 使用通用方法进行 JSON 校验与重试（失败时抛出异常）
-        full_content = await self._generate_with_json_check(
-            messages=messages,
-            schema=schema_json,
-            max_retries=3,
-            temperature=0.3,
-            response_format={"type": "json_object"},
-            log_prefix="一级提纲",
-            raise_on_fail=True,
-        )
+        try:
+            full_content = await asyncio.wait_for(
+                self._generate_with_json_check(
+                    messages=messages,
+                    schema=schema_json,
+                    max_retries=1,
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                    log_prefix="一级提纲",
+                    raise_on_fail=True,
+                ),
+                timeout=120,
+            )
+        except Exception as e:
+            print(f"一级提纲模型输出不可用，启用文本兜底目录：{str(e)}")
+            return self._fallback_outline(analysis_report, bid_mode)
 
         # 通过校验后再进行 JSON 解析
         level_l1 = json.loads(full_content.strip())

@@ -83,6 +83,16 @@ async def analyze_document_stream(request: AnalysisRequest):
         
         async def generate():
             try:
+                if openai_service._force_local_fallback():
+                    fallback_text = (
+                        OpenAIService.fallback_overview(request.file_content)
+                        if request.analysis_type == AnalysisType.OVERVIEW
+                        else OpenAIService.fallback_requirements(request.file_content)
+                    )
+                    yield f"data: {json.dumps({'chunk': fallback_text}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
                 # 构建分析提示词
                 if request.analysis_type == AnalysisType.OVERVIEW:
                     system_prompt = """你是一个专业的标书撰写专家。请分析用户发来的招标文件，提取并总结项目概述信息。
@@ -148,8 +158,17 @@ async def analyze_document_stream(request: AnalysisRequest):
                 ]
                 
                 # 流式返回分析结果
-                async for chunk in openai_service.stream_chat_completion(messages, temperature=0.3):
-                    yield f"data: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
+                try:
+                    async for chunk in openai_service.stream_chat_completion(messages, temperature=0.3):
+                        yield f"data: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
+                except Exception as e:
+                    fallback_text = (
+                        OpenAIService.fallback_overview(request.file_content)
+                        if request.analysis_type == AnalysisType.OVERVIEW
+                        else OpenAIService.fallback_requirements(request.file_content)
+                    )
+                    print(f"文档分析模型输出不可用，启用文本兜底分析：{str(e)}")
+                    yield f"data: {json.dumps({'chunk': fallback_text}, ensure_ascii=False)}\n\n"
             except Exception as e:
                 payload = {
                     "error": True,

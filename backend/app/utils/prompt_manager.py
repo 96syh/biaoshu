@@ -314,7 +314,7 @@ def get_review_report_schema():
 
 def generate_analysis_report_prompt(file_content):
   """生成结构化标准解析报告的提示词"""
-  schema_json = json.dumps(get_analysis_report_schema(), ensure_ascii=False, indent=2)
+  schema_json = json.dumps(get_analysis_report_schema(), ensure_ascii=False, separators=(",", ":"))
   rulebook = get_full_bid_rulebook()
   system_prompt = f"""你是专业招标文件解析专家。你的任务是把招标文件解析为可供后续目录生成、正文生成和合规检查复用的 AnalysisReport JSON。
 
@@ -329,6 +329,8 @@ def generate_analysis_report_prompt(file_content):
 8. required_materials.status 只能使用 missing、provided 或 unknown。
 9. 必须同时提取形式评审、资格评审、响应性评审、商务评分、技术评分、价格规则、固定格式、签字盖章、页码占位和证据链要求；若招标文件没有对应内容则输出空数组或空字符串。
 10. 如果文档明显只要求技术标，bid_mode_recommendation 输出 technical_only；如果出现完整资格/商务/报价/承诺/附件组卷要求，输出 full_bid。
+11. 为避免 JSON 被截断，每个数组最多输出最关键 8 项；单个字段内容尽量压缩到 80 字以内；不得为了完整复述原文而输出长段落。
+12. 若同类要求很多，优先保留否决项、实质性条款、评分项、签章/格式要求和材料要求，其余合并概括到 risk、writing_focus 或 source。
 
 {rulebook}
 
