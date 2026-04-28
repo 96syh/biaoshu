@@ -50,6 +50,10 @@ const processSseLine = (
 export const consumeSseStream = async (
   response: Response,
   onPayload: (payload: SsePayload) => void,
+  options?: {
+    shouldPause?: () => boolean;
+    isStopped?: () => boolean;
+  },
 ) => {
   if (!response.ok) {
     throw new Error(await extractErrorMessage(response));
@@ -62,8 +66,20 @@ export const consumeSseStream = async (
 
   const decoder = new TextDecoder();
   let buffer = '';
+  const waitIfPaused = async () => {
+    while (options?.shouldPause?.()) {
+      if (options?.isStopped?.()) {
+        throw new DOMException('请求已停止', 'AbortError');
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 160));
+    }
+  };
 
   while (true) {
+    if (options?.isStopped?.()) {
+      throw new DOMException('请求已停止', 'AbortError');
+    }
+    await waitIfPaused();
     const { done, value } = await reader.read();
     if (done) {
       break;
@@ -74,6 +90,10 @@ export const consumeSseStream = async (
     buffer = lines.pop() ?? '';
 
     for (const line of lines) {
+      await waitIfPaused();
+      if (options?.isStopped?.()) {
+        throw new DOMException('请求已停止', 'AbortError');
+      }
       processSseLine(line, onPayload);
     }
   }

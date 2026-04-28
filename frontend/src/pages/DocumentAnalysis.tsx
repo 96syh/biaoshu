@@ -182,6 +182,12 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
         event.target.value = '';
         return;
       }
+      if (file.size > 500 * 1024 * 1024) {
+        setUploadedFile(null);
+        setMessage({ type: 'error', text: '文件大小不能超过 500MB' });
+        event.target.value = '';
+        return;
+      }
       setUploadedFile(file);
       handleFileUpload(file);
     }
@@ -340,7 +346,7 @@ const DocumentAnalysis: React.FC<DocumentAnalysisProps> = ({
               {uploadedFile ? uploadedFile.name : '点击选择文件或拖拽文件到这里'}
             </p>
             <p className="mt-2 text-sm text-slate-500">
-              支持 PDF 和 DOCX 文档，最大 10MB
+              支持 PDF 和 DOCX 文档，最大 500MB
             </p>
           </div>
           

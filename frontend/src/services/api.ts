@@ -125,6 +125,7 @@ export interface ChapterContentRequest {
   sibling_chapters?: OutlineItem[];
   project_overview: string;
   analysis_report?: AnalysisReport;
+  response_matrix?: AnalysisReport['response_matrix'];
   bid_mode?: BidMode;
   generated_summaries?: GeneratedSummary[];
   enterprise_materials?: RequiredMaterial[];
@@ -230,13 +231,14 @@ export const contentApi = {
     api.post('/api/content/generate-chapter', data),
 
   // 流式生成单章节内容
-  generateChapterContentStream: (data: ChapterContentRequest) =>
+  generateChapterContentStream: (data: ChapterContentRequest, signal?: AbortSignal) =>
     fetch(`${API_BASE_URL}/api/content/generate-chapter-stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(data),
+      signal,
     }),
 };
 

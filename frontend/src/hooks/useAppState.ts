@@ -25,9 +25,8 @@ const initialState: AppState = {
 
 export const useAppState = () => {
   const [state, setState] = useState<AppState>(() => {
-    // 按当前需求：页面刷新后回到全新工作台，不自动恢复旧草稿
-    draftStorage.clearAll();
-    return { ...initialState };
+    const draft = draftStorage.loadDraft();
+    return { ...initialState, ...draft };
   });
 
   const updateConfig = useCallback((config: ConfigData) => {
@@ -44,6 +43,7 @@ export const useAppState = () => {
 
   const updateFileContent = useCallback((fileContent: string) => {
     setState(prev => {
+      draftStorage.startNewHistory();
       const next = { ...prev, fileContent };
       draftStorage.saveDraft({ fileContent });
       return next;
@@ -87,6 +87,23 @@ export const useAppState = () => {
     });
   }, []);
 
+  const restoreDraft = useCallback((draft: Partial<Pick<
+    AppState,
+    | 'currentStep'
+    | 'fileContent'
+    | 'projectOverview'
+    | 'techRequirements'
+    | 'analysisReport'
+    | 'outlineData'
+    | 'selectedChapter'
+  >>) => {
+    setState(prev => {
+      const next = { ...prev, ...draft };
+      draftStorage.saveDraft(draft);
+      return next;
+    });
+  }, []);
+
   const nextStep = useCallback(() => {
     setState(prev => {
       const nextStepValue = Math.min(prev.currentStep + 1, 2);
@@ -113,6 +130,7 @@ export const useAppState = () => {
     updateAnalysisResults,
     updateOutline,
     updateSelectedChapter,
+    restoreDraft,
     nextStep,
     prevStep,
   };

@@ -1,27 +1,4 @@
-import random
-from typing import Dict, Tuple
-
-
-def get_random_indexes(max_index: int) -> Tuple[int, int]:
-    """
-    从0到max_index范围内随机选择两个不同的索引
-    
-    Args:
-        max_index: 索引的最大值（不包含）
-        
-    Returns:
-        Tuple[int, int]: 两个不同的随机索引
-    """
-    if max_index < 2:
-        raise ValueError("max_index must be at least 2 to select two different indexes")
-    
-    # 生成所有可能的索引对
-    all_pairs = [(i, j) for i in range(max_index) for j in range(max_index) if i != j]
-    
-    # 随机选择一对索引
-    selected_pair = random.choice(all_pairs)
-    
-    return selected_pair
+from typing import Dict
 
 
 def calculate_nodes_distribution(level1_count: int, important_indexes: tuple[int, int], total_leaf_nodes: int) -> dict:
@@ -121,10 +98,17 @@ def generate_one_outline_json_by_level1(level1_title: str, level1_index: int, no
         "id":f"{level1_index}",
         "title": level1_title,
         "description": "",
+        "volume_id": "",
+        "chapter_type": "",
+        "fixed_format_sensitive": False,
+        "price_sensitive": False,
+        "anonymity_sensitive": False,
+        "expected_word_count": 0,
         "scoring_item_ids": [],
         "requirement_ids": [],
         "risk_ids": [],
         "material_ids": [],
+        "response_matrix_ids": [],
         "children": []
     }
     
@@ -134,10 +118,17 @@ def generate_one_outline_json_by_level1(level1_title: str, level1_index: int, no
             "id":f"{level1_index}.{j+1}",
             "title": "",  # 二级标题留空
             "description": "",
+            "volume_id": "",
+            "chapter_type": "",
+            "fixed_format_sensitive": False,
+            "price_sensitive": False,
+            "anonymity_sensitive": False,
+            "expected_word_count": 0,
             "scoring_item_ids": [],
             "requirement_ids": [],
             "risk_ids": [],
             "material_ids": [],
+            "response_matrix_ids": [],
             "children": []
         }
         
@@ -148,10 +139,17 @@ def generate_one_outline_json_by_level1(level1_title: str, level1_index: int, no
                 "id":f"{level1_index}.{j+1}.{k+1}",
                 "title": "",  # 三级标题留空
                 "description": "",
+                "volume_id": "",
+                "chapter_type": "",
+                "fixed_format_sensitive": False,
+                "price_sensitive": False,
+                "anonymity_sensitive": False,
+                "expected_word_count": 0,
                 "scoring_item_ids": [],
                 "requirement_ids": [],
                 "risk_ids": [],
-                "material_ids": []
+                "material_ids": [],
+                "response_matrix_ids": []
             })
         
         level1_node["children"].append(level2_node)

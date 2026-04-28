@@ -34,6 +34,10 @@ async def generate_chapter_content(request: ChapterContentRequest):
                 request.analysis_report.model_dump(mode="json")
                 if request.analysis_report else None
             ),
+            response_matrix=(
+                request.response_matrix.model_dump(mode="json")
+                if request.response_matrix else None
+            ),
             bid_mode=request.bid_mode.value if request.bid_mode else None,
             generated_summaries=[
                 item.model_dump(mode="json") for item in request.generated_summaries
@@ -83,6 +87,10 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
                     analysis_report=(
                         request.analysis_report.model_dump(mode="json")
                         if request.analysis_report else None
+                    ),
+                    response_matrix=(
+                        request.response_matrix.model_dump(mode="json")
+                        if request.response_matrix else None
                     ),
                     bid_mode=request.bid_mode.value if request.bid_mode else None,
                     generated_summaries=[

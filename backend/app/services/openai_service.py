@@ -7,11 +7,11 @@ import re
 import aiohttp
 import os
 
-from ..utils.outline_util import get_random_indexes, calculate_nodes_distribution, generate_one_outline_json_by_level1
+from ..utils.outline_util import generate_one_outline_json_by_level1
 from ..utils import prompt_manager
 from ..utils.json_util import check_json
 from ..utils.config_manager import config_manager
-from ..models.schemas import AnalysisReport, ReviewReport
+from ..models.schemas import AnalysisReport, ResponseMatrix, ReviewReport
 from ..utils.provider_registry import (
     DEFAULT_PROVIDER,
     get_base_url_candidates,
@@ -53,7 +53,11 @@ class OpenAIService:
         """按指定 Base URL 创建客户端实例"""
         return openai.AsyncOpenAI(
             api_key=resolve_api_key(self.provider, self.api_key),
-            base_url=base_url if base_url else None
+            base_url=base_url if base_url else None,
+            default_headers={
+                "Accept": "application/json",
+                "User-Agent": "curl/8.7.1",
+            },
         )
 
     @staticmethod
@@ -277,7 +281,7 @@ class OpenAIService:
                     "id": f"X-{index:02d}",
                     "name": f"{name}相关企业材料",
                     "used_by": [f"T-{index:02d}"],
-                    "placeholder": f"待补充：{name}相关证明材料",
+                    "placeholder": f"〖待补充：{name}相关证明材料〗",
                 })
                 evidence_requirements.append({
                     "id": f"EV-{index:02d}",
@@ -365,7 +369,7 @@ class OpenAIService:
                 "id": "X-01",
                 "name": "企业资格与评分证明材料",
                 "used_by": ["Q-01", "T-01"],
-                "placeholder": "待补充：企业资质、业绩、人员、承诺等证明材料",
+                "placeholder": "〖待补充：企业资质、业绩、人员、承诺等证明材料〗",
             })
 
         report = {
@@ -373,9 +377,14 @@ class OpenAIService:
                 "name": project_name,
                 "number": project_number,
                 "package_name": "",
+                "package_or_lot": "",
                 "purchaser": purchaser,
+                "agency": OpenAIService._extract_labeled_value(text, ["代理机构", "招标代理"]),
+                "procurement_method": OpenAIService._extract_labeled_value(text, ["采购方式", "招标方式"]),
                 "project_type": "",
                 "budget": budget,
+                "maximum_price": budget,
+                "funding_source": OpenAIService._extract_labeled_value(text, ["资金来源"]),
                 "service_scope": OpenAIService._extract_labeled_value(text, ["服务范围", "采购内容", "招标范围"], 100),
                 "service_period": service_period,
                 "service_location": OpenAIService._extract_labeled_value(text, ["服务地点", "项目地点", "建设地点"]),
@@ -384,10 +393,50 @@ class OpenAIService:
                 "bid_bond": OpenAIService._extract_labeled_value(text, ["投标保证金"]),
                 "performance_bond": OpenAIService._extract_labeled_value(text, ["履约担保", "履约保证金"]),
                 "bid_deadline": deadline,
+                "opening_time": OpenAIService._extract_labeled_value(text, ["开标时间"]),
+                "submission_method": OpenAIService._extract_labeled_value(text, ["递交方式"]),
+                "electronic_platform": OpenAIService._extract_labeled_value(text, ["电子交易平台", "电子招投标平台"]),
                 "submission_requirements": OpenAIService._extract_labeled_value(text, ["递交要求", "投标文件递交", "电子投标"]),
                 "signature_requirements": signature_req,
             },
             "bid_mode_recommendation": "full_bid" if re.search(r"报价|商务|资格|投标函|开标一览表", text) else "technical_only",
+            "source_refs": [
+                {
+                    "id": "SRC-01",
+                    "location": "招标文件关键条款",
+                    "excerpt": OpenAIService._compact_text(text[:240], 120),
+                    "related_ids": ["S-01", "T-01", "E-01"],
+                }
+            ],
+            "volume_rules": [
+                {
+                    "id": "V-TECH",
+                    "name": "技术标",
+                    "scope": "技术服务方案与技术评分响应",
+                    "separate_submission": bool(re.search(r"技术标.*单独|暗标|双盲", text)),
+                    "price_allowed": not bool(re.search(r"技术.*不得.*报价|暗标|双盲", text)),
+                    "anonymity_required": bool(re.search(r"暗标|双盲|匿名", text)),
+                    "seal_signature_rule": signature_req,
+                    "source": OpenAIService._keyword_source(text, "技术标"),
+                },
+                {
+                    "id": "V-PRICE",
+                    "name": "报价文件",
+                    "scope": "报价表、费用明细和价格响应",
+                    "separate_submission": bool(re.search(r"报价.*单独|价格.*单独", text)),
+                    "price_allowed": True,
+                    "anonymity_required": False,
+                    "seal_signature_rule": signature_req,
+                    "source": OpenAIService._keyword_source(text, "报价"),
+                },
+            ],
+            "anonymity_rules": {
+                "enabled": bool(re.search(r"暗标|双盲|匿名", text)),
+                "scope": OpenAIService._extract_labeled_value(text, ["暗标", "双盲", "匿名"], 100),
+                "forbidden_identifiers": ["企业名称", "人员姓名", "联系方式", "Logo", "商标"] if re.search(r"暗标|双盲|匿名", text) else [],
+                "formatting_rules": [],
+                "source": OpenAIService._keyword_source(text, "暗标") or OpenAIService._keyword_source(text, "双盲"),
+            },
             "bid_structure": bid_structure,
             "formal_review_items": formal_review,
             "qualification_review_items": qualification_review,
@@ -404,6 +453,11 @@ class OpenAIService:
             }] if "报价" in text or "价格" in text else [],
             "price_rules": {
                 "quote_method": OpenAIService._extract_labeled_value(text, ["报价方式", "报价要求"]),
+                "currency": "人民币" if "人民币" in text else "",
+                "maximum_price_rule": budget,
+                "abnormally_low_price_rule": OpenAIService._extract_labeled_value(text, ["异常低价", "低于成本"]),
+                "separate_price_volume_required": bool(re.search(r"报价.*单独|价格.*单独", text)),
+                "price_forbidden_in_other_volumes": bool(re.search(r"技术.*不得.*报价|商务.*不得.*报价|价格.*不得.*技术", text)),
                 "tax_requirement": "按招标文件要求含税/不含税报价" if re.search(r"含税|税率|不含税", text) else "",
                 "decimal_places": OpenAIService._extract_labeled_value(text, ["小数位", "精确到"]),
                 "uniqueness_requirement": "投标报价应唯一" if "唯一" in text and "报价" in text else "",
@@ -411,6 +465,7 @@ class OpenAIService:
                 "arithmetic_correction_rule": OpenAIService._extract_labeled_value(text, ["算术错误", "修正"]),
                 "missing_item_rule": OpenAIService._extract_labeled_value(text, ["缺漏项", "漏项"]),
                 "prohibited_format_changes": ["不得擅自修改固定格式"] if re.search(r"不得.*修改|格式.*不得", text) else [],
+                "source_ref": "SRC-01",
             },
             "qualification_requirements": [{
                 "id": "Q-01",
@@ -459,6 +514,7 @@ class OpenAIService:
             "evidence_chain_requirements": evidence_requirements[:8],
             "required_materials": required_materials[:8],
             "missing_company_materials": missing_materials[:8],
+            "generation_warnings": [],
         }
         if reason:
             report["rejection_risks"].append({
@@ -467,7 +523,90 @@ class OpenAIService:
                 "source": "系统解析状态",
                 "mitigation": "可换用更快模型后重跑标准解析以获得更完整映射",
             })
+            report["generation_warnings"].append({
+                "id": "W-01",
+                "warning": f"结构化模型输出未完整返回，已启用文本兜底解析：{OpenAIService._compact_text(reason, 80)}",
+                "severity": "warning",
+                "related_ids": ["R-02"],
+            })
+        report["response_matrix"] = OpenAIService._fallback_response_matrix(report)
         return AnalysisReport.model_validate(report).model_dump(mode="json")
+
+    @staticmethod
+    def _fallback_response_matrix(analysis_report: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """基于 AnalysisReport 稳定生成响应矩阵兜底结果。"""
+        report = analysis_report or {}
+        items: list[dict[str, Any]] = []
+
+        def append_item(source_type: str, source_id: str, summary: str, materials=None, risks=None, blocking=False, priority="normal", source_refs=None):
+            if not source_id:
+                return
+            matrix_id = f"RM-{len(items) + 1:02d}"
+            items.append({
+                "id": matrix_id,
+                "source_item_id": source_id,
+                "source_type": source_type,
+                "requirement_summary": OpenAIService._compact_text(summary, 80),
+                "response_strategy": "在目录和正文中设置对应章节，逐项响应并保留材料/页码占位",
+                "target_chapter_ids": [],
+                "required_material_ids": list(materials or []),
+                "risk_ids": list(risks or []),
+                "source_refs": list(source_refs or []),
+                "priority": priority,
+                "status": "pending",
+                "blocking": blocking,
+            })
+
+        for key, source_type in (
+            ("technical_scoring_items", "scoring"),
+            ("business_scoring_items", "scoring"),
+            ("price_scoring_items", "price"),
+        ):
+            for item in (report.get(key) or [])[:8]:
+                append_item(
+                    source_type,
+                    item.get("id"),
+                    item.get("standard") or item.get("logic") or item.get("name") or "",
+                    item.get("evidence_requirements") or [],
+                    [],
+                    source_type == "price",
+                    "high" if source_type == "price" or item.get("score") else "normal",
+                    [item.get("source")] if item.get("source") else [],
+                )
+
+        for key in ("formal_review_items", "qualification_review_items", "responsiveness_review_items"):
+            for item in (report.get(key) or [])[:8]:
+                append_item(
+                    "review",
+                    item.get("id"),
+                    item.get("requirement") or item.get("criterion") or "",
+                    item.get("required_materials") or [],
+                    [],
+                    bool(item.get("invalid_if_missing")),
+                    "high" if item.get("invalid_if_missing") else "normal",
+                    [item.get("source")] if item.get("source") else [],
+                )
+
+        for item in (report.get("mandatory_clauses") or [])[:8]:
+            append_item("mandatory", item.get("id"), item.get("clause") or "", [], [], True, "high", [item.get("source")] if item.get("source") else [])
+        for item in (report.get("rejection_risks") or [])[:8]:
+            append_item("risk", item.get("id"), item.get("risk") or "", [], [item.get("id")], bool(item.get("blocking", True)), "high", [item.get("source")] if item.get("source") else [])
+        for item in (report.get("required_materials") or [])[:8]:
+            append_item("material", item.get("id"), item.get("name") or item.get("purpose") or "", [item.get("id")], [], item.get("status") == "missing", "high" if item.get("status") == "missing" else "normal", [item.get("source")] if item.get("source") else [])
+        for item in (report.get("fixed_format_forms") or [])[:8]:
+            append_item("format", item.get("id"), item.get("name") or item.get("fill_rules") or "", [], [], True, "high", [item.get("source")] if item.get("source") else [])
+        for item in (report.get("signature_requirements") or [])[:8]:
+            append_item("signature", item.get("id"), item.get("target") or item.get("seal") or "", [], [], True, "high", [item.get("source")] if item.get("source") else [])
+        for item in (report.get("evidence_chain_requirements") or [])[:8]:
+            append_item("evidence", item.get("id"), item.get("target") or item.get("validation_rule") or "", [], [], False, "normal", [item.get("source")] if item.get("source") else [])
+
+        high_risk_ids = [item["id"] for item in items if item.get("priority") == "high" or item.get("blocking")]
+        return ResponseMatrix.model_validate({
+            "items": items,
+            "uncovered_ids": [item.get("source_item_id") for item in items if item.get("source_item_id")],
+            "high_risk_ids": high_risk_ids,
+            "coverage_summary": f"已建立 {len(items)} 条响应矩阵，待目录和正文阶段逐项覆盖。",
+        }).model_dump(mode="json")
 
     @staticmethod
     def fallback_overview(file_content: str) -> str:
@@ -513,6 +652,8 @@ class OpenAIService:
         report = analysis_report or {}
         technical_ids = [item.get("id") for item in report.get("technical_scoring_items", []) if item.get("id")]
         material_ids = [item.get("id") for item in report.get("required_materials", []) if item.get("id")]
+        material_ids.extend([item.get("id") for item in report.get("missing_company_materials", []) if item.get("id")])
+        material_ids.extend([item.get("id") for item in report.get("evidence_chain_requirements", []) if item.get("id")])
         risk_ids = [item.get("id") for item in report.get("rejection_risks", []) if item.get("id")]
         requirement_ids = []
         for key in ("qualification_requirements", "formal_response_requirements", "mandatory_clauses"):
@@ -638,7 +779,110 @@ class OpenAIService:
                     },
                 ],
             })
-        return {"outline": outline}
+        response_matrix = report.get("response_matrix") or OpenAIService._fallback_response_matrix(report)
+        return {
+            "outline": outline,
+            "response_matrix": response_matrix,
+            "coverage_summary": response_matrix.get("coverage_summary", ""),
+        }
+
+    @staticmethod
+    def _count_analysis_items(analysis_report: Dict[str, Any] | None) -> int:
+        """按已解析出的评分、审查、风险和材料数量估算目录颗粒度。"""
+        report = analysis_report or {}
+        keys = (
+            "technical_scoring_items",
+            "business_scoring_items",
+            "price_scoring_items",
+            "formal_review_items",
+            "qualification_review_items",
+            "responsiveness_review_items",
+            "qualification_requirements",
+            "formal_response_requirements",
+            "mandatory_clauses",
+            "rejection_risks",
+            "required_materials",
+            "missing_company_materials",
+        )
+        return sum(len(report.get(key) or []) for key in keys)
+
+    @staticmethod
+    def _allocate_leaf_distribution(total_leaf_nodes: int, weights: list[int]) -> list[int]:
+        """按确定性权重分配叶子节点，避免随机重点章节导致生成结果漂移。"""
+        if not weights:
+            return []
+
+        total_weight = max(sum(weights), 1)
+        allocated = [max(2, round(total_leaf_nodes * weight / total_weight)) for weight in weights]
+        diff = total_leaf_nodes - sum(allocated)
+        cursor = 0
+        while diff != 0 and allocated:
+            index = cursor % len(allocated)
+            if diff > 0:
+                allocated[index] += 1
+                diff -= 1
+            elif allocated[index] > 2:
+                allocated[index] -= 1
+                diff += 1
+            cursor += 1
+            if cursor > len(allocated) * 20:
+                break
+        return allocated
+
+    @staticmethod
+    def _split_leaf_count(leaf_count: int, level2_count: int) -> list[int]:
+        """把一级章节叶子节点稳定分摊给二级章节。"""
+        level2_count = max(1, level2_count)
+        base = leaf_count // level2_count
+        extra = leaf_count % level2_count
+        return [base + (1 if index < extra else 0) for index in range(level2_count)]
+
+    @staticmethod
+    def _build_nodes_distribution(
+        level_l1: list[dict],
+        analysis_report: Dict[str, Any] | None = None,
+        bid_mode: str | None = None,
+    ) -> dict:
+        """基于评分项/审查项/风险项确定目录规模，不再使用固定十万字和随机重点章节。"""
+        level1_count = len(level_l1)
+        if level1_count <= 0:
+            return {"level2_nodes": [], "leaf_nodes": [], "leaf_per_level2": []}
+
+        item_count = OpenAIService._count_analysis_items(analysis_report)
+        full_bid = bid_mode == "full_bid" or (analysis_report or {}).get("bid_mode_recommendation") == "full_bid"
+        base_leaf_nodes = 30 if full_bid else 18
+        total_leaf_nodes = max(base_leaf_nodes, level1_count * 3, item_count * 2)
+        total_leaf_nodes = min(total_leaf_nodes, 72 if full_bid else 48)
+
+        weights: list[int] = []
+        for node in level_l1:
+            title = str(node.get("new_title") or node.get("title") or "")
+            mapped_count = (
+                len(node.get("scoring_item_ids") or []) * 3
+                + len(node.get("requirement_ids") or []) * 2
+                + len(node.get("risk_ids") or []) * 2
+                + len(node.get("material_ids") or [])
+            )
+            keyword_weight = 0
+            if full_bid and any(keyword in title for keyword in ("资格", "商务", "报价", "投标函", "承诺", "附件", "自检")):
+                keyword_weight += 2
+            if any(keyword in title for keyword in ("技术", "方案", "实施", "服务", "评分", "响应")):
+                keyword_weight += 2
+            weights.append(max(1, mapped_count + keyword_weight + 1))
+
+        leaf_nodes = OpenAIService._allocate_leaf_distribution(total_leaf_nodes, weights)
+        level2_nodes: list[int] = []
+        leaf_per_level2: list[list[int]] = []
+        for leaf_count in leaf_nodes:
+            level2_count = min(6, max(2, round(leaf_count / 3)))
+            level2_nodes.append(level2_count)
+            leaf_per_level2.append(OpenAIService._split_leaf_count(leaf_count, level2_count))
+
+        return {
+            "level2_nodes": level2_nodes,
+            "leaf_nodes": leaf_nodes,
+            "leaf_per_level2": leaf_per_level2,
+        }
 
     @staticmethod
     def _fallback_chapter_content(
@@ -653,7 +897,7 @@ class OpenAIService:
         project = (analysis_report or {}).get("project", {})
         missing = missing_materials or (analysis_report or {}).get("missing_company_materials", [])
         missing_lines = "\n".join(
-            f"- 【待补充：{item.get('name') or '相关证明材料'}】{item.get('placeholder') or ''}"
+            f"- 〖待补充：{item.get('name') or '相关证明材料'}〗{item.get('placeholder') or ''}"
             for item in missing[:6]
         ) or "- 暂未识别到企业侧已提供材料，最终组卷前需核验资格、商务、人员、业绩和签章材料。"
         return (
@@ -663,7 +907,7 @@ class OpenAIService:
             "实施与响应要点：\n"
             "1. 对招标文件中的实质性条款、服务范围、进度安排、质量要求和成果交付要求逐项响应。\n"
             "2. 对评分项设置专门小节，说明工作方法、组织安排、质量控制、风险防控和交付成果。\n"
-            "3. 对固定格式、报价表、承诺函、签字盖章和页码索引保留【页码待编排】等占位，不擅自改变格式。\n\n"
+            "3. 对固定格式、报价表、承诺函、签字盖章和页码索引保留〖页码待编排〗等占位，不擅自改变格式。\n\n"
             "应附材料及核验要点：\n"
             f"{missing_lines}\n\n"
             "组卷提示：正文完成后需执行合规审校，确认覆盖率、阻塞问题、警告问题和材料缺失项。"
@@ -680,11 +924,27 @@ class OpenAIService:
         material_ids = [item.get("id") for item in report.get("required_materials", []) if item.get("id")]
         risk_ids = [item.get("id") for item in report.get("rejection_risks", []) if item.get("id")]
         coverage = [
-            {"item_id": item_id, "covered": False, "chapter_ids": [], "issue": "需确认正文是否逐项覆盖评分标准"}
+            {
+                "item_id": item_id,
+                "target_type": "scoring",
+                "covered": False,
+                "chapter_ids": [],
+                "issue": "需确认正文是否逐项覆盖评分标准",
+                "evidence": "",
+                "fix_suggestion": "在对应章节补写评分标准响应措施和支撑材料",
+            }
             for item_id in scoring_ids[:8]
         ]
         missing = [
-            {"material_id": item_id, "chapter_ids": [], "placeholder": "待补充或核验证明材料"}
+            {
+                "material_id": item_id,
+                "material_name": item_id,
+                "used_by": [],
+                "chapter_ids": [],
+                "placeholder": "〖待补充或核验证明材料〗",
+                "placeholder_found": False,
+                "fix_suggestion": "补齐材料或在正文中保留明确待补占位",
+            }
             for item_id in material_ids[:8]
         ]
         risks = [
@@ -692,6 +952,15 @@ class OpenAIService:
             for item_id in risk_ids[:8]
         ]
         warnings = len(coverage) + len(missing) + len(risks)
+        blocking_issue = {
+            "item_id": "CHECK-01",
+            "chapter_ids": [],
+            "issue": "兜底审校无法确认完整覆盖，需要人工复核响应矩阵、材料和签章",
+            "evidence": "模型审校不可用，系统返回兜底结果",
+            "fix_suggestion": "重新执行合规审校或逐项检查覆盖矩阵",
+            "severity": "blocking",
+            "blocking": True,
+        }
         return ReviewReport.model_validate({
             "coverage": coverage,
             "missing_materials": missing,
@@ -712,13 +981,35 @@ class OpenAIService:
                 "item_id": "PAGE-01",
                 "chapter_ids": [],
                 "issue": "最终排版前页码索引仍为待编排状态",
+                "evidence": "正文导出前尚未完成 Word 页码编排",
+                "fix_suggestion": "导出后更新目录、索引和页码引用",
                 "severity": "warning",
                 "blocking": False,
             }],
+            "anonymity_issues": [],
+            "blocking_issues": [blocking_issue],
+            "warnings": [],
+            "revision_plan": {
+                "actions": [{
+                    "id": "RP-01",
+                    "target_chapter_ids": [],
+                    "action_type": "人工确认",
+                    "instruction": "逐项核验评分项、审查项、材料、签章、固定格式和报价隔离要求。",
+                    "priority": "high",
+                    "related_issue_ids": ["CHECK-01"],
+                    "blocking": True,
+                }],
+                "summary": "兜底审校无法替代正式模型审校，导出前需人工复核。",
+            },
             "summary": {
                 "ready_to_export": False,
-                "blocking_issues": 0,
+                "blocking_issues": 1,
                 "warnings": warnings + 2,
+                "blocking_issues_count": 1,
+                "warnings_count": warnings + 2,
+                "coverage_rate": 0,
+                "blocking_summary": "需要人工复核完整响应矩阵和材料链",
+                "next_actions": ["重新执行合规审校", "补齐缺失材料", "核验签章与固定格式"],
             },
         }).model_dump(mode="json")
 
@@ -1236,7 +1527,7 @@ class OpenAIService:
             {"role": "user", "content": user_prompt},
         ]
         try:
-            return await asyncio.wait_for(
+            report = await asyncio.wait_for(
                 self._generate_pydantic_json(
                     messages=messages,
                     model_cls=AnalysisReport,
@@ -1248,15 +1539,47 @@ class OpenAIService:
                 ),
                 timeout=120,
             )
+            if not report.get("response_matrix"):
+                report["response_matrix"] = await self.generate_response_matrix(report)
+            return AnalysisReport.model_validate(report).model_dump(mode="json")
         except Exception as e:
             print(f"标准解析报告模型输出不可用，启用文本兜底解析：{str(e)}")
             return self._fallback_analysis_report(file_content, str(e))
+
+    async def generate_response_matrix(self, analysis_report: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """基于标准解析报告生成响应矩阵"""
+        report = analysis_report or {}
+        if self._force_local_fallback():
+            return self._fallback_response_matrix(report)
+
+        system_prompt, user_prompt = prompt_manager.generate_response_matrix_prompt(report)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            return await asyncio.wait_for(
+                self._generate_pydantic_json(
+                    messages=messages,
+                    model_cls=ResponseMatrix,
+                    max_retries=1,
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                    max_tokens=4096,
+                    log_prefix="响应矩阵",
+                ),
+                timeout=90,
+            )
+        except Exception as e:
+            print(f"响应矩阵模型输出不可用，启用兜底矩阵：{str(e)}")
+            return self._fallback_response_matrix(report)
 
     async def generate_compliance_review(
         self,
         outline: list,
         analysis_report: Dict[str, Any] | None = None,
         project_overview: str = "",
+        response_matrix: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """生成导出前合规审校报告"""
         if self._force_local_fallback():
@@ -1266,6 +1589,7 @@ class OpenAIService:
             analysis_report=analysis_report,
             outline=outline,
             project_overview=project_overview,
+            response_matrix=response_matrix or (analysis_report or {}).get("response_matrix"),
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1381,6 +1705,7 @@ class OpenAIService:
         generated_summaries: list | None = None,
         enterprise_materials: list | None = None,
         missing_materials: list | None = None,
+        response_matrix: Dict[str, Any] | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         为单个章节流式生成内容
@@ -1410,25 +1735,30 @@ class OpenAIService:
             rulebook = prompt_manager.get_full_bid_rulebook()
 
             # 构建提示词
-            system_prompt = f"""你是一个专业的标书编制工程师，负责在“开始生成标书”阶段，依据已完成的《标准解析报告》与既定目录，逐章生成正式投标文件内容。
+            effective_response_matrix = response_matrix or (analysis_report or {}).get("response_matrix") or {}
 
-你必须先在内部完成以下动作，但不要把过程写出来：
-1. 回顾《标准解析报告》中的项目基础信息、否决投标条款、资格审查要求、评分项、正式投标文件结构、证明材料要求、待补资料清单和高风险废标点。
+            system_prompt = f"""你是一个专业的标书编制工程师，负责在“开始生成标书”阶段，依据已完成的《标准解析报告》、ResponseMatrix 响应矩阵与既定目录，逐章生成正式投标文件内容。
+
+生成前必须依据传入资料完成以下判断，但不要把判断过程写出来：
+1. 回顾传入的《标准解析报告》和 ResponseMatrix 中的项目基础信息、否决投标条款、资格审查要求、评分项、正式投标文件结构、证明材料要求、待补资料清单和高风险废标点。
 2. 判断当前章节属于哪一类：函件类、承诺类、表格类、报价类、证明材料类、资格商务类、技术方案类、索引表类、其他资料类。
 3. 依据章节类型选择对应写法，再生成可直接用于正式投标文件的正文。
 
 硬性要求：
 1. 只输出当前章节正文，不输出标题、说明、前言、总结、markdown 代码块。
-2. 严禁编造企业名称、金额、日期、证书编号、业绩名称、人员姓名、联系方式、发票信息、查询结果、合同信息。
-3. 若上下文未提供且无法确认，必须使用【待补充：具体资料名称】或【以招标文件/企业资料为准】标注，不得猜测。
-4. 对营业执照、资质证书、身份证、社保、审计报告、合同、发票、税务查验截图、信誉查询截图等证明材料类章节，如缺少资料，不要写空泛叙述，直接输出“本节应附材料清单 + 核验要点”或保留规范占位内容。
-5. 对投标函、附录、承诺函、授权委托书、偏离表、一览表、基本情况表、人员表、业绩表等正式文件章节，必须使用正式标书语言，字段完整、格式严谨、可直接落地。
-6. 对技术方案类章节，必须围绕评审点展开，突出可执行性、组织安排、进度管理、质量安全、数字化、协调配合、现场服务、应急响应等内容，避免宣传式空话。
-7. 与同级章节不得重复；与上级章节保持逻辑承接；与正式投标文件结构保持一致。
-8. 不得写“作为 AI”“根据你的要求”“以下内容”等元话术。
-9. 对固定格式表、报价表、费用明细表、承诺函、偏离表，只能生成待填内容或材料清单，不得擅自改变招标文件要求的表头、列名、固定文字、行列数量。
-10. 对索引表或响应页码，未最终排版前统一使用【页码待编排】。
-11. 对业绩、人员、社保、发票、税务查验、信用截图等证据链章节，必须写出应附材料和核验要点；缺失时保留明确占位，不得写成已满足。
+2. 只能使用传入的 AnalysisReport、ResponseMatrix、目录映射、项目概述和企业材料；不得重新解析招标文件，不得另行推断新的评分项、审查项、企业资质或证明材料。
+3. 严禁编造企业名称、金额、日期、证书编号、业绩名称、人员姓名、联系方式、发票信息、查询结果、合同信息。
+4. 若上下文未提供且无法确认，必须使用〖待补充：具体资料名称〗或〖以招标文件/企业资料为准〗标注，不得猜测。
+5. 对营业执照、资质证书、身份证、社保、审计报告、合同、发票、税务查验截图、信誉查询截图等证明材料类章节，如缺少资料，不要写空泛叙述，直接输出“本节应附材料清单 + 核验要点”或保留规范占位内容。
+6. 对投标函、附录、承诺函、授权委托书、偏离表、一览表、基本情况表、人员表、业绩表等正式文件章节，必须使用正式标书语言，字段完整、格式严谨、可直接落地。
+7. 对技术方案类章节，必须围绕当前章节关联的 scoring_item_ids 展开；不得把未关联评分项强行塞入本章。
+8. 与同级章节不得重复；与上级章节保持逻辑承接；与正式投标文件结构保持一致。
+9. 不得写“作为 AI”“根据你的要求”“以下内容”等元话术。
+10. 对固定格式表、报价表、费用明细表、承诺函、偏离表，只能生成待填内容或材料清单，不得擅自改变招标文件要求的表头、列名、固定文字、行列数量。
+11. 对索引表或响应页码，未最终排版前统一使用〖页码待编排〗。
+12. 对业绩、人员、社保、发票、税务查验、信用截图等证据链章节，必须写出应附材料和核验要点；缺失时保留明确占位，不得写成已满足。
+13. 如 bid_mode 或 AnalysisReport 显示价格文件需要单独成册，不得在技术/商务章节生成具体报价内容。
+14. 如 AnalysisReport 显示暗标、双盲或匿名要求，不得输出企业名称、人员姓名、业绩名称、联系方式、Logo、商标等身份识别信息。
 
 {rulebook}
 """
@@ -1462,11 +1792,31 @@ class OpenAIService:
                 "requirement_ids": chapter.get("requirement_ids", []),
                 "risk_ids": chapter.get("risk_ids", []),
                 "material_ids": chapter.get("material_ids", []),
+                "response_matrix_ids": chapter.get("response_matrix_ids", []),
             }
             if any(chapter_links.values()):
                 structured_context.append(
                     "当前章节关联项(JSON)：\n"
                     f"{json.dumps(chapter_links, ensure_ascii=False)}"
+                )
+            if effective_response_matrix:
+                matrix_items = effective_response_matrix.get("items", [])
+                linked_ids = set(chapter.get("response_matrix_ids", []) or [])
+                linked_source_ids = set(
+                    (chapter.get("scoring_item_ids", []) or [])
+                    + (chapter.get("requirement_ids", []) or [])
+                    + (chapter.get("risk_ids", []) or [])
+                    + (chapter.get("material_ids", []) or [])
+                )
+                relevant_matrix = [
+                    item for item in matrix_items
+                    if item.get("id") in linked_ids
+                    or item.get("source_item_id") in linked_source_ids
+                    or not linked_ids and not linked_source_ids and item.get("priority") == "high"
+                ][:12]
+                structured_context.append(
+                    "当前章节响应矩阵(JSON，只能据此覆盖要求，不得新增要求)：\n"
+                    f"{json.dumps({'items': relevant_matrix}, ensure_ascii=False)}"
                 )
             if generated_summaries:
                 structured_context.append(
@@ -1495,7 +1845,7 @@ class OpenAIService:
 本次调用视为用户已明确下达“开始生成标书”指令。
 
 请先结合项目概述、上级章节、同级章节和当前章节信息，判断本章节类型，再按正式投标文件写法生成正文。
-若企业资料仍有缺失，请在正文中用【待补充：...】明确标注，不得虚构。
+若企业资料仍有缺失，请在正文中用〖待补充：...〗明确标注，不得虚构。
 
 {project_info}{context_info if context_info else ''}{chr(10).join(structured_context)}
 
@@ -1550,23 +1900,31 @@ class OpenAIService:
         )
         schema_json = json.dumps([
             {
-                "rating_item": "原评分项",
-                "new_title": "根据评分项修改的标题",
+                "id": "1",
+                "volume_id": "V-TECH",
+                "title": "正式一级目录标题",
+                "chapter_type": "technical/business/price/form/material/review",
+                "description": "本章响应什么要求、覆盖哪些评分/审查/材料/风险",
+                "fixed_format_sensitive": False,
+                "price_sensitive": False,
+                "anonymity_sensitive": False,
+                "expected_word_count": 1200,
                 "scoring_item_ids": [],
                 "requirement_ids": [],
                 "risk_ids": [],
                 "material_ids": [],
+                "response_matrix_ids": [],
             }
-        ])
+        ], ensure_ascii=False)
 
         system_prompt = f"""
             ### 角色
             你是专业的标书解析与编制专家，尤其适配本地 DeepSeek 类大模型。
 
-            ### 工作流（必须先在内部完成，但不要外显）
-            1. 先做《标准解析报告》：识别项目基础信息、评分项、否决投标条款、实质性条款、资格审查项、证明材料要求、正式投标文件结构、待补资料清单和高风险废标点。
-            2. 再依据解析报告生成一级目录。
-            3. 只有等企业资料补齐且用户明确说“开始生成标书”时，才进入正文生成阶段。
+            ### 工作流
+            当前阶段只能基于传入的 AnalysisReport、ResponseMatrix、项目概述和评分要求生成一级目录。
+            如果 analysis_report_json 非空，必须以它为准，不得另行推断新的审查项、评分项、材料项或风险项。
+            只有等企业资料补齐且用户明确说“开始生成标书”时，才进入正文生成阶段。
 
             ### 当前任务
             {scope_instruction}
@@ -1576,8 +1934,11 @@ class OpenAIService:
             1. 一级标题数量必须服务于 bid_mode：technical_only 时与技术评分/技术响应要求对应；full_bid 时与招标文件要求的完整投标文件结构对应。
             2. 一级标题名称应改写为正式目录标题，不能简单照抄评分项原文。
             3. 标题应服务于后续正式标书写作，避免口语化和空泛表述。
-            4. scoring_item_ids 可引用 T/B/P/E/F/Q/C 等相关 ID；requirement_ids / risk_ids / material_ids 必须来自标准解析报告中的 ID；无法对应时输出空数组。
-            5. 只输出 JSON，不要输出 markdown 代码块，不要输出解释。
+            4. full_bid 时优先按资格证明文件、商务技术文件、报价文件、附件、承诺函、偏离表、证明材料、组卷自检等卷册/章节拆分，再把评分项挂到相应章节。
+            5. technical_only 时聚焦技术评分项和技术响应，不生成报价文件正文入口。
+            6. scoring_item_ids 只允许引用 T/B/P ID；requirement_ids 只允许引用 E/Q/F/C/S/FF/SIG ID；risk_ids 只允许引用 R ID；material_ids 只允许引用 M/X/EV ID；response_matrix_ids 只允许引用 RM ID；无法对应时输出空数组。
+            7. 价格文件要求单独递交、暗标/双盲/匿名要求、固定格式和签章要求必须体现在标题、映射或后续 description 中。
+            8. 只输出 JSON，不要输出 markdown 代码块，不要输出解释。
 
             ### Output Format in JSON
             {schema_json}
@@ -1602,8 +1963,12 @@ class OpenAIService:
             {json.dumps(analysis_report, ensure_ascii=False) if analysis_report else ""}
             </analysis_report_json>
 
-            请先在内部完成《标准解析报告》，再输出一级目录 JSON。
-            当前只执行“先做标准解析报告；然后生成目录”这一步，不要开始生成标书正文。
+            <response_matrix_json>
+            {json.dumps((analysis_report or {}).get("response_matrix", {}), ensure_ascii=False) if analysis_report else ""}
+            </response_matrix_json>
+
+            请基于传入资料输出一级目录 JSON。
+            当前只执行“生成目录”这一步，不要开始生成标书正文。
             直接返回 json，不要任何额外说明或格式标记。
 
             """
@@ -1633,13 +1998,7 @@ class OpenAIService:
         # 通过校验后再进行 JSON 解析
         level_l1 = json.loads(full_content.strip())
 
-        expected_word_count = 100000
-        leaf_node_count = expected_word_count // 1500
-        
-        # 随机重点章节
-        index1, index2 = get_random_indexes(len(level_l1))
-
-        nodes_distribution = calculate_nodes_distribution(len(level_l1), (index1, index2), leaf_node_count)
+        nodes_distribution = self._build_nodes_distribution(level_l1, analysis_report, bid_mode)
         
         # 并发生成每个一级节点的提纲，保持结果顺序
         tasks = [
@@ -1652,6 +2011,7 @@ class OpenAIService:
                 requirements,
                 analysis_report=analysis_report,
                 bid_mode=bid_mode,
+                response_matrix=(analysis_report or {}).get("response_matrix"),
             )
             for i, level1_node in enumerate(level_l1)
         ]
@@ -1659,7 +2019,11 @@ class OpenAIService:
         
         
         
-        return {"outline": outline}
+        return {
+            "outline": outline,
+            "response_matrix": (analysis_report or {}).get("response_matrix"),
+            "coverage_summary": (analysis_report or {}).get("response_matrix", {}).get("coverage_summary", ""),
+        }
     
     async def process_level1_node(
         self,
@@ -1671,17 +2035,24 @@ class OpenAIService:
         requirements,
         analysis_report: Dict[str, Any] | None = None,
         bid_mode: str | None = None,
+        response_matrix: Dict[str, Any] | None = None,
     ):
         """处理单个一级节点的函数"""
 
         # 生成json
-        json_outline = generate_one_outline_json_by_level1(level1_node["new_title"], i + 1, nodes_distribution)
-        for key in ("scoring_item_ids", "requirement_ids", "risk_ids", "material_ids"):
+        title = level1_node.get("title") or level1_node.get("new_title") or level1_node.get("rating_item") or f"第{i + 1}章"
+        json_outline = generate_one_outline_json_by_level1(title, i + 1, nodes_distribution)
+        json_outline["volume_id"] = level1_node.get("volume_id", "")
+        json_outline["chapter_type"] = level1_node.get("chapter_type", "")
+        for key in ("scoring_item_ids", "requirement_ids", "risk_ids", "material_ids", "response_matrix_ids"):
             json_outline[key] = level1_node.get(key, [])
-        print(f"正在处理第{i+1}章: {level1_node['new_title']}")
+        for bool_key in ("fixed_format_sensitive", "price_sensitive", "anonymity_sensitive"):
+            json_outline[bool_key] = bool(level1_node.get(bool_key, False))
+        json_outline["expected_word_count"] = int(level1_node.get("expected_word_count") or 0)
+        print(f"正在处理第{i+1}章: {title}")
         
         # 其他标题
-        other_outline = "\n".join([f"{j+1}. {node['new_title']}" 
+        other_outline = "\n".join([f"{j+1}. {node.get('title') or node.get('new_title') or node.get('rating_item') or ''}"
                             for j, node in enumerate(level_l1) 
                             if j!= i])
 
@@ -1689,9 +2060,9 @@ class OpenAIService:
     ### 角色
     你是专业的标书解析与编制专家，尤其适配本地 DeepSeek 类大模型。
 
-    ### 工作流（必须先在内部完成，但不要外显）
-    1. 先做《标准解析报告》：识别项目基础信息、评分项、否决投标条款、实质性条款、证明材料要求、正式投标文件结构、待补资料清单和高风险废标点。
-    2. 再基于解析报告补全当前一级章节下的二三级目录。
+    ### 工作流
+    1. 当前阶段只能基于传入的 AnalysisReport、ResponseMatrix、项目概述、评分要求和一级目录补全二三级目录。
+    2. 如果 analysis_report_json 非空，必须以它为准，不得另行推断新的审查项、评分项、材料项或风险项。
     3. 只有等企业资料补齐且用户明确说“开始生成标书”时，才进入正文生成阶段。
 
     ### 当前任务
@@ -1704,7 +2075,7 @@ class OpenAIService:
     3. 补全内容必须参考项目概述、评分要求、标准解析报告、正式投标文件写法和后续正文生成需要。
     4. 你还会收到其他一级章节标题(other_outline)，你必须确保本章节不与其他章节重复。
     5. description 要写清本节点拟写内容、对应评分点/审查点、应附材料或支撑内容。
-    6. scoring_item_ids 可引用 T/B/P/E/F/Q/C 等相关 ID；requirement_ids / risk_ids / material_ids 必须来自标准解析报告中的 ID；一级节点既有映射必须保留，二三级节点可细化继承。
+    6. scoring_item_ids 只允许引用 T/B/P ID；requirement_ids 只允许引用 E/Q/F/C/S/FF/SIG ID；risk_ids 只允许引用 R ID；material_ids 只允许引用 M/X/EV ID；response_matrix_ids 只允许引用 RM ID；一级节点既有映射必须保留，二三级节点可细化继承。
     7. 如 bid_mode=full_bid，必须补全资格、商务、报价、承诺、技术、附件等正式投标文件结构；如 bid_mode=technical_only，则聚焦技术评分和技术响应章节。
     8. 对固定格式、签字盖章、报价规则、证据链和页码占位要求，要体现在 title/description 或映射字段中。
 
@@ -1734,13 +2105,17 @@ class OpenAIService:
     <analysis_report_json>
     {json.dumps(analysis_report, ensure_ascii=False) if analysis_report else ""}
     </analysis_report_json>
+
+    <response_matrix_json>
+    {json.dumps(response_matrix or (analysis_report or {}).get("response_matrix", {}), ensure_ascii=False)}
+    </response_matrix_json>
     
     <other_outline>
     {other_outline}
     </other_outline>
 
-    请先在内部完成《标准解析报告》，再补全当前一级章节的二三级目录。
-    当前只执行“先做标准解析报告；然后生成目录”这一步，不要开始生成标书正文。
+    请基于传入资料补全当前一级章节的二三级目录。
+    当前只执行“生成目录”这一步，不要开始生成标书正文。
     直接返回 json，不要任何额外说明或格式标记。
 
     """

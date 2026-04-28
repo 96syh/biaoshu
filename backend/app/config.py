@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     ]
     
     # 文件上传设置
-    max_file_size: int = 10 * 1024 * 1024  # 10MB
+    max_file_size: int = 500 * 1024 * 1024  # 500MB
     upload_dir: str = "uploads"
     
     # OpenAI默认设置

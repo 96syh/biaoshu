@@ -249,6 +249,10 @@ async def review_compliance_stream(request: ComplianceReviewRequest):
                             request.analysis_report.model_dump(mode="json")
                             if request.analysis_report else None
                         ),
+                        response_matrix=(
+                            request.response_matrix.model_dump(mode="json")
+                            if request.response_matrix else None
+                        ),
                         project_overview=request.project_overview or "",
                     )
                 )

@@ -12,10 +12,12 @@ import {
   DocumentTextIcon,
   ExclamationTriangleIcon,
   FolderIcon,
+  PauseIcon,
   PencilSquareIcon,
   PlayIcon,
   ShieldCheckIcon,
   SparklesIcon,
+  StopIcon,
   XMarkIcon,
 } from '@heroicons/react/24/outline';
 import { useAppState } from './hooks/useAppState';
@@ -37,6 +39,7 @@ import {
   ReviewReport,
 } from './types';
 import { consumeSseStream } from './utils/sse';
+import { DraftHistoryRecord, draftStorage } from './utils/draftStorage';
 
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
 type NavKey = 'project' | 'analysis' | 'outline' | 'content' | 'review' | 'config';
@@ -49,12 +52,38 @@ type ProgressState = {
   status: 'running' | 'success' | 'error';
   error?: string;
 };
+type GenerationControlState = 'idle' | 'running' | 'paused' | 'stopped';
+type DraftOutlineRow = { id: string; title: string; level: number; status: string };
+type ProjectSummary = Partial<AnalysisReport['project']> & { __fallback?: boolean };
 
 interface ChapterEntry {
   item: OutlineItem;
   parents: OutlineItem[];
   top: OutlineItem;
 }
+
+const PAGE_META: Record<Exclude<NavKey, 'config'>, { title: string; description: string }> = {
+  project: {
+    title: '上传文件',
+    description: '上传招标文件并查看项目基础信息、材料缺失提示和解析入口。',
+  },
+  analysis: {
+    title: '开始解析',
+    description: '抽取项目概况、评分办法、资格审查、实质性要求和材料清单。',
+  },
+  outline: {
+    title: '生成目录',
+    description: '把评分项、审查项、风险项和材料项映射到正式投标文件目录。',
+  },
+  content: {
+    title: '生成正文',
+    description: '选择章节生成正文，预览当前章节内容，并支持批量生成与导出。',
+  },
+  review: {
+    title: '执行审校',
+    description: '检查覆盖率、阻塞项、固定格式、签章、报价和证据链风险。',
+  },
+};
 
 const NAV_ITEMS: Array<{ key: NavKey; label: string; description: string; icon: React.ElementType; target?: string }> = [
   { key: 'project', label: '上传文件', description: '选择招标文件', icon: FolderIcon, target: 'panel-analysis' },
@@ -95,6 +124,22 @@ const collectEntries = (items: OutlineItem[], parents: OutlineItem[] = [], top?:
     return collectEntries(item.children, [...parents, item], currentTop);
   });
 
+const findFirstLeaf = (item: OutlineItem): OutlineItem => {
+  if (!item.children?.length) return item;
+  return findFirstLeaf(item.children[0]);
+};
+
+const docSectionId = (id: string) => `doc-section-${id.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+
+const apiErrorMessage = (error: any, fallback: string) => {
+  if (error?.response?.data?.detail) return error.response.data.detail;
+  if (error?.response?.data?.message) return error.response.data.message;
+  if (error?.message === 'Network Error') {
+    return '无法连接应用后端服务。请先启动后端 API（默认 http://localhost:8000），再同步模型；LiteLLM/Base URL 是模型代理地址，不是前端直连地址。';
+  }
+  return error?.message || fallback;
+};
+
 const updateOutlineItem = (items: OutlineItem[], id: string, patch: Partial<OutlineItem>): OutlineItem[] =>
   items.map((item) => {
     if (item.id === id) return { ...item, ...patch };
@@ -124,6 +169,72 @@ const riskLevel = (item: OutlineItem) => {
   return '低风险';
 };
 
+const isMeaningfulValue = (value?: string | null) => {
+  const normalized = (value || '').trim();
+  if (!normalized) return false;
+  return !['待模型解析', '待解析', '无', '暂无', '未提供', '未明确', '不详', 'null', 'undefined'].includes(normalized);
+};
+
+const findFieldInText = (text: string, labels: string[]) => {
+  for (const label of labels) {
+    const pattern = new RegExp(`${label}\\s*[：:]\\s*([^\\n；;，,]{2,80})`, 'i');
+    const match = text.match(pattern);
+    if (match?.[1]) return match[1].replace(/[。；;，,]$/, '').trim();
+  }
+  return '';
+};
+
+const buildProjectSummary = (
+  report: AnalysisReport | null,
+  overview: string,
+  requirements: string,
+  fileContent: string,
+): ProjectSummary | undefined => {
+  if (!report?.project) return undefined;
+  const sourceText = [overview, requirements, fileContent.slice(0, 30000)].filter(Boolean).join('\n');
+  const project = report.project;
+  const fallback: ProjectSummary = {
+    ...project,
+    name: isMeaningfulValue(project.name) ? project.name : findFieldInText(sourceText, ['项目名称', '采购项目名称', '招标项目名称', '项目']),
+    number: isMeaningfulValue(project.number) ? project.number : findFieldInText(sourceText, ['项目编号', '采购项目编号', '招标编号', '项目代码']),
+    purchaser: isMeaningfulValue(project.purchaser) ? project.purchaser : findFieldInText(sourceText, ['采购人', '招标人', '采购单位', '建设单位']),
+    service_period: isMeaningfulValue(project.service_period) ? project.service_period : findFieldInText(sourceText, ['服务期限', '服务期', '履约期限', '工期']),
+    budget: isMeaningfulValue(project.budget) ? project.budget : findFieldInText(sourceText, ['预算金额', '采购预算', '最高限价', '控制价']),
+    bid_deadline: isMeaningfulValue(project.bid_deadline) ? project.bid_deadline : findFieldInText(sourceText, ['提交截止时间', '投标截止时间', '响应文件提交截止时间', '开标时间']),
+  };
+  fallback.__fallback = ['name', 'number', 'purchaser', 'service_period', 'budget', 'bid_deadline'].some((key) => {
+    const typedKey = key as keyof AnalysisReport['project'];
+    return !isMeaningfulValue(project[typedKey]) && isMeaningfulValue(fallback[typedKey]);
+  });
+  return fallback;
+};
+
+const parseOutlineDraftRows = (raw: string): DraftOutlineRow[] => {
+  const rows: DraftOutlineRow[] = [];
+  const seen = new Set<string>();
+  const objectPattern = /"id"\s*:\s*"([^"]+)"[\s\S]{0,260}?"title"\s*:\s*"([^"]+)"/g;
+  let objectMatch: RegExpExecArray | null;
+  while ((objectMatch = objectPattern.exec(raw)) && rows.length < 40) {
+    const id = objectMatch[1].trim();
+    const title = objectMatch[2].trim();
+    if (!id || !title || seen.has(id)) continue;
+    seen.add(id);
+    rows.push({ id, title, level: Math.max(0, id.split('.').length - 1), status: '正在映射' });
+  }
+
+  if (rows.length) return rows;
+
+  const titlePattern = /"title"\s*:\s*"([^"]+)"/g;
+  let titleMatch: RegExpExecArray | null;
+  while ((titleMatch = titlePattern.exec(raw)) && rows.length < 24) {
+    const title = titleMatch[1].trim();
+    if (!title || seen.has(title)) continue;
+    seen.add(title);
+    rows.push({ id: `${rows.length + 1}`, title, level: 0, status: '生成中' });
+  }
+  return rows;
+};
+
 const App = () => {
   const {
     state,
@@ -132,10 +243,11 @@ const App = () => {
     updateAnalysisResults,
     updateOutline,
     updateSelectedChapter,
+    restoreDraft,
   } = useAppState();
 
   const [activeNav, setActiveNav] = useState<NavKey>('project');
-  const [configOpen, setConfigOpen] = useState(true);
+  const [configOpen, setConfigOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState('');
   const [busy, setBusy] = useState('');
   const [progress, setProgress] = useState<ProgressState | null>(null);
@@ -146,28 +258,67 @@ const App = () => {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [localConfig, setLocalConfig] = useState<ConfigData>(state.config);
   const [selectedBidMode, setSelectedBidMode] = useState<BidMode>('full_bid');
+  const [activeDocId, setActiveDocId] = useState('');
+  const [outlineDraftRows, setOutlineDraftRows] = useState<DraftOutlineRow[]>([]);
+  const [streamingChapterId, setStreamingChapterId] = useState('');
+  const [generationControl, setGenerationControl] = useState<GenerationControlState>('idle');
+  const [generationProgress, setGenerationProgress] = useState<ProgressState | null>(null);
+  const [historyRecords, setHistoryRecords] = useState<DraftHistoryRecord[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const docPreviewRef = useRef<HTMLElement>(null);
   const progressVersionRef = useRef(0);
+  const generationAbortRef = useRef<AbortController | null>(null);
+  const generationPausedRef = useRef(false);
+  const generationStoppedRef = useRef(false);
+  const batchOutlineRef = useRef<OutlineData | null>(null);
 
   const activeReport = state.analysisReport || state.outlineData?.analysis_report || null;
   const effectiveOutline = state.outlineData;
+  const activeResponseMatrix = effectiveOutline?.response_matrix || activeReport?.response_matrix || null;
+  const responseMatrixItems = activeResponseMatrix?.items || [];
+  const highRiskMatrixCount = responseMatrixItems.filter(item => item.priority === 'high' || item.blocking).length;
+  const uncoveredMatrixCount = activeResponseMatrix?.uncovered_ids?.length || responseMatrixItems.filter(item => item.status !== 'covered').length;
   const entries = useMemo(() => effectiveOutline ? collectEntries(effectiveOutline.outline) : [], [effectiveOutline]);
   const selectedEntry = entries.find(entry => entry.item.id === state.selectedChapter) || entries[0];
-  const selectedContent = selectedEntry?.item.content || '';
-  const project = activeReport?.project;
+  const project = useMemo(
+    () => buildProjectSummary(activeReport, state.projectOverview, state.techRequirements, state.fileContent),
+    [activeReport, state.projectOverview, state.techRequirements, state.fileContent],
+  );
   const completedLeaves = entries.filter(entry => entry.item.content?.trim()).length;
   const coverage = entries.length > 0 ? Math.round((completedLeaves / entries.length) * 100) : 0;
-  const reviewCoverage = reviewReport?.coverage.length
+  const reviewCoverage = reviewReport?.summary.coverage_rate !== undefined && reviewReport?.summary.coverage_rate !== null
+    ? Math.round(reviewReport.summary.coverage_rate)
+    : reviewReport?.coverage.length
     ? Math.round((reviewReport.coverage.filter(item => item.covered).length / reviewReport.coverage.length) * 100)
     : null;
-  const blockingIssues = reviewReport?.summary.blocking_issues ?? null;
-  const warningIssues = reviewReport?.summary.warnings ?? null;
+  const blockingIssues = reviewReport?.summary.blocking_issues_count ?? reviewReport?.summary.blocking_issues ?? null;
+  const warningIssues = reviewReport?.summary.warnings_count ?? reviewReport?.summary.warnings ?? null;
   const infoIssues = reviewReport
-    ? reviewReport.duplication_issues.length + reviewReport.fabrication_risks.length + reviewReport.rejection_risks.filter(item => item.handled).length
+    ? reviewReport.duplication_issues.length + reviewReport.fabrication_risks.length + reviewReport.rejection_risks.filter(item => item.handled).length + (reviewReport.revision_plan?.actions.length || 0)
     : null;
   const projectTitle = project?.name || effectiveOutline?.project_name || '待解析项目';
 
   useEffect(() => setLocalConfig(state.config), [state.config]);
+
+  useEffect(() => {
+    setHistoryRecords(draftStorage.loadHistory());
+  }, [state.fileContent, state.analysisReport, state.outlineData, state.selectedChapter]);
+
+  useEffect(() => {
+    const syncPageFromHash = () => {
+      const key = window.location.hash.replace(/^#\/?/, '') as NavKey;
+      if (!NAV_ITEMS.some(item => item.key === key)) return;
+      if (key === 'config') {
+        setConfigOpen(true);
+        return;
+      }
+      setActiveNav(key);
+    };
+
+    syncPageFromHash();
+    window.addEventListener('hashchange', syncPageFromHash);
+    return () => window.removeEventListener('hashchange', syncPageFromHash);
+  }, []);
 
   useEffect(() => {
     configApi.loadConfig()
@@ -188,12 +339,17 @@ const App = () => {
   }, [entries, state.selectedChapter, updateSelectedChapter]);
 
   useEffect(() => {
+    if (!activeDocId && selectedEntry?.item.id) setActiveDocId(selectedEntry.item.id);
+  }, [activeDocId, selectedEntry?.item.id]);
+
+  useEffect(() => {
     if (activeReport?.bid_mode_recommendation) setSelectedBidMode(activeReport.bid_mode_recommendation);
   }, [activeReport?.bid_mode_recommendation]);
 
   const setError = (text: string) => setNotice({ type: 'error', text });
   const setSuccess = (text: string) => setNotice({ type: 'success', text });
   const setInfo = (text: string) => setNotice({ type: 'info', text });
+  const refreshHistory = () => setHistoryRecords(draftStorage.loadHistory());
 
   const clampProgress = (value: number) => Math.max(0, Math.min(100, Math.round(value)));
 
@@ -259,8 +415,93 @@ const App = () => {
     }
   };
 
-  const focusPanel = (target?: string) => {
-    if (target) document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  const syncGenerationProgress = (detail: string, percent: number, stepIndex = 0, label = '正文生成') => {
+    setGenerationProgress(prev => ({
+      label,
+      detail,
+      percent: clampProgress(percent),
+      stepIndex,
+      steps: prev?.steps?.length ? prev.steps : ['准备章节', '模型写入', '保存正文'],
+      status: 'running',
+    }));
+  };
+
+  const waitIfGenerationPaused = async () => {
+    while (generationPausedRef.current && !generationStoppedRef.current) {
+      await new Promise(resolve => window.setTimeout(resolve, 160));
+    }
+    if (generationStoppedRef.current) {
+      throw new DOMException('已停止生成', 'AbortError');
+    }
+  };
+
+  const resetGenerationControls = () => {
+    generationPausedRef.current = false;
+    generationStoppedRef.current = false;
+    generationAbortRef.current = null;
+    setStreamingChapterId('');
+    setGenerationControl('idle');
+  };
+
+  const pauseGeneration = () => {
+    if (!busy.startsWith('chapter') && busy !== 'batch') return;
+    generationPausedRef.current = true;
+    setGenerationControl('paused');
+    setGenerationProgress(prev => prev ? { ...prev, detail: `已暂停：${prev.detail}`, status: 'running' } : prev);
+  };
+
+  const resumeGeneration = () => {
+    if (!generationPausedRef.current) return;
+    generationPausedRef.current = false;
+    setGenerationControl('running');
+    setGenerationProgress(prev => prev ? { ...prev, detail: prev.detail.replace(/^已暂停：/, ''), status: 'running' } : prev);
+  };
+
+  const stopGeneration = () => {
+    if (!busy.startsWith('chapter') && busy !== 'batch') return;
+    generationStoppedRef.current = true;
+    generationPausedRef.current = false;
+    generationAbortRef.current?.abort();
+    setGenerationControl('stopped');
+    setGenerationProgress(prev => prev ? { ...prev, detail: '已停止生成，可重新选择章节继续', status: 'error' } : prev);
+  };
+
+  const scrollToDocumentNode = (item: OutlineItem) => {
+    const firstLeaf = findFirstLeaf(item);
+    setActiveDocId(item.id);
+    updateSelectedChapter(firstLeaf.id);
+    window.requestAnimationFrame(() => {
+      document.getElementById(docSectionId(item.id))?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  };
+
+  const goToPage = (key: NavKey) => {
+    if (key === 'config') {
+      setConfigOpen(true);
+      window.history.pushState(null, '', '#config');
+      return;
+    }
+    setActiveNav(key);
+    window.history.pushState(null, '', `#${key}`);
+  };
+
+  const restoreHistoryRecord = (record: DraftHistoryRecord) => {
+    const activated = draftStorage.activateHistory(record.id);
+    restoreDraft((activated || record).draft);
+    setReviewReport(null);
+    setActiveDocId(record.draft.selectedChapter || '');
+    setUploadedFileName(record.title);
+    refreshHistory();
+    setSuccess(`已恢复历史记录：${record.title}`);
+    if (record.draft.outlineData) {
+      goToPage('content');
+    } else if (record.draft.analysisReport) {
+      goToPage('outline');
+    } else if (record.draft.fileContent) {
+      goToPage('analysis');
+    } else {
+      goToPage('project');
+    }
   };
 
   const handleModeChange = (mode: BidMode) => {
@@ -272,6 +513,10 @@ const App = () => {
   const handleUpload = async (file: File) => {
     if (!file.name.toLowerCase().match(/\.(pdf|docx)$/)) {
       setError('仅支持 PDF 和 DOCX 文件');
+      return;
+    }
+    if (file.size > 500 * 1024 * 1024) {
+      setError('文件大小不能超过 500MB');
       return;
     }
     setBusy('upload');
@@ -356,9 +601,15 @@ const App = () => {
     setBusy('outline');
     const taskVersion = startProgress('目录生成', ['构建输入', '生成目录', '映射评分风险'], '正在准备目录生成上下文', 8);
     setStreamText('');
+    setOutlineDraftRows((state.analysisReport?.bid_structure || []).slice(0, 8).map((item, index) => ({
+      id: item.id || `${index + 1}`,
+      title: item.title || item.purpose || `候选章节 ${index + 1}`,
+      level: item.parent_id ? 1 : 0,
+      status: '待模型确认',
+    })));
     try {
       let raw = '';
-      advanceProgress('正在调用模型生成目录和映射关系', 16, 1);
+      advanceProgress('正在调用模型生成目录和映射关系', 16, 1, taskVersion);
       const response = await outlineApi.generateOutlineStream({
         overview: state.projectOverview,
         requirements: state.techRequirements,
@@ -370,22 +621,27 @@ const App = () => {
         if (typeof payload.chunk === 'string') {
           raw += payload.chunk;
           setStreamText(raw);
-          advanceProgress('正在调用模型生成目录和映射关系', Math.min(92, 16 + Math.floor(raw.length / 220)), raw.length > 1000 ? 2 : 1);
+          const draftRows = parseOutlineDraftRows(raw);
+          if (draftRows.length) setOutlineDraftRows(draftRows);
+          advanceProgress('正在调用模型生成目录和映射关系', Math.min(92, 16 + Math.floor(raw.length / 220)), raw.length > 1000 ? 2 : 1, taskVersion);
         }
       });
-      advanceProgress('正在写入目录结构和评分映射', 96, 2);
+      advanceProgress('正在写入目录结构和评分映射', 96, 2, taskVersion);
       const outline = JSON.parse(extractJsonPayload(raw)) as OutlineData;
       const nextOutline = {
         ...outline,
         project_name: state.analysisReport.project?.name || '投标文件',
         project_overview: state.projectOverview,
         analysis_report: state.analysisReport,
+        response_matrix: outline.response_matrix || state.analysisReport.response_matrix,
+        coverage_summary: outline.coverage_summary || state.analysisReport.response_matrix?.coverage_summary,
         bid_mode: selectedBidMode,
       };
       updateOutline(nextOutline);
       const first = collectEntries(nextOutline.outline)[0];
       if (first) updateSelectedChapter(first.item.id);
       setStreamText('');
+      setOutlineDraftRows([]);
       completeProgress('目录生成完成', taskVersion);
       setSuccess('目录映射完成，章节已关联评分、风险和材料项');
     } catch (error: any) {
@@ -396,7 +652,14 @@ const App = () => {
     }
   };
 
-  const generateChapter = async (entry: ChapterEntry) => {
+  const generateChapter = async (
+    entry: ChapterEntry,
+    options?: {
+      signal?: AbortSignal;
+      onContent?: (content: string) => void;
+      onProgress?: (content: string) => void;
+    },
+  ) => {
     if (!effectiveOutline) throw new Error('缺少目录数据');
     if (!activeReport) throw new Error('缺少结构化解析结果，请先完成标准解析');
     const siblingItems = entry.parents.length
@@ -408,6 +671,7 @@ const App = () => {
       sibling_chapters: siblingItems,
       project_overview: effectiveOutline.project_overview || state.projectOverview,
       analysis_report: activeReport,
+      response_matrix: effectiveOutline.response_matrix || activeReport.response_matrix,
       bid_mode: effectiveOutline.bid_mode || selectedBidMode,
       generated_summaries: entries
         .filter(item => item.item.id !== entry.item.id && item.item.content?.trim())
@@ -416,41 +680,82 @@ const App = () => {
       enterprise_materials: (activeReport.required_materials || []).filter(item => item.status === 'provided'),
       missing_materials: activeReport.missing_company_materials || [],
     };
-    const response = await contentApi.generateChapterContentStream(request);
+    const response = await contentApi.generateChapterContentStream(request, options?.signal);
     let content = '';
     await consumeSseStream(response, (payload) => {
       if (payload.status === 'error') throw new Error(payload.message || '正文生成失败');
-      if (payload.status === 'streaming' && payload.full_content) content = payload.full_content;
-      if (payload.status === 'completed' && payload.content) content = payload.content;
+      if (payload.status === 'streaming' && payload.full_content) {
+        content = payload.full_content;
+        options?.onContent?.(content);
+        options?.onProgress?.(content);
+      }
+      if (payload.status === 'completed' && payload.content) {
+        content = payload.content;
+        options?.onContent?.(content);
+        options?.onProgress?.(content);
+      }
+    }, {
+      shouldPause: () => generationPausedRef.current,
+      isStopped: () => generationStoppedRef.current,
     });
     if (!content.trim()) throw new Error('模型返回空内容');
     return content;
   };
 
-  const saveGeneratedContent = (entry: ChapterEntry, content: string) => {
-    if (!effectiveOutline) return;
+  const saveGeneratedContent = (entry: ChapterEntry, content: string, scroll = true, outlineSource = effectiveOutline) => {
+    if (!outlineSource) return outlineSource;
     const nextOutline = {
-      ...effectiveOutline,
-      outline: updateOutlineItem(effectiveOutline.outline, entry.item.id, { content }),
+      ...outlineSource,
+      outline: updateOutlineItem(outlineSource.outline, entry.item.id, { content }),
     };
     updateOutline(nextOutline);
+    setActiveDocId(entry.item.id);
+    if (scroll) {
+      window.requestAnimationFrame(() => {
+        document.getElementById(docSectionId(entry.item.id))?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+    return nextOutline;
   };
 
   const runCurrentChapter = async () => {
     if (!selectedEntry) return;
     setBusy(`chapter:${selectedEntry.item.id}`);
+    const controller = new AbortController();
+    generationAbortRef.current = controller;
+    generationPausedRef.current = false;
+    generationStoppedRef.current = false;
+    setGenerationControl('running');
+    setStreamingChapterId(selectedEntry.item.id);
     const taskVersion = startProgress('正文生成', ['准备章节', '模型写入', '保存正文'], `正在生成 ${selectedEntry.item.id} ${selectedEntry.item.title}`, 12);
+    syncGenerationProgress(`正在生成 ${selectedEntry.item.id} ${selectedEntry.item.title}`, 12, 1, '正文生成');
     try {
-      const content = await generateChapter(selectedEntry);
-      advanceProgress('正在保存本章正文', 88, 2);
+      const content = await generateChapter(selectedEntry, {
+        signal: controller.signal,
+        onContent: (partial) => saveGeneratedContent(selectedEntry, partial, false),
+        onProgress: (partial) => {
+          const percent = Math.min(84, 18 + Math.floor(partial.length / 120));
+          advanceProgress(`正在写入 ${selectedEntry.item.id} ${selectedEntry.item.title}`, percent, 1, taskVersion);
+          syncGenerationProgress(`正在写入 ${selectedEntry.item.id} ${selectedEntry.item.title}`, percent, 1, '正文生成');
+        },
+      });
+      advanceProgress('正在保存本章正文', 88, 2, taskVersion);
       saveGeneratedContent(selectedEntry, content);
+      syncGenerationProgress('本章正文生成完成', 100, 2, '正文生成');
+      setGenerationProgress(prev => prev ? { ...prev, status: 'success', percent: 100, detail: '本章正文生成完成' } : prev);
       completeProgress('本章正文生成完成', taskVersion);
       setSuccess(`已生成 ${selectedEntry.item.id} ${selectedEntry.item.title}`);
     } catch (error: any) {
+      if (error?.name === 'AbortError' || generationStoppedRef.current) {
+        failProgress('已停止生成', undefined, taskVersion);
+        setInfo('已停止生成，可继续生成当前或其他章节');
+        return;
+      }
       failProgress(error.message || '生成本章失败', undefined, taskVersion);
       setError(error.message || '生成本章失败');
     } finally {
       setBusy('');
+      resetGenerationControls();
     }
   };
 
@@ -460,25 +765,64 @@ const App = () => {
       return;
     }
     setBusy('batch');
+    const controller = new AbortController();
+    generationAbortRef.current = controller;
+    generationPausedRef.current = false;
+    generationStoppedRef.current = false;
+    setGenerationControl('running');
     const taskVersion = startProgress('批量生成', ['排队章节', '逐章生成', '保存正文'], '正在准备批量生成正文', 5);
+    syncGenerationProgress('正在准备批量生成正文', 5, 0, '批量生成');
     try {
       let nextOutline = effectiveOutline;
+      batchOutlineRef.current = nextOutline;
       const pendingEntries = entries.filter(entry => !entry.item.content?.trim());
       for (let index = 0; index < pendingEntries.length; index += 1) {
+        await waitIfGenerationPaused();
         const entry = pendingEntries[index];
         if (entry.item.content?.trim()) continue;
-        advanceProgress(`正在生成 ${entry.item.id} ${entry.item.title}`, Math.min(92, 8 + Math.round((index / Math.max(pendingEntries.length, 1)) * 82)), 1);
-        const content = await generateChapter(entry);
+        setStreamingChapterId(entry.item.id);
+        setActiveDocId(entry.item.id);
+        updateSelectedChapter(entry.item.id);
+        const basePercent = Math.min(92, 8 + Math.round((index / Math.max(pendingEntries.length, 1)) * 82));
+        advanceProgress(`正在生成 ${entry.item.id} ${entry.item.title}`, basePercent, 1, taskVersion);
+        syncGenerationProgress(`正在生成 ${entry.item.id} ${entry.item.title}`, basePercent, 1, '批量生成');
+        const content = await generateChapter(entry, {
+          signal: controller.signal,
+          onContent: (partial) => {
+            const currentOutline = batchOutlineRef.current;
+            if (!currentOutline) return;
+            const patchedOutline = { ...currentOutline, outline: updateOutlineItem(currentOutline.outline, entry.item.id, { content: partial }) };
+            batchOutlineRef.current = patchedOutline;
+            updateOutline(patchedOutline);
+          },
+          onProgress: (partial) => {
+            const chapterProgress = Math.min(8, Math.floor(partial.length / 260));
+            const percent = Math.min(96, basePercent + chapterProgress);
+            advanceProgress(`正在写入 ${entry.item.id} ${entry.item.title}`, percent, 1, taskVersion);
+            syncGenerationProgress(`正在写入 ${entry.item.id} ${entry.item.title}`, percent, 1, '批量生成');
+          },
+        });
+        nextOutline = batchOutlineRef.current || nextOutline;
         nextOutline = { ...nextOutline, outline: updateOutlineItem(nextOutline.outline, entry.item.id, { content }) };
+        batchOutlineRef.current = nextOutline;
         updateOutline(nextOutline);
       }
+      syncGenerationProgress('批量正文生成完成', 100, 2, '批量生成');
+      setGenerationProgress(prev => prev ? { ...prev, status: 'success', percent: 100, detail: '批量正文生成完成' } : prev);
       completeProgress('批量正文生成完成', taskVersion);
       setSuccess('批量正文生成完成');
     } catch (error: any) {
+      if (error?.name === 'AbortError' || generationStoppedRef.current) {
+        failProgress('已停止批量生成', undefined, taskVersion);
+        setInfo('已停止批量生成，已保留已生成章节');
+        return;
+      }
       failProgress(error.message || '批量生成失败', undefined, taskVersion);
       setError(error.message || '批量生成失败');
     } finally {
       setBusy('');
+      batchOutlineRef.current = null;
+      resetGenerationControls();
     }
   };
 
@@ -502,6 +846,7 @@ const App = () => {
         outline,
         project_overview: effectiveOutline.project_overview || state.projectOverview,
         analysis_report: activeReport,
+        response_matrix: effectiveOutline.response_matrix || activeReport?.response_matrix,
         bid_mode: effectiveOutline.bid_mode || selectedBidMode,
       });
       await consumeSseStream(response, (payload) => {
@@ -541,9 +886,35 @@ const App = () => {
       });
       if (!response.ok) throw new Error('导出失败');
       const blob = await response.blob();
-      saveAs(blob, `${effectiveOutline.project_name || project?.name || '投标文件'}.docx`);
+      const filename = `${effectiveOutline.project_name || project?.name || '投标文件'}.docx`;
+      const picker = (window as any).showSaveFilePicker;
+      if (picker) {
+        try {
+          const handle = await picker({
+            suggestedName: filename,
+            types: [{
+              description: 'Word 文档',
+              accept: {
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
+              },
+            }],
+          });
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+        } catch (error: any) {
+          if (error?.name === 'AbortError') {
+            setProgress(null);
+            setInfo('已取消保存 Word 文件');
+            return;
+          }
+          throw error;
+        }
+      } else {
+        saveAs(blob, filename);
+      }
       completeProgress('Word 文件已生成', taskVersion);
-      setSuccess('Word 文件已生成');
+      setSuccess(`Word 文件已保存：${filename}`);
     } catch (error: any) {
       failProgress(error.message || '导出失败', undefined, taskVersion);
       setError(error.message || '导出失败');
@@ -563,7 +934,7 @@ const App = () => {
       updateConfig(nextConfig);
       setSuccess('模型配置已保存');
     } catch (error: any) {
-      setError(error.message || '配置保存失败');
+      setError(apiErrorMessage(error, '配置保存失败'));
     } finally {
       setBusy('');
     }
@@ -579,7 +950,7 @@ const App = () => {
       if (modelCheck?.models?.length) setAvailableModels(modelCheck.models);
       setNotice({ type: response.data.success ? 'success' : 'error', text: response.data.message });
     } catch (error: any) {
-      setError(error.response?.data?.detail || '验证端点失败');
+      setError(apiErrorMessage(error, '验证端点失败'));
     } finally {
       setBusy('');
     }
@@ -599,64 +970,14 @@ const App = () => {
       }
       setSuccess(response.data.message || `已同步 ${models.length} 个模型`);
     } catch (error: any) {
-      setError(error.response?.data?.detail || error.message || '模型同步失败');
+      setError(apiErrorMessage(error, '模型同步失败'));
     } finally {
       setBusy('');
     }
   };
 
   const handleWorkflowAction = (item: typeof NAV_ITEMS[number]) => {
-    setActiveNav(item.key);
-    if (item.key === 'config') {
-      setConfigOpen(true);
-      return;
-    }
-    if (busy) {
-      setInfo(progress?.detail || '当前任务正在执行，请等待完成后再继续');
-      focusPanel(item.target);
-      return;
-    }
-    if (item.key === 'project') {
-      focusPanel(item.target);
-      fileInputRef.current?.click();
-      return;
-    }
-    if (item.key === 'analysis') {
-      focusPanel(item.target);
-      if (!state.fileContent) {
-        setInfo('请先上传招标文件，再开始标准解析');
-        fileInputRef.current?.click();
-        return;
-      }
-      void runAnalysis();
-      return;
-    }
-    if (item.key === 'outline') {
-      focusPanel(item.target);
-      if (!state.analysisReport) {
-        setInfo('先完成标准解析，再生成目录映射');
-        return;
-      }
-      void runOutline();
-      return;
-    }
-    if (item.key === 'content') {
-      focusPanel(item.target);
-      if (!selectedEntry) {
-        setInfo('先生成目录并选择章节，再调用模型编写正文');
-        return;
-      }
-      void runCurrentChapter();
-      return;
-    }
-    if (item.key === 'review') {
-      focusPanel(item.target);
-      if (!effectiveOutline || completedLeaves === 0) {
-        setInfo('先生成正文内容，再执行合规审校');
-        return;
-      }
-      void runReview();
-    }
+    goToPage(item.key);
   };
 
   const flowIndex = state.fileContent
@@ -713,13 +1034,15 @@ const App = () => {
             ? '正在上传文件'
             : '正在处理请求');
   const busyPercent = progress?.percent ?? 12;
+  const currentPage = activeNav === 'config' ? 'project' : activeNav;
+  const pageMeta = PAGE_META[currentPage];
 
   return (
     <div className="ops-app">
       <aside className="ops-nav">
         <div className="ops-brand">
           <span className="ops-brand__mark">A</span>
-          <span>AI 标书生成助手</span>
+          <span>华正ai标书系统</span>
         </div>
         <nav className="ops-nav__list">
           {NAV_ITEMS.map((item) => {
@@ -731,7 +1054,6 @@ const App = () => {
                 type="button"
                 className={`ops-nav__item ${active ? 'ops-nav__item--active' : ''}`}
                 onClick={() => handleWorkflowAction(item)}
-                disabled={Boolean(busy) && item.key !== 'config'}
               >
                 <Icon className="h-4 w-4" />
                 <span className="ops-nav__copy">
@@ -743,6 +1065,27 @@ const App = () => {
             );
           })}
         </nav>
+        <div className="history-panel">
+          <div className="history-panel__head">
+            <strong>历史记录</strong>
+            <span>{historyRecords.length}</span>
+          </div>
+          <div className="history-list">
+            {historyRecords.length ? historyRecords.slice(0, 4).map(record => (
+              <button
+                key={record.id}
+                type="button"
+                className="history-item"
+                onClick={() => restoreHistoryRecord(record)}
+              >
+                <strong>{record.title}</strong>
+                <span>{record.total ? `${record.completed}/${record.total} 章` : '待生成目录'} · {new Date(record.updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+              </button>
+            )) : (
+              <div className="history-empty">生成后自动保存</div>
+            )}
+          </div>
+        </div>
         <div className="ops-progress-card">
           <div className="ops-progress-card__ring">{coverage}%</div>
           <div>
@@ -787,231 +1130,424 @@ const App = () => {
           </div>
         </header>
 
-        <div className="ops-body">
-          <section className="ops-left-rail">
-            <div id="panel-analysis" className="ops-panel">
-              <h2>1. 上传招标文件</h2>
-              <button type="button" className="upload-zone" onClick={() => fileInputRef.current?.click()}>
-                <DocumentArrowUpIcon className="h-10 w-10" />
-                <strong>点击或拖拽文件到此处上传</strong>
-                <span>支持 PDF/DOC/DOCX，大小不超过 100MB</span>
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                className="hidden"
-                accept=".pdf,.docx"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) handleUpload(file);
-                }}
-              />
-              <div className="file-pill">
-                <DocumentTextIcon className="h-5 w-5 text-rose-600" />
-                <div>
-                  <strong>{uploadedFileName || '等待上传招标文件'}</strong>
-                  <span>{state.fileContent ? '已上传并读取文本' : '待上传'}</span>
-                </div>
-                {state.fileContent && <CheckCircleIcon className="h-5 w-5 text-emerald-600" />}
+        <div className="ops-body ops-body--page">
+          <section className="ops-page">
+            <div className="ops-page__head">
+              <div>
+                <span className="ops-page__eyebrow">工作流页面</span>
+                <h1>{pageMeta.title}</h1>
+                <p>{pageMeta.description}</p>
+              </div>
+              <div className="ops-page__quicknav">
+                {NAV_ITEMS.filter(item => item.key !== 'config').map(item => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    className={currentPage === item.key ? 'active' : ''}
+                    onClick={() => goToPage(item.key)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
               </div>
             </div>
 
-            <div className="ops-panel">
-              <div className="ops-panel__head">
-                <h2>2. 解析状态</h2>
-                <button type="button" className="text-link" onClick={runAnalysis} disabled={busy === 'analysis'}>
-                  {busy === 'analysis' ? '解析中' : '开始解析'}
-                </button>
-              </div>
-              {(busy === 'analysis' || progress?.label === '标准解析') && <TaskProgress progress={progress} onRetry={runAnalysis} />}
-              {ANALYSIS_STEPS.map((item, index) => {
-                const status = analysisStepStatus(index);
-                return (
-                  <div key={item} className={`check-row check-row--${status === '失败' ? 'error' : status === '进行中' ? 'active' : status === '已完成' ? 'done' : 'idle'}`}>
-                  <CheckCircleIcon className={`h-4 w-4 ${status === '已完成' ? 'text-emerald-600' : status === '失败' ? 'text-rose-600' : status === '进行中' ? 'text-amber-500' : 'text-slate-300'}`} />
-                  <span>{item}</span>
-                  <strong>{status}</strong>
-                  </div>
-                );
-              })}
-              {streamText && <pre className="stream-box">{streamText}</pre>}
-            </div>
-
-            <div id="panel-project" className="ops-panel project-info">
-              <div className="ops-panel__head">
-                <h2>3. 项目基础信息</h2>
-                <span className="text-link">{activeReport ? '模型解析结果' : '待解析'}</span>
-              </div>
-              {!activeReport && (
-                <div className="empty-state empty-state--compact">
-                  <strong>上传并解析招标文件后生成</strong>
-                  <span>项目编号、采购人、预算、截止时间等字段不会使用前端示例占位。</span>
-                </div>
-              )}
-              {[
-                ['项目编号', project?.number],
-                ['采购人', project?.purchaser],
-                ['服务期限', project?.service_period],
-                ['报价要求', activeReport?.price_rules?.quote_method],
-                ['预算金额', project?.budget],
-                ['提交截止时间', project?.bid_deadline],
-              ].map(([label, value]) => (
-                <div key={label} className="info-row"><span>{label}</span><strong>{value || '待模型解析'}</strong></div>
-              ))}
-            </div>
-
-            <div className="ops-panel">
-              <div className="ops-panel__head">
-                <h2>4. 材料缺失提示</h2>
-                <span>{activeReport ? `共 ${(activeReport.missing_company_materials || []).length} 项` : '待解析'}</span>
-              </div>
-              {activeReport ? (
-                (activeReport.missing_company_materials || []).length ? (
-                  (activeReport.missing_company_materials || []).slice(0, 6).map(item => (
-                    <div key={item.id} className="warning-row">
-                      <ExclamationTriangleIcon className="h-4 w-4 text-amber-500" />
-                      <span>{item.name}</span>
-                      <strong>待补充</strong>
+            {currentPage === 'project' && (
+              <div className="ops-page-grid ops-page-grid--upload">
+                <div className="ops-panel">
+                  <h2>上传招标文件</h2>
+                  <button type="button" className="upload-zone upload-zone--large" onClick={() => fileInputRef.current?.click()}>
+                    <DocumentArrowUpIcon className="h-12 w-12" />
+                    <strong>点击选择 PDF 或 DOCX 招标文件</strong>
+                    <span>文件大小限制在 500MB 以下，上传后系统会读取全文并复用同一份解析结果。</span>
+                  </button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    className="hidden"
+                    accept=".pdf,.docx"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) handleUpload(file);
+                    }}
+                  />
+                  <div className="file-pill">
+                    <DocumentTextIcon className="h-5 w-5 text-rose-600" />
+                    <div>
+                      <strong>{uploadedFileName || '等待上传招标文件'}</strong>
+                      <span>{state.fileContent ? '已上传并读取文本' : '待上传'}</span>
                     </div>
-                  ))
-                ) : (
-                  <div className="empty-state empty-state--compact">
-                    <strong>未识别出缺失材料</strong>
-                    <span>该结果来自当前解析报告，可在审校阶段继续核验。</span>
+                    {state.fileContent && <CheckCircleIcon className="h-5 w-5 text-emerald-600" />}
                   </div>
-                )
-              ) : (
-                <div className="empty-state empty-state--compact">
-                  <strong>完成标准解析后显示</strong>
-                  <span>材料清单由模型从资格、商务、签章等要求中抽取。</span>
-                </div>
-              )}
-            </div>
-          </section>
-
-          <section className="ops-center">
-            <div className="flow-panel">
-              {FLOW_STEPS.map((step, index) => (
-                <div key={step} className={`flow-step ${index <= flowIndex ? 'flow-step--done' : ''}`}>
-                  <span>{index <= flowIndex ? <CheckCircleIcon className="h-4 w-4" /> : index + 1}</span>
-                  <strong>{step}</strong>
-                </div>
-              ))}
-              <button type="button" className="solid-button" onClick={runOutline} disabled={busy === 'outline' || !state.analysisReport}>生成目录</button>
-            </div>
-
-            <div id="panel-outline" className="outline-panel">
-              <div className="ops-panel__head">
-                <div>
-                  <h2>目录结构与评分项映射</h2>
-                  <span>{effectiveOutline ? `共 ${countNodes(effectiveOutline.outline)} 章，已映射 ${countMapped(effectiveOutline.outline)} 项` : '等待模型生成目录和映射'}</span>
-                </div>
-                <div className="outline-actions">
-                  <button type="button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>智能建议</button>
-                  <button type="button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>{effectiveOutline ? '重新生成' : '生成目录'}</button>
-                </div>
-              </div>
-              {effectiveOutline ? (
-                <div className="outline-table">
-                  <div className="outline-table__head">
-                    <span>章节名称</span><span>评分项映射</span><span>风险</span><span>材料</span>
+                  <div className="page-action-row">
+                    <button type="button" className="solid-button" onClick={() => goToPage('analysis')} disabled={!state.fileContent}>
+                      去解析
+                    </button>
+                    <button type="button" onClick={() => fileInputRef.current?.click()}>重新选择</button>
                   </div>
-                  {effectiveOutline.outline.map(section => (
-                    <OutlineRows key={section.id} item={section} selectedId={selectedEntry?.item.id} onSelect={updateSelectedChapter} />
+                </div>
+
+                <div className="ops-panel project-info">
+                  <div className="ops-panel__head">
+                    <h2>项目基础信息</h2>
+                    <span className="text-link">{activeReport ? '模型解析结果' : '待解析'}</span>
+                  </div>
+                  {!activeReport && (
+                    <div className="empty-state empty-state--compact">
+                      <strong>上传并解析招标文件后生成</strong>
+                      <span>项目编号、采购人、预算、截止时间等字段不会使用前端示例占位。</span>
+                    </div>
+                  )}
+                  {[
+                    ['项目编号', project?.number],
+                    ['采购人', project?.purchaser],
+                    ['服务期限', project?.service_period],
+                    ['报价要求', activeReport?.price_rules?.quote_method],
+                    ['预算金额', project?.budget],
+                    ['提交截止时间', project?.bid_deadline],
+                  ].map(([label, value]) => (
+                    <div key={label} className="info-row"><span>{label}</span><strong>{value || '待模型解析'}</strong></div>
                   ))}
                 </div>
-              ) : (
-                <div className="empty-state">
-                  <strong>目录还没有生成</strong>
-                  <span>完成标准解析后，点击“生成目录”，后端会把招标结构、评分项、风险和材料要求映射到章节。</span>
-                  <button type="button" className="solid-button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>调用模型生成目录</button>
-                </div>
-              )}
-            </div>
-          </section>
 
-          <section className="ops-right-rail">
-            <div id="panel-content" className="preview-panel">
-              <div className="preview-actions">
-                <button type="button" className="solid-button" onClick={runCurrentChapter} disabled={!selectedEntry || busy.startsWith('chapter')}>
-                  <PlayIcon className="h-4 w-4" /> 生成本章
-                </button>
-                <button type="button" onClick={runBatch} disabled={!effectiveOutline || busy === 'batch'}>批量生成</button>
-                <button type="button" onClick={exportWord} disabled={!effectiveOutline || busy === 'export'}>
-                  <ArrowDownTrayIcon className="h-4 w-4" /> 导出 Word
-                </button>
-              </div>
-              <article className="doc-preview">
-                {selectedEntry ? (
-                  <>
-                    <span className="doc-kicker">{selectedEntry.item.id}　{selectedEntry.top.title}</span>
-                    <h2>{selectedEntry.item.id} {selectedEntry.item.title}</h2>
-                    <p>{selectedEntry.item.description || '本章节将在模型生成后展示正式投标文件正文。'}</p>
-                    {selectedContent ? (
-                      <ReactMarkdown>{selectedContent}</ReactMarkdown>
+                <div className="ops-panel">
+                  <div className="ops-panel__head">
+                    <h2>材料缺失提示</h2>
+                    <span>{activeReport ? `共 ${(activeReport.missing_company_materials || []).length} 项` : '待解析'}</span>
+                  </div>
+                  {activeReport ? (
+                    (activeReport.missing_company_materials || []).length ? (
+                      (activeReport.missing_company_materials || []).slice(0, 8).map(item => (
+                        <div key={item.id} className="warning-row">
+                          <ExclamationTriangleIcon className="h-4 w-4 text-amber-500" />
+                          <span>{item.name}</span>
+                          <strong>待补充</strong>
+                        </div>
+                      ))
                     ) : (
-                      <div className="empty-state empty-state--document">
-                        <strong>本章正文尚未生成</strong>
-                        <span>点击“生成本章”后，后端会把当前章节、父级章节、评分项、风险和材料要求传给模型生成内容。</span>
+                      <div className="empty-state empty-state--compact">
+                        <strong>未识别出缺失材料</strong>
+                        <span>该结果来自当前解析报告，可在审校阶段继续核验。</span>
+                      </div>
+                    )
+                  ) : (
+                    <div className="empty-state empty-state--compact">
+                      <strong>完成标准解析后显示</strong>
+                      <span>材料清单由模型从资格、商务、签章等要求中抽取。</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {currentPage === 'analysis' && (
+              <div className="ops-page-grid ops-page-grid--analysis">
+                <div className="ops-panel">
+                  <div className="ops-panel__head">
+                    <h2>解析状态</h2>
+                    <button type="button" className="text-link" onClick={runAnalysis} disabled={!state.fileContent || busy === 'analysis'}>
+                      {busy === 'analysis' ? '解析中' : '开始解析'}
+                    </button>
+                  </div>
+                  {(busy === 'analysis' || progress?.label === '标准解析') && <TaskProgress progress={progress} onRetry={runAnalysis} />}
+                  {ANALYSIS_STEPS.map((item, index) => {
+                    const status = analysisStepStatus(index);
+                    return (
+                      <div key={item} className={`check-row check-row--${status === '失败' ? 'error' : status === '进行中' ? 'active' : status === '已完成' ? 'done' : 'idle'}`}>
+                        <CheckCircleIcon className={`h-4 w-4 ${status === '已完成' ? 'text-emerald-600' : status === '失败' ? 'text-rose-600' : status === '进行中' ? 'text-amber-500' : 'text-slate-300'}`} />
+                        <span>{item}</span>
+                        <strong>{status}</strong>
+                      </div>
+                    );
+                  })}
+                  {streamText && <pre className="stream-box stream-box--large">{streamText}</pre>}
+                  <div className="page-action-row">
+                    <button type="button" className="solid-button" onClick={runAnalysis} disabled={!state.fileContent || busy === 'analysis'}>
+                      {state.analysisReport ? '重新解析' : '开始解析'}
+                    </button>
+                    <button type="button" onClick={() => goToPage('outline')} disabled={!state.analysisReport}>去生成目录</button>
+                  </div>
+                </div>
+
+                <div className="ops-panel project-info">
+                  <div className="ops-panel__head">
+                    <h2>解析结果摘要</h2>
+                    <span>{activeReport ? (project?.__fallback ? '已补全关键字段' : selectedBidMode) : '待解析'}</span>
+                  </div>
+                  {activeReport && project?.__fallback && (
+                    <div className="field-hint">部分基础信息来自解析文本兜底提取，后续审校时仍建议核对原文。</div>
+                  )}
+                  {[
+                    ['项目编号', project?.number],
+                    ['采购人', project?.purchaser],
+                    ['服务期限', project?.service_period],
+                    ['预算金额', project?.budget],
+                    ['提交截止时间', project?.bid_deadline],
+                  ].map(([label, value]) => (
+                    <div key={label} className="info-row"><span>{label}</span><strong>{isMeaningfulValue(value) ? value : '未识别到'}</strong></div>
+                  ))}
+                </div>
+
+                <div className="ops-panel response-matrix-panel">
+                  <div className="ops-panel__head">
+                    <h2>响应矩阵</h2>
+                    <span>{activeResponseMatrix ? `${responseMatrixItems.length} 项` : '待生成'}</span>
+                  </div>
+                  {activeResponseMatrix ? (
+                    <>
+                      <div className="review-metrics review-metrics--compact">
+                        <Metric label="矩阵项" value={`${responseMatrixItems.length}`} tone="green" />
+                        <Metric label="高风险" value={`${highRiskMatrixCount}`} tone="red" />
+                        <Metric label="待覆盖" value={`${uncoveredMatrixCount}`} tone="amber" />
+                      </div>
+                      <div className="matrix-mini-list">
+                        {responseMatrixItems.slice(0, 5).map(item => (
+                          <div key={item.id} className="matrix-mini-row">
+                            <strong>{item.id}</strong>
+                            <span>{item.requirement_summary || item.source_item_id}</span>
+                            <em>{item.priority === 'high' || item.blocking ? '高优先级' : item.source_type}</em>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="empty-state empty-state--compact">
+                      <strong>等待标准解析</strong>
+                      <span>解析完成后会生成“要求-章节-材料-风险”的响应矩阵，后续目录、正文和审校都会复用它。</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {currentPage === 'outline' && (
+              <div className="ops-page-stack">
+                <div className="flow-panel">
+                  {FLOW_STEPS.map((step, index) => (
+                    <div key={step} className={`flow-step ${index <= flowIndex ? 'flow-step--done' : ''}`}>
+                      <span>{index <= flowIndex ? <CheckCircleIcon className="h-4 w-4" /> : index + 1}</span>
+                      <strong>{step}</strong>
+                    </div>
+                  ))}
+                  <button type="button" className="solid-button" onClick={runOutline} disabled={busy === 'outline' || !state.analysisReport}>生成目录</button>
+                </div>
+                <div className="outline-panel">
+                  <div className="ops-panel__head">
+                    <div>
+                      <h2>目录结构与评分项映射</h2>
+                      <span>{effectiveOutline ? `共 ${countNodes(effectiveOutline.outline)} 章，已映射 ${countMapped(effectiveOutline.outline)} 项` : '等待模型生成目录和映射'}</span>
+                    </div>
+                    <div className="outline-actions">
+                      {effectiveOutline && <button type="button" className="solid-button" onClick={() => goToPage('content')}>去生成正文</button>}
+                      <button type="button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>智能建议</button>
+                      <button type="button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>{effectiveOutline ? '重新生成' : '生成目录'}</button>
+                    </div>
+                  </div>
+                  {busy === 'outline' && <TaskProgress progress={progress} />}
+                  {activeResponseMatrix && (
+                    <div className="matrix-strip">
+                      <strong>响应矩阵</strong>
+                      <span>{activeResponseMatrix.coverage_summary || `共 ${responseMatrixItems.length} 项，待覆盖 ${uncoveredMatrixCount} 项`}</span>
+                    </div>
+                  )}
+                  {effectiveOutline ? (
+                    <div className="outline-table outline-table--page">
+                      <div className="outline-table__head">
+                        <span>章节名称</span><span>评分项映射</span><span>风险</span><span>材料</span>
+                      </div>
+                      {effectiveOutline.outline.map(section => (
+                        <OutlineRows key={section.id} item={section} selectedId={selectedEntry?.item.id} onSelect={updateSelectedChapter} />
+                      ))}
+                    </div>
+                  ) : (
+                    busy === 'outline' ? (
+                      <OutlineDraftPreview rows={outlineDraftRows} raw={streamText} />
+                    ) : (
+                      <div className="empty-state">
+                        <strong>目录还没有生成</strong>
+                        <span>完成标准解析后，点击“生成目录”，后端会把招标结构、评分项、风险和材料要求映射到章节。</span>
+                        <button type="button" className="solid-button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>调用模型生成目录</button>
+                      </div>
+                    )
+                  )}
+                </div>
+              </div>
+            )}
+
+            {currentPage === 'content' && (
+              <div className="word-workspace">
+                <aside className="word-toc-panel">
+                  <div className="ops-panel__head">
+                    <div>
+                      <h2>目录</h2>
+                      <span>{effectiveOutline ? `已生成 ${completedLeaves}/${entries.length} 章` : '等待目录'}</span>
+                    </div>
+                    <button type="button" className="text-link" onClick={() => goToPage('outline')}>查看目录页</button>
+                  </div>
+                  {effectiveOutline ? (
+                    <div className="word-toc">
+                      {effectiveOutline.outline.map(section => (
+                        <DocumentTocRows
+                          key={section.id}
+                          item={section}
+                          activeId={activeDocId || selectedEntry?.item.id}
+                          onSelect={scrollToDocumentNode}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="empty-state empty-state--compact">
+                      <strong>等待目录生成</strong>
+                      <span>生成目录后，这里会显示可选择的章节。</span>
+                    </div>
+                  )}
+                </aside>
+
+                <div className="word-editor-panel">
+                  <div className="preview-actions">
+                    <button type="button" className="solid-button" onClick={runCurrentChapter} disabled={!selectedEntry || busy.startsWith('chapter')}>
+                      <PlayIcon className="h-4 w-4" /> 生成本章
+                    </button>
+                    <button type="button" onClick={runBatch} disabled={!effectiveOutline || busy === 'batch'}>批量生成</button>
+                    {(busy.startsWith('chapter') || busy === 'batch') && (
+                      <div className="generation-controls">
+                        {generationControl === 'paused' ? (
+                          <button type="button" onClick={resumeGeneration}><PlayIcon className="h-4 w-4" /> 继续</button>
+                        ) : (
+                          <button type="button" onClick={pauseGeneration}><PauseIcon className="h-4 w-4" /> 暂停</button>
+                        )}
+                        <button type="button" className="danger-button" onClick={stopGeneration}><StopIcon className="h-4 w-4" /> 停止</button>
                       </div>
                     )}
-                  </>
-                ) : (
-                  <div className="empty-state empty-state--document">
-                    <strong>等待目录生成</strong>
-                    <span>正文区不会显示示例文本；生成目录并选择章节后，再调用模型写入正式内容。</span>
+                    <button type="button" onClick={exportWord} disabled={!effectiveOutline || busy === 'export'}>
+                      <ArrowDownTrayIcon className="h-4 w-4" /> 导出 Word
+                    </button>
                   </div>
-                )}
-              </article>
-            </div>
+                  {generationProgress && (
+                    <div className="content-progress-strip">
+                      <TaskProgress progress={generationProgress} />
+                    </div>
+                  )}
+                  <article ref={docPreviewRef} className="word-document">
+                    {effectiveOutline ? (
+                      <>
+                        <div className="word-document__cover">
+                          <span>投标文件正文</span>
+                          <h2>{effectiveOutline.project_name || project?.name || '待生成标书'}</h2>
+                          <p>左侧目录可跳转到对应章节；未生成正文的章节会保留待编写占位。</p>
+                        </div>
+                        {effectiveOutline.outline.map(section => (
+                          <DocumentPreviewNode
+                            key={section.id}
+                            item={section}
+                            level={1}
+                            activeId={activeDocId || selectedEntry?.item.id}
+                            streamingId={streamingChapterId}
+                            onSelect={scrollToDocumentNode}
+                          />
+                        ))}
+                      </>
+                    ) : (
+                      <div className="empty-state empty-state--document">
+                        <strong>等待目录生成</strong>
+                        <span>正文区不会显示示例文本；生成目录并选择章节后，再调用模型写入正式内容。</span>
+                      </div>
+                    )}
+                  </article>
+                </div>
+              </div>
+            )}
 
-            <div id="panel-review" className="review-panel">
-              <div className="ops-panel__head">
-                <h2>合规审校</h2>
-                <button type="button" className="text-link" onClick={runReview} disabled={!effectiveOutline || completedLeaves === 0 || busy === 'review'}>{busy === 'review' ? '审校中' : '执行审校'}</button>
-              </div>
-              <div className="review-metrics">
-                <Metric label="覆盖率" value={reviewCoverage === null ? '--' : `${reviewCoverage}%`} tone="green" />
-                <Metric label="阻塞问题" value={blockingIssues === null ? '--' : `${blockingIssues}`} tone="red" />
-                <Metric label="警告问题" value={warningIssues === null ? '--' : `${warningIssues}`} tone="amber" />
-                <Metric label="提示信息" value={infoIssues === null ? '--' : `${infoIssues}`} tone="blue" />
-              </div>
-              <div className="issue-list">
-                {reviewReport ? (
-                  [
-                    ...reviewReport.fixed_format_issues,
-                    ...reviewReport.signature_issues,
-                    ...reviewReport.price_rule_issues,
-                    ...reviewReport.evidence_chain_issues,
-                    ...reviewReport.page_reference_issues,
-                  ].length ? (
+            {currentPage === 'review' && (
+              <div className="review-panel review-panel--page">
+                <div className="ops-panel__head">
+                  <h2>合规审校</h2>
+                  <button type="button" className="text-link" onClick={runReview} disabled={!effectiveOutline || completedLeaves === 0 || busy === 'review'}>{busy === 'review' ? '审校中' : '执行审校'}</button>
+                </div>
+                <div className="review-metrics">
+                  <Metric label="覆盖率" value={reviewCoverage === null ? '--' : `${reviewCoverage}%`} tone="green" />
+                  <Metric label="阻塞问题" value={blockingIssues === null ? '--' : `${blockingIssues}`} tone="red" />
+                  <Metric label="警告问题" value={warningIssues === null ? '--' : `${warningIssues}`} tone="amber" />
+                  <Metric label="提示信息" value={infoIssues === null ? '--' : `${infoIssues}`} tone="blue" />
+                </div>
+                <div className="issue-list">
+                  {reviewReport ? (
                     [
+                      ...(reviewReport.blocking_issues || []),
+                      ...(reviewReport.warnings || []),
                       ...reviewReport.fixed_format_issues,
                       ...reviewReport.signature_issues,
                       ...reviewReport.price_rule_issues,
                       ...reviewReport.evidence_chain_issues,
                       ...reviewReport.page_reference_issues,
-                    ].map(item => ({ level: item.blocking ? '阻塞' : '警告', text: item.issue, chapter: item.chapter_ids.join('、') || '全篇' })).slice(0, 5).map((issue, index) => (
-                      <div key={`${issue.text}-${index}`} className="issue-row">
-                        <span className={`issue-tag issue-tag--${issue.level === '阻塞' ? 'red' : 'amber'}`}>{issue.level}</span>
-                        <strong>{issue.text}</strong>
-                        <em>{issue.chapter}</em>
+                      ...(reviewReport.anonymity_issues || []),
+                    ].length ? (
+                      [
+                        ...(reviewReport.blocking_issues || []),
+                        ...(reviewReport.warnings || []),
+                        ...reviewReport.fixed_format_issues,
+                        ...reviewReport.signature_issues,
+                        ...reviewReport.price_rule_issues,
+                        ...reviewReport.evidence_chain_issues,
+                        ...reviewReport.page_reference_issues,
+                        ...(reviewReport.anonymity_issues || []),
+                      ].map(item => ({
+                        level: item.blocking ? '阻塞' : '警告',
+                        text: item.issue,
+                        chapter: item.chapter_ids.join('、') || '全篇',
+                        suggestion: item.fix_suggestion,
+                      })).map((issue, index) => (
+                        <div key={`${issue.text}-${index}`} className="issue-row">
+                          <span className={`issue-tag issue-tag--${issue.level === '阻塞' ? 'red' : 'amber'}`}>{issue.level}</span>
+                          <strong>{issue.text}</strong>
+                          <em>{issue.chapter}</em>
+                          {issue.suggestion && <small>{issue.suggestion}</small>}
+                        </div>
+                      ))
+                    ) : (
+                      <div className="empty-state empty-state--compact">
+                        <strong>未发现阻塞或警告项</strong>
+                        <span>当前结果来自模型审校报告，可继续导出前复核。</span>
                       </div>
-                    ))
+                    )
                   ) : (
-                    <div className="empty-state empty-state--compact">
-                      <strong>未发现阻塞或警告项</strong>
-                      <span>当前结果来自模型审校报告，可继续导出前复核。</span>
+                    <div className="review-ready-block">
+                      <div className="review-ready-block__icon">
+                        <ShieldCheckIcon className="h-7 w-7" />
+                      </div>
+                      <div className="review-ready-block__copy">
+                        <strong>待执行合规审校</strong>
+                        <span>模型会检查正文覆盖率、阻塞条款、固定格式、签章、报价和证据链风险。</span>
+                        <div className="review-ready-block__checks">
+                          <em className={effectiveOutline ? 'ready' : ''}>目录结构</em>
+                          <em className={completedLeaves > 0 ? 'ready' : ''}>正文内容</em>
+                          <em className={activeReport ? 'ready' : ''}>解析报告</em>
+                        </div>
+                      </div>
+                      <button type="button" className="solid-button" onClick={runReview} disabled={!effectiveOutline || completedLeaves === 0 || busy === 'review'}>
+                        {busy === 'review' ? '审校中' : '执行审校'}
+                      </button>
                     </div>
-                  )
-                ) : (
-                  <div className="empty-state empty-state--compact">
-                    <strong>待执行合规审校</strong>
-                    <span>生成正文后点击“执行审校”，这里会展示模型返回的覆盖率、阻塞项和警告项。</span>
+                  )}
+                </div>
+                {reviewReport?.revision_plan?.actions.length ? (
+                  <div className="revision-plan">
+                    <div className="ops-panel__head">
+                      <h3>修订计划</h3>
+                      <span>{reviewReport.revision_plan.actions.length} 项待处理</span>
+                    </div>
+                    <p>{reviewReport.revision_plan.summary || reviewReport.summary.blocking_summary}</p>
+                    {reviewReport.revision_plan.actions.slice(0, 6).map(action => (
+                      <div key={action.id} className="revision-action">
+                        <strong>{action.action_type || '修订'}</strong>
+                        <span>{action.instruction}</span>
+                        <em>{action.target_chapter_ids.join('、') || '全篇'}</em>
+                      </div>
+                    ))}
                   </div>
-                )}
+                ) : null}
               </div>
-            </div>
+            )}
           </section>
         </div>
       </main>
@@ -1140,6 +1676,113 @@ const OutlineRows = ({ item, selectedId, level = 0, onSelect }: OutlineRowsProps
         <OutlineRows key={child.id} item={child} selectedId={selectedId} level={level + 1} onSelect={onSelect} />
       ))}
     </>
+  );
+};
+
+const OutlineDraftPreview = ({ rows, raw }: { rows: DraftOutlineRow[]; raw: string }) => (
+  <div className="outline-draft">
+    <div className="outline-draft__head">
+      <SparklesIcon className="h-4 w-4" />
+      <strong>正在生成目录和映射关系</strong>
+      <span>{rows.length ? `已出现 ${rows.length} 个章节` : '等待模型返回章节'}</span>
+    </div>
+    <div className="outline-draft__list">
+      {rows.length ? rows.map((row, index) => (
+        <div key={`${row.id}-${index}`} className="outline-draft-row" style={{ paddingLeft: 14 + row.level * 22 }}>
+          <span>{row.id}</span>
+          <strong>{row.title}</strong>
+          <em>{row.status}</em>
+        </div>
+      )) : (
+        Array.from({ length: 5 }).map((_, index) => <div key={index} className="outline-draft-skeleton" />)
+      )}
+    </div>
+    {raw && <pre className="stream-box">模型正在返回结构化目录，已接收 {raw.length.toLocaleString()} 字符...</pre>}
+  </div>
+);
+
+interface DocumentTocRowsProps {
+  item: OutlineItem;
+  activeId?: string;
+  level?: number;
+  onSelect: (item: OutlineItem) => void;
+}
+
+const DocumentTocRows = ({ item, activeId, level = 0, onSelect }: DocumentTocRowsProps) => {
+  const hasChildren = Boolean(item.children?.length);
+  const active = item.id === activeId;
+  const generated = Boolean(item.content?.trim());
+
+  return (
+    <div className="word-toc-node">
+      <button
+        type="button"
+        className={`word-toc-row ${active ? 'word-toc-row--active' : ''}`}
+        style={{ paddingLeft: 10 + level * 18 }}
+        onClick={() => onSelect(item)}
+      >
+        {hasChildren ? <ChevronRightIcon className="h-3.5 w-3.5" /> : <span className="tree-branch" />}
+        <span>{item.id} {item.title}</span>
+        {generated && <CheckCircleIcon className="h-3.5 w-3.5 text-emerald-600" />}
+      </button>
+      {item.children?.map(child => (
+        <DocumentTocRows
+          key={child.id}
+          item={child}
+          activeId={activeId}
+          level={level + 1}
+          onSelect={onSelect}
+        />
+      ))}
+    </div>
+  );
+};
+
+interface DocumentPreviewNodeProps {
+  item: OutlineItem;
+  level: number;
+  activeId?: string;
+  streamingId?: string;
+  onSelect: (item: OutlineItem) => void;
+}
+
+const DocumentPreviewNode = ({ item, level, activeId, streamingId, onSelect }: DocumentPreviewNodeProps) => {
+  const hasChildren = Boolean(item.children?.length);
+  const active = item.id === activeId;
+  const streaming = item.id === streamingId;
+  const headingLevel = Math.min(level, 4);
+  const headingClass = `word-heading word-heading--${headingLevel}`;
+
+  return (
+    <section
+      id={docSectionId(item.id)}
+      className={`word-section ${active ? 'word-section--active' : ''}`}
+    >
+      <button type="button" className={headingClass} onClick={() => onSelect(item)}>
+        <span>{item.id} {item.title}</span>
+        {!hasChildren && <SparklesIcon className="h-4 w-4" />}
+      </button>
+      {item.description && <p className="word-section__desc">{item.description}</p>}
+      {!hasChildren && (
+        item.content?.trim() ? (
+          <div className={`word-section__content ${streaming ? 'word-section__content--streaming' : ''}`}>
+            <ReactMarkdown>{item.content}</ReactMarkdown>
+          </div>
+        ) : (
+          <div className={`word-section__placeholder ${streaming ? 'word-section__placeholder--streaming' : ''}`}>请输入或智能编写...</div>
+        )
+      )}
+      {item.children?.map(child => (
+        <DocumentPreviewNode
+          key={child.id}
+          item={child}
+          level={level + 1}
+          activeId={activeId}
+          streamingId={streamingId}
+          onSelect={onSelect}
+        />
+      ))}
+    </section>
   );
 };
 

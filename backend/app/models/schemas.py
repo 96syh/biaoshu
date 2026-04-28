@@ -84,9 +84,14 @@ class AnalysisProjectInfo(BaseModel):
     name: str = Field("", description="项目名称")
     number: str = Field("", description="项目编号")
     package_name: str = Field("", description="标段/包号")
+    package_or_lot: str = Field("", description="标段/包件信息")
     purchaser: str = Field("", description="采购人/招标人")
+    agency: str = Field("", description="采购代理机构")
+    procurement_method: str = Field("", description="采购/招标方式")
     project_type: str = Field("", description="项目类型")
     budget: str = Field("", description="项目预算")
+    maximum_price: str = Field("", description="最高限价/控制价")
+    funding_source: str = Field("", description="资金来源")
     service_scope: str = Field("", description="服务范围")
     service_period: str = Field("", description="服务期限")
     service_location: str = Field("", description="服务地点")
@@ -95,8 +100,19 @@ class AnalysisProjectInfo(BaseModel):
     bid_bond: str = Field("", description="投标保证金要求")
     performance_bond: str = Field("", description="履约担保要求")
     bid_deadline: str = Field("", description="投标截止/开标时间")
+    opening_time: str = Field("", description="开标时间")
+    submission_method: str = Field("", description="递交方式")
+    electronic_platform: str = Field("", description="电子交易平台")
     submission_requirements: str = Field("", description="电子标/纸质标递交要求")
     signature_requirements: str = Field("", description="整体签字盖章要求")
+
+
+class SourceRef(BaseModel):
+    """招标文件出处索引"""
+    id: str = Field(..., description="出处ID，如 SRC-01")
+    location: str = Field("", description="章节、页码、表格或条款位置")
+    excerpt: str = Field("", description="短摘录，不超过120字")
+    related_ids: List[str] = Field(default_factory=list, description="关联解析项ID")
 
 
 class TechnicalScoringItem(BaseModel):
@@ -159,14 +175,17 @@ class MandatoryClause(BaseModel):
     clause: str = Field("", description="条款内容")
     source: str = Field("", description="招标文件出处")
     response_strategy: str = Field("", description="响应策略")
+    invalid_if_not_responded: bool = Field(False, description="未响应是否可能导致否决")
 
 
 class RejectionRisk(BaseModel):
     """废标或高风险项"""
     id: str = Field(..., description="风险ID，如 R-01")
     risk: str = Field("", description="风险描述")
+    trigger: str = Field("", description="触发条件")
     source: str = Field("", description="招标文件出处")
     mitigation: str = Field("", description="规避或响应建议")
+    blocking: bool = Field(True, description="是否阻塞导出")
 
 
 class RequiredMaterial(BaseModel):
@@ -176,6 +195,8 @@ class RequiredMaterial(BaseModel):
     purpose: str = Field("", description="材料用途")
     source: str = Field("", description="招标文件出处")
     status: str = Field("missing", description="材料状态，如 missing/provided/unknown")
+    used_by: List[str] = Field(default_factory=list, description="被哪些评分项/审查项引用")
+    volume_id: str = Field("", description="所属卷册ID")
 
 
 class BidStructureItem(BaseModel):
@@ -185,10 +206,14 @@ class BidStructureItem(BaseModel):
     title: str = Field("", description="章节或表格名称")
     purpose: str = Field("", description="章节用途")
     category: str = Field("", description="资格/商务/技术/报价/承诺/附件等类别")
+    volume_id: str = Field("", description="卷册ID，如 V-TECH/V-BIZ/V-PRICE")
     required: bool = Field(True, description="是否必备")
     fixed_format: bool = Field(False, description="是否固定格式")
     signature_required: bool = Field(False, description="是否需要签字盖章")
     attachment_required: bool = Field(False, description="是否需要附件证明")
+    seal_required: bool = Field(False, description="是否需要盖章")
+    price_related: bool = Field(False, description="是否与报价相关")
+    anonymity_sensitive: bool = Field(False, description="是否受暗标/匿名要求约束")
     source: str = Field("", description="招标文件出处")
 
 
@@ -202,11 +227,17 @@ class ReviewRequirementItem(BaseModel):
     risk: str = Field("", description="常见失分或废标风险")
     target_chapters: List[str] = Field(default_factory=list, description="建议对应章节")
     source: str = Field("", description="招标文件出处")
+    invalid_if_missing: bool = Field(False, description="缺失是否可能导致否决")
 
 
 class PriceRule(BaseModel):
     """报价与计价规则"""
     quote_method: str = Field("", description="报价方式")
+    currency: str = Field("", description="币种")
+    maximum_price_rule: str = Field("", description="最高限价规则")
+    abnormally_low_price_rule: str = Field("", description="异常低价/低于成本规则")
+    separate_price_volume_required: bool = Field(False, description="报价文件是否必须单独成册")
+    price_forbidden_in_other_volumes: bool = Field(False, description="技术/商务卷是否禁止出现价格")
     tax_requirement: str = Field("", description="含税/不含税及税率要求")
     decimal_places: str = Field("", description="小数位数要求")
     uniqueness_requirement: str = Field("", description="报价唯一性要求")
@@ -214,16 +245,51 @@ class PriceRule(BaseModel):
     arithmetic_correction_rule: str = Field("", description="算术错误修正规则")
     missing_item_rule: str = Field("", description="缺漏项处理规则")
     prohibited_format_changes: List[str] = Field(default_factory=list, description="禁止改动的格式要求")
+    source_ref: str = Field("", description="出处ID或条款位置")
+
+
+class BidVolumeRule(BaseModel):
+    """卷册隔离和组卷规则"""
+    id: str = Field(..., description="卷册ID，如 V-TECH")
+    name: str = Field("", description="卷册名称")
+    scope: str = Field("", description="卷册范围")
+    separate_submission: bool = Field(False, description="是否单独递交")
+    price_allowed: bool = Field(True, description="本卷是否允许出现报价")
+    anonymity_required: bool = Field(False, description="本卷是否要求匿名/暗标")
+    seal_signature_rule: str = Field("", description="签章规则")
+    source: str = Field("", description="招标文件出处")
+
+
+class AnonymityRules(BaseModel):
+    """暗标、双盲或匿名技术标规则"""
+    enabled: bool = Field(False, description="是否存在匿名/暗标要求")
+    scope: str = Field("", description="适用范围")
+    forbidden_identifiers: List[str] = Field(default_factory=list, description="禁止出现的身份识别信息")
+    formatting_rules: List[str] = Field(default_factory=list, description="字体、页眉页脚、图片等格式规则")
+    source: str = Field("", description="招标文件出处")
+
+
+class GenerationWarning(BaseModel):
+    """生成链路警告"""
+    id: str = Field(..., description="警告ID，如 W-01")
+    warning: str = Field("", description="警告内容")
+    severity: str = Field("warning", description="warning/blocking")
+    related_ids: List[str] = Field(default_factory=list, description="关联解析项ID")
 
 
 class FixedFormatForm(BaseModel):
     """固定格式表单或模板"""
     id: str = Field(..., description="固定格式ID，如 FF-01")
     name: str = Field("", description="表单或模板名称")
+    volume_id: str = Field("", description="所属卷册ID")
     source: str = Field("", description="招标文件出处")
     required_columns: List[str] = Field(default_factory=list, description="不得修改的表头/列名")
+    must_keep_columns: List[str] = Field(default_factory=list, description="必须保留的列")
+    must_keep_text: List[str] = Field(default_factory=list, description="必须保留的固定文字")
+    fillable_fields: List[str] = Field(default_factory=list, description="允许填写的字段")
     fixed_text: str = Field("", description="不得修改的固定文字")
     fill_rules: str = Field("", description="填写规则")
+    seal_required: bool = Field(False, description="是否需要盖章")
 
 
 class SignatureRequirement(BaseModel):
@@ -232,6 +298,8 @@ class SignatureRequirement(BaseModel):
     target: str = Field("", description="对应章节/表单/附件")
     signer: str = Field("", description="签署主体或人员")
     seal: str = Field("", description="盖章要求")
+    date_required: bool = Field(False, description="是否要求签署日期")
+    electronic_signature_required: bool = Field(False, description="是否要求电子签章")
     source: str = Field("", description="招标文件出处")
     risk: str = Field("", description="遗漏风险")
 
@@ -252,12 +320,40 @@ class MissingCompanyMaterial(BaseModel):
     name: str = Field("", description="资料名称")
     used_by: List[str] = Field(default_factory=list, description="被哪些评分项/要求引用")
     placeholder: str = Field("", description="正文中使用的待补充占位文本")
+    blocking: bool = Field(False, description="是否阻塞导出")
+
+
+class ResponseMatrixItem(BaseModel):
+    """响应矩阵条目"""
+    id: str = Field(..., description="矩阵ID，如 RM-01")
+    source_item_id: str = Field("", description="来源解析项ID")
+    source_type: str = Field("", description="scoring/review/mandatory/risk/material/format/signature/evidence/price")
+    requirement_summary: str = Field("", description="需要响应的要求摘要")
+    response_strategy: str = Field("", description="正文响应策略")
+    target_chapter_ids: List[str] = Field(default_factory=list, description="建议目录章节ID")
+    required_material_ids: List[str] = Field(default_factory=list, description="材料ID")
+    risk_ids: List[str] = Field(default_factory=list, description="风险ID")
+    source_refs: List[str] = Field(default_factory=list, description="出处ID或条款位置")
+    priority: str = Field("normal", description="high/normal/low")
+    status: str = Field("pending", description="pending/covered/missing")
+    blocking: bool = Field(False, description="未覆盖是否阻塞导出")
+
+
+class ResponseMatrix(BaseModel):
+    """招标要求到目录、正文和材料的响应矩阵"""
+    items: List[ResponseMatrixItem] = Field(default_factory=list, description="响应矩阵条目")
+    uncovered_ids: List[str] = Field(default_factory=list, description="尚未覆盖的来源项ID")
+    high_risk_ids: List[str] = Field(default_factory=list, description="高风险矩阵条目ID")
+    coverage_summary: str = Field("", description="覆盖摘要")
 
 
 class AnalysisReport(BaseModel):
     """招标文件标准解析报告，供目录、正文和审校阶段复用"""
     project: AnalysisProjectInfo = Field(default_factory=AnalysisProjectInfo, description="项目基础信息")
     bid_mode_recommendation: BidMode = Field(BidMode.TECHNICAL_ONLY, description="推荐生成模式")
+    source_refs: List[SourceRef] = Field(default_factory=list, description="出处索引")
+    volume_rules: List[BidVolumeRule] = Field(default_factory=list, description="卷册隔离规则")
+    anonymity_rules: AnonymityRules = Field(default_factory=AnonymityRules, description="暗标/匿名规则")
     bid_structure: List[BidStructureItem] = Field(default_factory=list, description="投标文件结构树")
     formal_review_items: List[ReviewRequirementItem] = Field(default_factory=list, description="形式评审项")
     qualification_review_items: List[ReviewRequirementItem] = Field(default_factory=list, description="资格评审项")
@@ -275,6 +371,8 @@ class AnalysisReport(BaseModel):
     evidence_chain_requirements: List[EvidenceChainRequirement] = Field(default_factory=list, description="证据链要求")
     required_materials: List[RequiredMaterial] = Field(default_factory=list, description="所需证明材料")
     missing_company_materials: List[MissingCompanyMaterial] = Field(default_factory=list, description="待补企业资料")
+    generation_warnings: List[GenerationWarning] = Field(default_factory=list, description="生成链路警告")
+    response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
 
 
 class OutlineItem(BaseModel):
@@ -282,10 +380,17 @@ class OutlineItem(BaseModel):
     id: str
     title: str
     description: str
+    volume_id: str = Field("", description="所属卷册ID")
+    chapter_type: str = Field("", description="章节类型，如 technical/business/price/form/material/review")
+    fixed_format_sensitive: bool = Field(False, description="是否涉及固定格式")
+    price_sensitive: bool = Field(False, description="是否涉及报价")
+    anonymity_sensitive: bool = Field(False, description="是否受暗标/匿名要求约束")
+    expected_word_count: int = Field(0, description="建议篇幅")
     scoring_item_ids: List[str] = Field(default_factory=list, description="关联技术评分项ID列表")
     requirement_ids: List[str] = Field(default_factory=list, description="关联资格/响应要求ID列表")
     risk_ids: List[str] = Field(default_factory=list, description="关联风险ID列表")
     material_ids: List[str] = Field(default_factory=list, description="关联材料ID列表")
+    response_matrix_ids: List[str] = Field(default_factory=list, description="关联响应矩阵ID列表")
     children: Optional[List['OutlineItem']] = None
     content: Optional[str] = None
 
@@ -297,6 +402,8 @@ OutlineItem.model_rebuild()
 class OutlineResponse(BaseModel):
     """目录响应"""
     outline: List[OutlineItem]
+    response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
+    coverage_summary: str = Field("", description="目录映射覆盖摘要")
 
 
 class OutlineRequest(BaseModel):
@@ -328,6 +435,7 @@ class ChapterContentRequest(BaseModel):
     sibling_chapters: Optional[List[Dict[str, Any]]] = Field(None, description="同级章节列表")
     project_overview: str = Field("", description="项目概述")
     analysis_report: Optional[AnalysisReport] = Field(None, description="结构化标准解析报告")
+    response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
     bid_mode: Optional[BidMode] = Field(None, description="标书生成模式")
     generated_summaries: List[GeneratedSummary] = Field(default_factory=list, description="已生成章节摘要")
     enterprise_materials: List[RequiredMaterial] = Field(default_factory=list, description="已提供企业材料")
@@ -342,16 +450,23 @@ class AnalysisReportRequest(BaseModel):
 class ReviewCoverageItem(BaseModel):
     """评分项覆盖检查结果"""
     item_id: str = Field("", description="评分项或要求ID")
+    target_type: str = Field("", description="检查对象类型")
     covered: bool = Field(False, description="是否已覆盖")
     chapter_ids: List[str] = Field(default_factory=list, description="覆盖该项的章节ID")
     issue: str = Field("", description="问题说明")
+    evidence: str = Field("", description="覆盖证据")
+    fix_suggestion: str = Field("", description="修复建议")
 
 
 class ReviewMissingMaterialItem(BaseModel):
     """缺失材料检查结果"""
     material_id: str = Field("", description="材料ID")
+    material_name: str = Field("", description="材料名称")
+    used_by: List[str] = Field(default_factory=list, description="被哪些要求引用")
     chapter_ids: List[str] = Field(default_factory=list, description="相关章节ID")
     placeholder: str = Field("", description="建议占位文本")
+    placeholder_found: bool = Field(False, description="正文是否已有占位")
+    fix_suggestion: str = Field("", description="修复建议")
 
 
 class ReviewRiskItem(BaseModel):
@@ -372,6 +487,7 @@ class ReviewFabricationRisk(BaseModel):
     chapter_id: str = Field("", description="章节ID")
     text: str = Field("", description="疑似风险文本")
     reason: str = Field("", description="判断原因")
+    fix_suggestion: str = Field("", description="修复建议")
 
 
 class ReviewContractIssue(BaseModel):
@@ -379,8 +495,27 @@ class ReviewContractIssue(BaseModel):
     item_id: str = Field("", description="关联项ID")
     chapter_ids: List[str] = Field(default_factory=list, description="相关章节ID")
     issue: str = Field("", description="问题说明")
+    evidence: str = Field("", description="审校证据")
+    fix_suggestion: str = Field("", description="修复建议")
     severity: str = Field("warning", description="问题等级，如 blocking/warning")
     blocking: bool = Field(False, description="是否阻塞导出")
+
+
+class RevisionPlanAction(BaseModel):
+    """修订计划动作"""
+    id: str = Field(..., description="动作ID，如 RP-01")
+    target_chapter_ids: List[str] = Field(default_factory=list, description="目标章节")
+    action_type: str = Field("", description="补写/替换/删减/补材料/人工确认")
+    instruction: str = Field("", description="修订指令")
+    priority: str = Field("normal", description="high/normal/low")
+    related_issue_ids: List[str] = Field(default_factory=list, description="关联问题ID")
+    blocking: bool = Field(False, description="是否处理后才能导出")
+
+
+class RevisionPlan(BaseModel):
+    """审校后的修订计划"""
+    actions: List[RevisionPlanAction] = Field(default_factory=list, description="修订动作")
+    summary: str = Field("", description="修订摘要")
 
 
 class ReviewSummary(BaseModel):
@@ -388,6 +523,11 @@ class ReviewSummary(BaseModel):
     ready_to_export: bool = Field(False, description="是否可导出")
     blocking_issues: int = Field(0, description="阻塞问题数量")
     warnings: int = Field(0, description="警告数量")
+    blocking_issues_count: int = Field(0, description="阻塞问题数量")
+    warnings_count: int = Field(0, description="警告数量")
+    coverage_rate: float = Field(0, description="覆盖率")
+    blocking_summary: str = Field("", description="阻塞摘要")
+    next_actions: List[str] = Field(default_factory=list, description="下一步处理建议")
 
 
 class ReviewReport(BaseModel):
@@ -402,6 +542,10 @@ class ReviewReport(BaseModel):
     price_rule_issues: List[ReviewContractIssue] = Field(default_factory=list, description="报价规则问题")
     evidence_chain_issues: List[ReviewContractIssue] = Field(default_factory=list, description="证据链问题")
     page_reference_issues: List[ReviewContractIssue] = Field(default_factory=list, description="页码/索引问题")
+    anonymity_issues: List[ReviewContractIssue] = Field(default_factory=list, description="暗标/匿名问题")
+    blocking_issues: List[ReviewContractIssue] = Field(default_factory=list, description="阻塞项清单")
+    warnings: List[ReviewContractIssue] = Field(default_factory=list, description="警告项清单")
+    revision_plan: Optional[RevisionPlan] = Field(None, description="修订计划")
     summary: ReviewSummary = Field(default_factory=ReviewSummary, description="审校汇总")
 
 
@@ -410,6 +554,7 @@ class ComplianceReviewRequest(BaseModel):
     outline: List[OutlineItem] = Field(..., description="包含正文内容的目录结构")
     project_overview: Optional[str] = Field("", description="项目概述")
     analysis_report: Optional[AnalysisReport] = Field(None, description="结构化标准解析报告")
+    response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
     bid_mode: Optional[BidMode] = Field(None, description="标书生成模式")
 
 

@@ -155,6 +155,11 @@ const OutlineEdit: React.FC<OutlineEditProps> = ({
       event.target.value = '';
       return;
     }
+    if (file.size > 500 * 1024 * 1024) {
+      setMessage({ type: 'error', text: '文件大小不能超过 500MB' });
+      event.target.value = '';
+      return;
+    }
 
     try {
       setuploadedExpand(true);
