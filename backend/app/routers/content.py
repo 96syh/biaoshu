@@ -39,6 +39,8 @@ async def generate_chapter_content(request: ChapterContentRequest):
                 if request.response_matrix else None
             ),
             bid_mode=request.bid_mode.value if request.bid_mode else None,
+            reference_bid_style_profile=request.reference_bid_style_profile,
+            document_blocks_plan=request.document_blocks_plan,
             generated_summaries=[
                 item.model_dump(mode="json") for item in request.generated_summaries
             ],
@@ -93,6 +95,8 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
                         if request.response_matrix else None
                     ),
                     bid_mode=request.bid_mode.value if request.bid_mode else None,
+                    reference_bid_style_profile=request.reference_bid_style_profile,
+                    document_blocks_plan=request.document_blocks_plan,
                     generated_summaries=[
                         item.model_dump(mode="json") for item in request.generated_summaries
                     ],

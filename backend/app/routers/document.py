@@ -6,6 +6,8 @@ from ..models.schemas import (
     AnalysisRequest,
     AnalysisType,
     ComplianceReviewRequest,
+    ConsistencyRevisionRequest,
+    DocumentBlocksPlanRequest,
     FileUploadResponse,
     WordExportRequest,
 )
@@ -229,6 +231,106 @@ async def analyze_report_stream(request: AnalysisReportRequest):
         raise HTTPException(status_code=500, detail=f"结构化解析报告生成失败: {str(e)}")
 
 
+@router.post("/reference-style-upload")
+async def reference_style_upload(file: UploadFile = File(...)):
+    """上传成熟投标文件样例并生成可复用风格剖面"""
+    try:
+        file_kind = FileService.detect_upload_file_kind(file)
+        if file_kind in (None, "doc"):
+            return FileUploadResponse(success=False, message=FileService.get_upload_validation_message(file))
+
+        file_content = await FileService.process_uploaded_file(file)
+        config = config_manager.load_config()
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
+
+        profile = await OpenAIService().generate_reference_bid_style_profile(file_content)
+        return FileUploadResponse(
+            success=True,
+            message=f"样例文件 {file.filename} 已解析为风格剖面",
+            file_content=file_content,
+            reference_bid_style_profile=profile,
+        )
+    except HTTPException as e:
+        return FileUploadResponse(success=False, message=e.detail)
+    except Exception as e:
+        return FileUploadResponse(success=False, message=f"样例解析失败: {str(e)}")
+
+
+@router.post("/document-blocks-plan-stream")
+async def document_blocks_plan_stream(request: DocumentBlocksPlanRequest):
+    """生成图表、表格、图片、承诺书和附件规划"""
+    try:
+        config = config_manager.load_config()
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
+
+        async def generate():
+            try:
+                service = OpenAIService()
+                compute_task = asyncio.create_task(service.generate_document_blocks_plan(
+                    outline=[item.model_dump(mode="json") for item in request.outline],
+                    analysis_report=request.analysis_report.model_dump(mode="json") if request.analysis_report else None,
+                    response_matrix=request.response_matrix.model_dump(mode="json") if request.response_matrix else None,
+                    reference_bid_style_profile=request.reference_bid_style_profile,
+                    enterprise_materials=[item.model_dump(mode="json") for item in request.enterprise_materials],
+                    asset_library=request.asset_library,
+                ))
+                while not compute_task.done():
+                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(1)
+                result_json = json.dumps(await compute_task, ensure_ascii=False)
+                for index in range(0, len(result_json), 256):
+                    yield f"data: {json.dumps({'chunk': result_json[index:index + 256]}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'chunk': '', 'error': True, 'message': f'图表素材规划失败: {str(e)}'}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return sse_response(generate())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"图表素材规划失败: {str(e)}")
+
+
+@router.post("/consistency-revision-stream")
+async def consistency_revision_stream(request: ConsistencyRevisionRequest):
+    """生成全文一致性修订报告"""
+    try:
+        config = config_manager.load_config()
+        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
+        if auth_error:
+            raise HTTPException(status_code=400, detail=auth_error)
+
+        async def generate():
+            try:
+                service = OpenAIService()
+                compute_task = asyncio.create_task(service.generate_consistency_revision_report(
+                    full_bid_draft=[item.model_dump(mode="json") for item in request.full_bid_draft],
+                    analysis_report=request.analysis_report.model_dump(mode="json") if request.analysis_report else None,
+                    response_matrix=request.response_matrix.model_dump(mode="json") if request.response_matrix else None,
+                    reference_bid_style_profile=request.reference_bid_style_profile,
+                    document_blocks_plan=request.document_blocks_plan,
+                ))
+                while not compute_task.done():
+                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(1)
+                result_json = json.dumps(await compute_task, ensure_ascii=False)
+                for index in range(0, len(result_json), 256):
+                    yield f"data: {json.dumps({'chunk': result_json[index:index + 256]}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'chunk': '', 'error': True, 'message': f'全文一致性修订失败: {str(e)}'}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return sse_response(generate())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"全文一致性修订失败: {str(e)}")
+
+
 @router.post("/review-compliance-stream")
 async def review_compliance_stream(request: ComplianceReviewRequest):
     """导出前执行覆盖性、缺料、废标风险和虚构风险审校"""
@@ -254,6 +356,8 @@ async def review_compliance_stream(request: ComplianceReviewRequest):
                             if request.response_matrix else None
                         ),
                         project_overview=request.project_overview or "",
+                        reference_bid_style_profile=request.reference_bid_style_profile,
+                        document_blocks_plan=request.document_blocks_plan,
                     )
                 )
 
@@ -504,6 +608,59 @@ async def export_word(request: WordExportRequest):
             blocks = parse_markdown_blocks(content)
             render_markdown_blocks(blocks)
 
+        def planned_blocks_by_chapter() -> dict[str, list[dict]]:
+            """按章节聚合图表/素材规划，导出时渲染为可替换占位。"""
+            plan = request.document_blocks_plan or {}
+            groups: dict[str, list[dict]] = {}
+            raw_blocks = plan.get("document_blocks") if isinstance(plan, dict) else []
+            for block in raw_blocks or []:
+                if not isinstance(block, dict):
+                    continue
+                chapter_id = str(block.get("chapter_id") or block.get("target_chapter_id") or "").strip()
+                if not chapter_id:
+                    continue
+                groups.setdefault(chapter_id, []).append(block)
+            return groups
+
+        blocks_by_chapter = planned_blocks_by_chapter()
+
+        def add_planned_blocks(chapter_id: str) -> None:
+            """将文档块规划渲染为 Word 中的表格/图片/承诺书占位。"""
+            planned = blocks_by_chapter.get(str(chapter_id), [])
+            if not planned:
+                return
+            heading = doc.add_heading("文档块规划", level=4)
+            set_paragraph_font_simsun(heading)
+            for block in planned:
+                block_name = block.get("block_name") or block.get("name") or block.get("asset_name") or "文档块"
+                block_type = block.get("block_type") or block.get("type") or "block"
+                placeholder = block.get("placeholder") or block.get("fallback_placeholder") or ""
+                p = doc.add_paragraph()
+                add_markdown_runs(p, f"【{block_type}】{block_name}")
+                if placeholder:
+                    add_markdown_paragraph(str(placeholder))
+
+                table_schema = block.get("table_schema") or {}
+                columns = table_schema.get("columns") if isinstance(table_schema, dict) else []
+                if columns:
+                    table = doc.add_table(rows=2, cols=len(columns))
+                    table.style = "Table Grid"
+                    for idx, column in enumerate(columns):
+                        table.rows[0].cells[idx].text = str(column)
+                        table.rows[1].cells[idx].text = "〖待补充〗"
+                        for paragraph in table.rows[0].cells[idx].paragraphs + table.rows[1].cells[idx].paragraphs:
+                            set_paragraph_font_simsun(paragraph)
+
+                chart_schema = block.get("chart_schema") or {}
+                if isinstance(chart_schema, dict) and (chart_schema.get("nodes") or chart_schema.get("edges")):
+                    add_markdown_paragraph(f"〖插入图表：{block_name}〗")
+
+                commitment_schema = block.get("commitment_schema") or {}
+                if isinstance(commitment_schema, dict) and commitment_schema.get("items"):
+                    add_markdown_paragraph(f"承诺书：{block_name}")
+                    for item in commitment_schema.get("items", []):
+                        add_markdown_paragraph(f"- {item}")
+
         # 递归构建文档内容（章节和内容）
         def add_outline_items(items, level: int = 1):
             for item in items:
@@ -532,6 +689,7 @@ async def export_word(request: WordExportRequest):
                     content = item.content or ""
                     if content.strip():
                         add_markdown_content(content)
+                    add_planned_blocks(item.id)
                 else:
                     add_outline_items(item.children, level + 1)
 

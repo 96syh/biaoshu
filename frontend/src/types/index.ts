@@ -283,6 +283,8 @@ export interface AnalysisReport {
   missing_company_materials: MissingCompanyMaterial[];
   generation_warnings?: GenerationWarning[];
   response_matrix?: ResponseMatrix;
+  reference_bid_style_profile?: Record<string, unknown>;
+  document_blocks_plan?: Record<string, unknown>;
 }
 
 export interface OutlineItem {
@@ -300,6 +302,11 @@ export interface OutlineItem {
   risk_ids?: string[];
   material_ids?: string[];
   response_matrix_ids?: string[];
+  source_type?: string;
+  expected_depth?: string;
+  expected_blocks?: string[];
+  enterprise_required?: boolean;
+  asset_required?: boolean;
   children?: OutlineItem[];
   content?: string;
 }
@@ -311,6 +318,8 @@ export interface OutlineData {
   analysis_report?: AnalysisReport;
   response_matrix?: ResponseMatrix;
   coverage_summary?: string;
+  reference_bid_style_profile?: Record<string, unknown>;
+  document_blocks_plan?: Record<string, unknown>;
   bid_mode?: BidMode;
 }
 
@@ -416,7 +425,47 @@ export interface ComplianceReviewRequest {
   project_overview?: string;
   analysis_report?: AnalysisReport;
   response_matrix?: ResponseMatrix;
+  reference_bid_style_profile?: Record<string, unknown>;
+  document_blocks_plan?: Record<string, unknown>;
   bid_mode?: BidMode;
+}
+
+export interface DocumentBlocksPlanRequest {
+  outline: OutlineItem[];
+  analysis_report?: AnalysisReport;
+  response_matrix?: ResponseMatrix;
+  reference_bid_style_profile?: Record<string, unknown>;
+  enterprise_materials?: RequiredMaterial[];
+  asset_library?: Record<string, unknown>;
+}
+
+export interface ConsistencyRevisionRequest {
+  full_bid_draft: OutlineItem[];
+  analysis_report?: AnalysisReport;
+  response_matrix?: ResponseMatrix;
+  reference_bid_style_profile?: Record<string, unknown>;
+  document_blocks_plan?: Record<string, unknown>;
+}
+
+export interface ConsistencyRevisionReport {
+  ready_for_export: boolean;
+  issues: Array<{
+    id: string;
+    severity: string;
+    issue_type: string;
+    chapter_id: string;
+    original_text: string;
+    problem: string;
+    fix_suggestion: string;
+  }>;
+  coverage_check: Array<Record<string, unknown>>;
+  missing_blocks: Array<Record<string, unknown>>;
+  summary: {
+    blocking_count: number;
+    high_count: number;
+    can_export_after_auto_fix: boolean;
+    manual_data_needed: string[];
+  };
 }
 
 export interface AppState {

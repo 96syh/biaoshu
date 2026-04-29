@@ -6,6 +6,8 @@ import type {
   AnalysisReport,
   BidMode,
   ComplianceReviewRequest,
+  ConsistencyRevisionRequest,
+  DocumentBlocksPlanRequest,
   GeneratedSummary,
   MissingCompanyMaterial,
   OutlineData,
@@ -28,11 +30,9 @@ const getDefaultApiBaseUrl = () => {
   }
 
   if (typeof window !== 'undefined' && window.location.origin) {
-    if (
-      window.location.hostname === 'localhost'
-      && ['3000', '3001'].includes(window.location.port)
-    ) {
-      return 'http://localhost:8000';
+    const isLocalDevHost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+    if (isLocalDevHost && ['3000', '3001'].includes(window.location.port)) {
+      return 'http://127.0.0.1:8000';
     }
 
     return window.location.origin;
@@ -70,6 +70,8 @@ export interface FileUploadResponse {
   message: string;
   file_content?: string;
   old_outline?: string;
+  reference_bid_style_profile?: Record<string, unknown>;
+  document_blocks_plan?: Record<string, unknown>;
 }
 
 export interface ProviderCheckItem {
@@ -112,6 +114,8 @@ export interface OutlineRequest {
   old_document?: string;
   analysis_report?: AnalysisReport;
   bid_mode?: BidMode;
+  reference_bid_style_profile?: Record<string, unknown>;
+  document_blocks_plan?: Record<string, unknown>;
 }
 
 export interface ContentGenerationRequest {
@@ -127,6 +131,9 @@ export interface ChapterContentRequest {
   analysis_report?: AnalysisReport;
   response_matrix?: AnalysisReport['response_matrix'];
   bid_mode?: BidMode;
+  reference_bid_style_profile?: Record<string, unknown>;
+  document_blocks_plan?: Record<string, unknown>;
+  asset_library?: Record<string, unknown>;
   generated_summaries?: GeneratedSummary[];
   enterprise_materials?: RequiredMaterial[];
   missing_materials?: MissingCompanyMaterial[];
@@ -164,6 +171,18 @@ export const documentApi = {
     });
   },
 
+  // 上传成熟投标文件样例并生成风格剖面
+  uploadReferenceStyleFile: (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post<FileUploadResponse>('/api/document/reference-style-upload', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+      timeout: 300000,
+    });
+  },
+
 
   // 流式分析文档
   analyzeDocumentStream: (data: AnalysisRequest) =>
@@ -188,6 +207,26 @@ export const documentApi = {
   // 流式执行导出前合规审校
   reviewComplianceStream: (data: ComplianceReviewRequest) =>
     fetch(`${API_BASE_URL}/api/document/review-compliance-stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(data),
+    }),
+
+  // 流式生成图表与素材规划
+  generateDocumentBlocksPlanStream: (data: DocumentBlocksPlanRequest) =>
+    fetch(`${API_BASE_URL}/api/document/document-blocks-plan-stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(data),
+    }),
+
+  // 流式生成全文一致性修订报告
+  generateConsistencyRevisionStream: (data: ConsistencyRevisionRequest) =>
+    fetch(`${API_BASE_URL}/api/document/consistency-revision-stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

@@ -335,8 +335,8 @@
 
   .ops-topbar {
     display: grid;
-    grid-template-columns: minmax(280px, 1fr) auto auto;
-    gap: 22px;
+    grid-template-columns: minmax(220px, 1fr) minmax(0, auto) minmax(210px, auto);
+    gap: 14px;
     align-items: center;
     padding: 0 16px 0 26px;
     border-bottom: 1px solid var(--ops-border);
@@ -355,6 +355,17 @@
     white-space: nowrap;
   }
 
+  .ops-topbar__center {
+    justify-self: center;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .ops-topbar__status {
+    justify-self: end;
+    min-width: max-content;
+  }
+
   .ops-project-title strong,
   .ops-topbar__center strong {
     color: var(--ops-text);
@@ -365,6 +376,7 @@
 
   .ops-segment {
     display: inline-flex;
+    flex: 0 0 auto;
     padding: 3px;
     border: 1px solid var(--ops-border);
     border-radius: 7px;
@@ -380,6 +392,7 @@
     font-weight: 700;
     color: var(--ops-muted);
     cursor: pointer;
+    white-space: nowrap;
     transition: background 160ms ease, color 160ms ease;
   }
 
@@ -1301,6 +1314,16 @@
     box-shadow: inset 3px 0 0 var(--ops-green);
   }
 
+  .outline-chevron {
+    flex: 0 0 auto;
+    color: #66766e;
+    transition: transform 160ms ease;
+  }
+
+  .outline-chevron--open {
+    transform: rotate(90deg);
+  }
+
   .outline-name {
     display: flex;
     align-items: center;
@@ -1313,6 +1336,24 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 13px;
+  }
+
+  .outline-row-detail {
+    display: grid;
+    gap: 4px;
+    padding-top: 8px;
+    padding-right: 14px;
+    padding-bottom: 9px;
+    border-top: 1px solid #dbe8e1;
+    background: #f7fbf9;
+    color: #4f6058;
+    font-size: 11px;
+    line-height: 1.55;
+  }
+
+  .outline-row-detail em {
+    color: #7a6a38;
+    font-style: normal;
   }
 
   .tree-branch {
@@ -1446,6 +1487,45 @@
     border-radius: 7px;
     color: var(--ops-muted);
     font-size: 13px;
+  }
+
+  .live-stream-panel {
+    margin: 8px 0 10px;
+    overflow: hidden;
+    border: 1px solid #cfe3da;
+    border-radius: 7px;
+    background: #fbfefd;
+  }
+
+  .live-stream-panel__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 34px;
+    padding: 0 10px;
+    border-bottom: 1px solid #dce9e3;
+    color: var(--ops-green);
+    font-size: 12px;
+    font-weight: 800;
+  }
+
+  .live-stream-panel__head span {
+    margin-left: auto;
+    color: var(--ops-muted);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .live-stream-panel pre {
+    max-height: 220px;
+    margin: 0;
+    overflow: auto;
+    padding: 10px 12px;
+    color: #2d3a34;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.65;
+    white-space: pre-wrap;
   }
 
   .review-panel {

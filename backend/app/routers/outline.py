@@ -35,6 +35,8 @@ async def generate_outline(request: OutlineRequest):
                         if request.analysis_report else None
                     ),
                     bid_mode=request.bid_mode.value if request.bid_mode else None,
+                    reference_bid_style_profile=request.reference_bid_style_profile,
+                    document_blocks_plan=request.document_blocks_plan,
                 ))
 
                 # 在等待计算完成期间发送心跳，保持连接（发送空字符串chunk）
@@ -101,6 +103,11 @@ async def generate_outline_stream(request: OutlineRequest):
                         f"用户已有目录参考：\n{request.old_outline}"
                     )
 
+                progress_queue: asyncio.Queue = asyncio.Queue()
+
+                async def on_progress(payload: dict):
+                    await progress_queue.put(payload)
+
                 compute_task = asyncio.create_task(
                     openai_service.generate_outline_v2(
                         overview=request.overview,
@@ -110,12 +117,22 @@ async def generate_outline_stream(request: OutlineRequest):
                             if request.analysis_report else None
                         ),
                         bid_mode=request.bid_mode.value if request.bid_mode else None,
+                        reference_bid_style_profile=request.reference_bid_style_profile,
+                        document_blocks_plan=request.document_blocks_plan,
+                        progress_callback=on_progress,
                     )
                 )
 
                 while not compute_task.done():
-                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(1)
+                    try:
+                        payload = await asyncio.wait_for(progress_queue.get(), timeout=0.8)
+                        yield f"data: {json.dumps({'preview': payload}, ensure_ascii=False)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
+
+                while not progress_queue.empty():
+                    payload = await progress_queue.get()
+                    yield f"data: {json.dumps({'preview': payload}, ensure_ascii=False)}\n\n"
 
                 outline_json = json.dumps(await compute_task, ensure_ascii=False)
                 chunk_size = 256

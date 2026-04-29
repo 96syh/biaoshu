@@ -59,6 +59,8 @@ class FileUploadResponse(BaseModel):
     message: str
     file_content: Optional[str] = None
     old_outline: Optional[str] = None
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="样例投标文件风格剖面")
+    document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
 
 
 class AnalysisType(str, Enum):
@@ -68,9 +70,45 @@ class AnalysisType(str, Enum):
 
 
 class BidMode(str, Enum):
-    """标书生成模式"""
+    """标书生成模式。
+
+    保持向后兼容，同时扩展为通用投标文件范围：完整标书、技术标、服务方案、
+    商务卷、资格卷、报价卷、施工组织设计、供货方案等。
+    """
     TECHNICAL_ONLY = "technical_only"
+    TECHNICAL_SERVICE_PLAN = "technical_service_plan"
+    SERVICE_PLAN = "service_plan"
     FULL_BID = "full_bid"
+    BUSINESS_TECHNICAL = "business_technical"
+    BUSINESS_VOLUME = "business_volume"
+    QUALIFICATION_VOLUME = "qualification_volume"
+    PRICE_VOLUME = "price_volume"
+    CONSTRUCTION_PLAN = "construction_plan"
+    GOODS_SUPPLY_PLAN = "goods_supply_plan"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def _missing_(cls, value):
+        normalized = str(value or "").strip()
+        aliases = {
+            "technical_volume": cls.TECHNICAL_ONLY,
+            "service_plan_volume": cls.SERVICE_PLAN,
+            "technical_service_volume": cls.TECHNICAL_SERVICE_PLAN,
+            "business": cls.BUSINESS_VOLUME,
+            "qualification": cls.QUALIFICATION_VOLUME,
+            "price": cls.PRICE_VOLUME,
+            "full": cls.FULL_BID,
+            "完整标书": cls.FULL_BID,
+            "完整标": cls.FULL_BID,
+            "技术标": cls.TECHNICAL_ONLY,
+            "服务方案": cls.SERVICE_PLAN,
+            "商务卷": cls.BUSINESS_VOLUME,
+            "资格卷": cls.QUALIFICATION_VOLUME,
+            "报价卷": cls.PRICE_VOLUME,
+            "施工方案": cls.CONSTRUCTION_PLAN,
+            "供货方案": cls.GOODS_SUPPLY_PLAN,
+        }
+        return aliases.get(normalized, cls.UNKNOWN)
 
 
 class AnalysisRequest(BaseModel):
@@ -113,6 +151,86 @@ class SourceRef(BaseModel):
     location: str = Field("", description="章节、页码、表格或条款位置")
     excerpt: str = Field("", description="短摘录，不超过120字")
     related_ids: List[str] = Field(default_factory=list, description="关联解析项ID")
+
+
+class BidDocumentSourceChapter(BaseModel):
+    """招标文件中投标文件编制要求的出处"""
+    id: str = Field(..., description="出处ID，如 BD-SRC-01")
+    chapter_title: str = Field("", description="章节名称，如 投标文件/投标文件格式/投标文件的组成")
+    location: str = Field("", description="章节、页码、条款或表格位置")
+    excerpt: str = Field("", description="短摘录，不超过120字")
+
+
+class BidDocumentCompositionItem(BaseModel):
+    """投标文件应包含的卷册、章节、表单或附件要求"""
+    id: str = Field(..., description="组成项ID，如 BD-01")
+    order: int = Field(0, description="招标文件列明的顺序")
+    title: str = Field("", description="章节、表单、附件或卷册名称")
+    required: bool = Field(True, description="是否必备")
+    applicability: str = Field("required", description="required/optional/not_applicable/conditional")
+    volume_id: str = Field("", description="所属卷册ID，如 V-BIZ/V-TECH/V-PRICE")
+    chapter_type: str = Field("", description="cover/toc/form/authorization/bond/price/qualification/business/technical/service_plan/deviation_table/commitment/other")
+    fixed_format: bool = Field(False, description="是否固定格式")
+    allow_self_drafting: bool = Field(False, description="是否允许自拟或参考模板扩展")
+    signature_required: bool = Field(False, description="是否需要签字")
+    seal_required: bool = Field(False, description="是否需要盖章")
+    attachment_required: bool = Field(False, description="是否需要附件或证明材料")
+    price_related: bool = Field(False, description="是否报价相关")
+    anonymity_sensitive: bool = Field(False, description="是否受暗标/匿名约束")
+    source_ref: str = Field("", description="出处ID")
+    must_keep_text: List[str] = Field(default_factory=list, description="不得修改的固定文字")
+    must_keep_columns: List[str] = Field(default_factory=list, description="不得修改的表头/列名")
+    fillable_fields: List[str] = Field(default_factory=list, description="允许填写的字段")
+    children: List[Dict[str, Any]] = Field(default_factory=list, description="子项，避免递归模型带来的兼容问题")
+
+
+class SchemeOutlineRequirement(BaseModel):
+    """技术/服务/施工/供货方案应包含的提纲要求"""
+    id: str = Field(..., description="提纲要求ID，如 BD-SP-01")
+    parent_title: str = Field("", description="所属方案名称，如 服务方案/技术方案/施工组织设计")
+    order: int = Field(0, description="顺序")
+    title: str = Field("", description="招标文件列明的方案子项")
+    required: bool = Field(True, description="是否必须覆盖")
+    allow_expand: bool = Field(True, description="是否允许结合投标人情况扩展")
+    source_ref: str = Field("", description="出处ID")
+    target_chapter_hint: str = Field("", description="建议映射章节")
+
+
+class BidDocumentFixedForm(BaseModel):
+    """投标文件格式中的固定表单或固定函件"""
+    id: str = Field(..., description="固定格式ID，如 BD-FF-01")
+    form_name: str = Field("", description="表单或函件名称")
+    belongs_to: str = Field("", description="所属组成项ID")
+    must_keep_columns: List[str] = Field(default_factory=list, description="必须保留的列名")
+    must_keep_text: List[str] = Field(default_factory=list, description="必须保留的固定文字")
+    fillable_fields: List[str] = Field(default_factory=list, description="允许填写的字段")
+    signature_required: bool = Field(False, description="是否要求签字")
+    seal_required: bool = Field(False, description="是否要求盖章")
+    date_required: bool = Field(False, description="是否要求日期")
+    source_ref: str = Field("", description="出处ID")
+
+
+class BidDocumentFormattingRules(BaseModel):
+    """投标文件格式、递交和排版要求"""
+    language: str = Field("", description="语言文字要求")
+    toc_required: bool = Field(False, description="是否要求目录")
+    page_number_required: bool = Field(False, description="是否要求页码或响应页码")
+    binding_or_upload_rules: str = Field("", description="装订、上传、加密、密封或递交规则")
+    electronic_signature_rules: str = Field("", description="电子签章规则")
+    encryption_or_platform_rules: str = Field("", description="平台、加密、验签或上传规则")
+    source_ref: str = Field("", description="出处ID")
+
+
+class BidDocumentRequirements(BaseModel):
+    """招标文件中“投标文件/投标文件格式/投标文件组成/编制要求”的硬约束"""
+    source_chapters: List[BidDocumentSourceChapter] = Field(default_factory=list, description="投标文件编制要求出处")
+    document_scope_required: str = Field("unknown", description="full_bid/technical_volume/service_plan_volume/business_volume/qualification_volume/price_volume/unknown")
+    composition: List[BidDocumentCompositionItem] = Field(default_factory=list, description="投标文件组成、顺序和格式要求")
+    scheme_or_technical_outline_requirements: List[SchemeOutlineRequirement] = Field(default_factory=list, description="方案类章节应包括的提纲")
+    fixed_forms: List[BidDocumentFixedForm] = Field(default_factory=list, description="固定格式表单或函件")
+    formatting_and_submission_rules: BidDocumentFormattingRules = Field(default_factory=BidDocumentFormattingRules, description="投标文件格式、递交和平台要求")
+    excluded_when_generating_technical_only: List[str] = Field(default_factory=list, description="生成技术/服务分册时应排除的完整投标文件章节")
+    priority_rule: str = Field("投标文件编制要求优先于样例风格。", description="优先级说明")
 
 
 class TechnicalScoringItem(BaseModel):
@@ -352,6 +470,7 @@ class AnalysisReport(BaseModel):
     project: AnalysisProjectInfo = Field(default_factory=AnalysisProjectInfo, description="项目基础信息")
     bid_mode_recommendation: BidMode = Field(BidMode.TECHNICAL_ONLY, description="推荐生成模式")
     source_refs: List[SourceRef] = Field(default_factory=list, description="出处索引")
+    bid_document_requirements: BidDocumentRequirements = Field(default_factory=BidDocumentRequirements, description="投标文件/投标文件格式/组成/编制要求硬约束")
     volume_rules: List[BidVolumeRule] = Field(default_factory=list, description="卷册隔离规则")
     anonymity_rules: AnonymityRules = Field(default_factory=AnonymityRules, description="暗标/匿名规则")
     bid_structure: List[BidStructureItem] = Field(default_factory=list, description="投标文件结构树")
@@ -373,6 +492,8 @@ class AnalysisReport(BaseModel):
     missing_company_materials: List[MissingCompanyMaterial] = Field(default_factory=list, description="待补企业资料")
     generation_warnings: List[GenerationWarning] = Field(default_factory=list, description="生成链路警告")
     response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟投标文件样例反向建模结果")
+    document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
 
 
 class OutlineItem(BaseModel):
@@ -381,12 +502,17 @@ class OutlineItem(BaseModel):
     title: str
     description: str
     volume_id: str = Field("", description="所属卷册ID")
-    chapter_type: str = Field("", description="章节类型，如 technical/business/price/form/material/review")
+    chapter_type: str = Field("", description="章节类型，如 technical/business/price/form/material/review/service_plan/supply/construction")
+    source_type: str = Field("", description="章节来源类型，如 tender_direct_response/scoring_response/profile_expansion/enterprise_showcase")
     fixed_format_sensitive: bool = Field(False, description="是否涉及固定格式")
     price_sensitive: bool = Field(False, description="是否涉及报价")
     anonymity_sensitive: bool = Field(False, description="是否受暗标/匿名要求约束")
     expected_word_count: int = Field(0, description="建议篇幅")
-    scoring_item_ids: List[str] = Field(default_factory=list, description="关联技术评分项ID列表")
+    expected_depth: str = Field("medium", description="建议深度 short/medium/long/very_long")
+    expected_blocks: List[str] = Field(default_factory=list, description="预期内容块 paragraph/table/image/org_chart/workflow_chart/commitment_letter/material_attachment")
+    enterprise_required: bool = Field(False, description="是否依赖企业资料")
+    asset_required: bool = Field(False, description="是否依赖图片、证书、截图或其他素材")
+    scoring_item_ids: List[str] = Field(default_factory=list, description="关联技术/商务/价格评分项ID列表")
     requirement_ids: List[str] = Field(default_factory=list, description="关联资格/响应要求ID列表")
     risk_ids: List[str] = Field(default_factory=list, description="关联风险ID列表")
     material_ids: List[str] = Field(default_factory=list, description="关联材料ID列表")
@@ -403,6 +529,8 @@ class OutlineResponse(BaseModel):
     """目录响应"""
     outline: List[OutlineItem]
     response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟投标文件样例反向建模结果")
+    document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
     coverage_summary: str = Field("", description="目录映射覆盖摘要")
 
 
@@ -415,6 +543,8 @@ class OutlineRequest(BaseModel):
     old_document: Optional[str] = Field(None, description="上传的方案扩写文件解析出的旧文档")
     analysis_report: Optional[AnalysisReport] = Field(None, description="结构化标准解析报告")
     bid_mode: Optional[BidMode] = Field(None, description="标书生成模式")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="可选：成熟投标文件样例风格剖面")
+    document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="可选：图表与素材规划")
 
 class ContentGenerationRequest(BaseModel):
     """内容生成请求"""
@@ -437,9 +567,12 @@ class ChapterContentRequest(BaseModel):
     analysis_report: Optional[AnalysisReport] = Field(None, description="结构化标准解析报告")
     response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
     bid_mode: Optional[BidMode] = Field(None, description="标书生成模式")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="可选：样例风格剖面")
+    document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="可选：图表与素材规划")
     generated_summaries: List[GeneratedSummary] = Field(default_factory=list, description="已生成章节摘要")
     enterprise_materials: List[RequiredMaterial] = Field(default_factory=list, description="已提供企业材料")
     missing_materials: List[MissingCompanyMaterial] = Field(default_factory=list, description="待补企业资料")
+    asset_library: Dict[str, Any] = Field(default_factory=dict, description="可选：图片、证书、截图、效果图等素材库")
 
 
 class AnalysisReportRequest(BaseModel):
@@ -555,7 +688,28 @@ class ComplianceReviewRequest(BaseModel):
     project_overview: Optional[str] = Field("", description="项目概述")
     analysis_report: Optional[AnalysisReport] = Field(None, description="结构化标准解析报告")
     response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟投标文件样例反向建模结果")
+    document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
     bid_mode: Optional[BidMode] = Field(None, description="标书生成模式")
+
+
+class DocumentBlocksPlanRequest(BaseModel):
+    """图表与素材规划请求"""
+    outline: List[OutlineItem] = Field(..., description="目录结构")
+    analysis_report: Optional[AnalysisReport] = Field(None, description="结构化标准解析报告")
+    response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟投标文件样例反向建模结果")
+    enterprise_materials: List[RequiredMaterial] = Field(default_factory=list, description="企业资料")
+    asset_library: Dict[str, Any] = Field(default_factory=dict, description="素材库")
+
+
+class ConsistencyRevisionRequest(BaseModel):
+    """全文一致性修订请求"""
+    full_bid_draft: List[OutlineItem] = Field(..., description="包含正文内容的目录结构")
+    analysis_report: Optional[AnalysisReport] = Field(None, description="结构化标准解析报告")
+    response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟投标文件样例反向建模结果")
+    document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
 
 
 class ErrorResponse(BaseModel):
@@ -569,3 +723,4 @@ class WordExportRequest(BaseModel):
     project_name: Optional[str] = Field(None, description="项目名称")
     project_overview: Optional[str] = Field(None, description="项目概述")
     outline: List[OutlineItem] = Field(..., description="目录结构，包含内容")
+    document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")

@@ -1,751 +1,877 @@
+"""Prompt 管理器：通用标书生成流水线提示词。
+
+本文件可直接替换 backend/app/utils/prompt_manager.py。
+
+设计目标：
+1. 适配完整投标文件、技术标/服务方案分册、商务卷、资格卷、报价卷等多种模式；
+2. 不绑定任何单一行业；
+3. 支持成熟投标文件样例反向建模、响应矩阵、目录生成、正文生成、图表素材规划、全文一致性审校；
+4. 所有正文生成均以招标文件、响应矩阵和企业资料为事实源，企业材料缺失时只保留占位。
+"""
+from __future__ import annotations
 
 import json
+from typing import Any, Dict, List, Tuple
 
 
-def get_full_bid_rulebook():
-  """从完整标书模板提炼出的通用风控规则，供多阶段提示词复用"""
-  return """标书编制通用风控规则：
-1. 以招标文件原文为最高优先级依据。不得用通用经验覆盖招标文件的具体要求。
-2. 所有输出必须服务于投标文件编制、评分点覆盖、实质性响应、废标风险规避和后续 Word 导出。
-3. 不得编造企业名称、资质、业绩、人员、财务、报价、税率、日期、证书编号、社保、发票、合同、信用查询结果或联系方式。
-4. 未提供或无法核实的信息必须使用明确占位符：〖待补充：资料名称〗、〖待确认：事项〗、〖待提供扫描件：资料名称〗、〖以招标文件要求为准〗或〖页码待编排〗。
-5. 招标文件、澄清/答疑/补遗、企业资料和历史案例冲突时，按“招标文件 > 澄清/答疑/补遗 > 企业已提供资料 > 企业历史材料 > 通用经验”处理。
-6. 不得把“不满足、未提供、待确认”的事项写成“满足、已具备、已完成、已提供”。
-7. 标注为“实质性格式”“固定格式”“不得修改格式”“必须按格式填写”的投标函、报价表、费用明细表、授权委托书、承诺函、偏离表、声明函、资格表、人员表、业绩表等，不得改变表头、列名、固定文字、行列结构和选择项。
-8. 对“★”“*”“▲”“实质性要求”“不允许偏离”“投标无效”“废标”“否决投标”“资格审查不通过”等内容，必须单独识别、编号、响应和审校。
-9. 对签字、签章、电子签章、骑缝章、法定代表人或授权代表签署、日期、附件扫描件等要求，必须建立检查项。
-10. 对暗标、双盲评审、匿名技术标，如招标文件有要求，正文不得出现企业名称、人员姓名、业绩名称、联系方式、Logo、商标、可识别图片、页眉页脚异常、隐藏超链接等身份识别信息。
-11. 报价文件必须严格服从招标文件规定的报价方式、币种、税率、含税/不含税口径、小数位、总价/单价、唯一报价、最高限价、分项报价、费用包含范围和算术修正规则。
-12. 如招标文件要求价格文件单独成册或不得出现在技术/商务文件中，必须在目录、正文和审校中强制隔离。
-13. 未提供报价信息时，不得生成具体金额，只能保留〖待补充：报价金额/分项报价〗。
-14. 业绩证据链应区分合同关键页、中标通知书、验收证明、发票、税务查验截图、业主证明、框架协议、订单/任务书；仅有历史案例文字不得自动认定为有效证明材料。
-15. 人员证据链应关注身份证、学历、职称/注册证、劳动合同、社保、退休返聘协议、人员业绩和证书有效期。
-16. 信用与资质证据链应关注查询平台、查询对象、查询日期、截图页面、资质有效期、年检状态和承诺函。
-17. 技术方案必须围绕评分细则逐条展开，说明响应措施、实施步骤、人员/资源、质量控制、进度控制、风险控制、交付成果和支撑材料。
-18. 分值高、实质性强、容易失分的评分项，应获得更高目录层级、更长篇幅和更细颗粒度响应。
-19. 不得重复生成同质化段落；同级章节必须分工明确。
-20. 要求 JSON 时，只输出合法 JSON；要求正文时，只输出当前章节正文，不输出标题、提示语、AI 自述或解释过程。"""
+def _json(data: Any, *, indent: int | None = None) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=indent, separators=None if indent else (",", ":"))
 
 
-def get_analysis_report_schema():
-  """结构化标准解析报告 JSON 模板"""
-  return {
-    "project": {
-      "name": "",
-      "number": "",
-      "package_name": "",
-      "package_or_lot": "",
-      "purchaser": "",
-      "agency": "",
-      "procurement_method": "",
-      "project_type": "",
-      "budget": "",
-      "maximum_price": "",
-      "funding_source": "",
-      "service_scope": "",
-      "service_period": "",
-      "service_location": "",
-      "quality_requirements": "",
-      "bid_validity": "",
-      "bid_bond": "",
-      "performance_bond": "",
-      "bid_deadline": "",
-      "opening_time": "",
-      "submission_method": "",
-      "electronic_platform": "",
-      "submission_requirements": "",
-      "signature_requirements": ""
-    },
-    "bid_mode_recommendation": "technical_only",
-    "source_refs": [
-      {
-        "id": "SRC-01",
-        "location": "招标文件章节/页码/表格",
-        "excerpt": "不超过120字的原文短摘录",
-        "related_ids": ["T-01", "C-01"]
-      }
-    ],
-    "volume_rules": [
-      {
-        "id": "V-TECH",
-        "name": "技术标",
-        "scope": "",
-        "separate_submission": False,
-        "price_allowed": False,
-        "anonymity_required": False,
-        "seal_signature_rule": "",
-        "source": ""
-      }
-    ],
-    "anonymity_rules": {
-      "enabled": False,
-      "scope": "",
-      "forbidden_identifiers": [],
-      "formatting_rules": [],
-      "source": ""
-    },
-    "bid_structure": [
-      {
-        "id": "S-01",
-        "parent_id": "",
-        "title": "",
-        "purpose": "",
-        "category": "资格/商务/技术/报价/承诺/附件",
+def get_full_bid_rulebook() -> str:
+    """跨行业标书风控规则，供所有阶段复用。"""
+    return """标书生成通用规则：
+
+一、事实源与禁止虚构
+1. 以招标文件原文为最高优先级依据。不得用通用经验、历史模板或样例文件覆盖招标文件的具体要求。
+2. 招标文件、澄清/答疑/补遗、企业资料、历史案例之间冲突时，按“招标文件 > 澄清/答疑/补遗 > 企业已提供资料 > 企业知识库/历史材料 > 通用行业经验”处理。
+3. 不得编造企业名称、资质、业绩、人员、金额、日期、证书编号、合同编号、发票信息、社保记录、信用查询结果、联系方式、报价、税率、服务期限、交付期限或承诺事项。
+4. 未在招标文件或企业资料中出现的信息，必须使用：〖待补充：资料名称〗、〖待确认：事项〗、〖待提供扫描件：资料名称〗、〖待提供查询截图：事项〗、〖以招标文件要求为准〗、〖页码待编排〗。
+5. 不得把“不满足、未提供、待确认”的事项写成“满足、已具备、已完成、已提供”。
+
+二、投标文件编制要求与格式硬约束
+1. 招标文件中的“投标文件”“投标文件格式”“投标文件的组成”“投标文件的编制”“投标文件格式要求”“技术/服务/施工/供货方案应包括”等章节，是目录生成、正文生成和导出审校的硬约束，优先级高于历史样例、通用模板和模型自由发挥。
+2. 必须单独解析投标文件应包括哪些卷册、章节、表格、承诺函、证明材料和附件；必须记录章节顺序、是否必交、是否固定格式、是否需要签字盖章、是否需要附件、是否允许自拟。
+3. 若用户目标是 full_bid，目录必须按招标文件“投标文件/投标文件格式”列明的顺序完整生成，不得遗漏投标函、授权/身份证明、联合体协议、保证金、报价、资格审查资料、技术/服务方案、其他资料、偏差表等必需项；不适用章节应保留“不适用/本项目不适用”处理规则或按招标文件要求处理。
+4. 若用户目标是 technical_only、technical_service_plan 或 service_plan，只生成对应技术/服务分册正文，但仍必须遵守招标文件中对该分册的“应包括但不限于”章节要求；完整投标文件中的商务、报价、资格、保证金等内容应进入 excluded_full_bid_sections 或审校提示，不得混入技术分册正文。
+5. 对招标文件明确给出的固定表格和固定格式，必须保留表头、列名、固定文字、顺序、签章栏、日期栏和附件说明；只允许填写空白项或使用占位符，不得擅自改写格式含义。
+6. 对标注“以上内容仅供参考模板，可以根据投标人情况自行拟定”的方案类内容，可以扩展和优化，但必须覆盖其列明的全部要点，且不得与评分办法、实质性条款和卷册隔离规则冲突。
+
+三、格式、签章与实质性响应
+1. 对“★”“*”“▲”“实质性要求”“不允许偏离”“投标无效”“废标”“否决投标”“资格审查不通过”“必须”“不得”“应当”等内容，必须单独识别、编号、响应和审校。
+2. 标注为“实质性格式”“固定格式”“不得修改格式”“必须按格式填写”的投标函、报价表、费用明细表、授权委托书、承诺函、偏离表、声明函、资格表、人员表、业绩表等，不得改变表头、列名、固定文字、行列结构和选择项。
+3. 对签字、签章、电子签章、骑缝章、法定代表人或授权代表签署、日期、附件扫描件等要求，必须建立检查项。
+4. 对暗标、双盲、匿名技术标，如招标文件有要求，正文不得出现企业名称、人员姓名、业绩名称、联系方式、Logo、商标、可识别图片、页眉页脚异常、隐藏超链接等身份识别信息。
+
+四、报价与卷册隔离
+1. 报价文件必须严格服从招标文件规定的报价方式、币种、税率、含税/不含税口径、小数位、总价/单价、唯一报价、最高限价、分项报价、费用包含范围和算术修正规则。
+2. 如招标文件要求价格文件单独成册，或不得出现在技术/商务/暗标文件中，必须在目录、正文和审校中强制隔离。
+3. 未提供报价信息时，不得生成具体金额，只能保留 〖待补充：报价金额/分项报价〗。
+
+五、证据链
+1. 业绩证据链应区分：合同关键页、中标通知书、验收证明、发票、税务查验截图、业主证明、框架协议、订单/任务书；仅有历史案例文字不得自动认定为有效证明材料。
+2. 人员证据链应关注：身份证、学历、职称/注册证、劳动合同、社保、退休返聘协议、人员业绩、证书有效期。
+3. 信用与资质证据链应关注：查询平台、查询对象、查询日期、截图页面、资质有效期、年检状态和承诺函。
+4. 货物类项目应关注：厂家授权、检测报告、合格证、参数证明、供货能力、售后网点、备品备件、质保承诺。
+5. 工程类项目应关注：施工资质、安全生产许可证、项目经理证书、施工组织、机械设备、质量安全文明施工、进度计划。
+6. 服务类项目应关注：服务团队、服务流程、响应时限、质量保障、沟通机制、应急预案、成果交付和保密承诺。
+
+六、评分点写作
+1. 技术/服务/实施方案必须围绕评分细则逐条展开，不能只做空泛宣传。
+2. 每个评分点至少形成一个明确的响应章节或段落，并说明：响应措施、实施步骤、人员/资源、质量控制、进度控制、风险控制、交付成果、支撑材料。
+3. 分值高、实质性强、容易失分的评分项，应获得更高目录层级、更长篇幅和更细颗粒度响应。
+4. 同级章节必须分工明确；不得重复生成同质化段落。
+
+七、输出约束
+1. 要求 JSON 时，只输出合法 JSON，不输出 markdown 代码块、解释语、前后缀。
+2. 要求正文时，只输出当前章节正文，不输出标题、提示语、AI 自述、解释过程。
+3. 页码、附件页码、响应页码在最终 Word 排版前统一使用 〖页码待编排〗。
+"""
+
+
+def _node(
+    id_: str,
+    title: str,
+    desc: str,
+    children: List[Dict[str, Any]] | None = None,
+    *,
+    chapter_type: str = "technical",
+    expected_depth: str = "medium",
+    scoring: List[str] | None = None,
+    req: List[str] | None = None,
+    material: List[str] | None = None,
+    blocks: List[str] | None = None,
+    source_type: str = "template_expansion",
+) -> Dict[str, Any]:
+    blocks = blocks or ["paragraph"]
+    return {
+        "id": id_,
         "volume_id": "V-TECH",
-        "required": True,
-        "fixed_format": False,
-        "signature_required": False,
-        "attachment_required": False,
-        "seal_required": False,
-        "price_related": False,
+        "title": title,
+        "description": desc,
+        "chapter_type": chapter_type,
+        "source_type": source_type,
+        "fixed_format_sensitive": False,
+        "price_sensitive": False,
         "anonymity_sensitive": False,
-        "source": ""
-      }
-    ],
-    "formal_review_items": [
-      {
-        "id": "E-01",
-        "review_type": "形式评审",
-        "requirement": "",
-        "criterion": "",
-        "required_materials": ["M-01"],
-        "risk": "",
-        "target_chapters": ["S-01"],
-        "source": "",
-        "invalid_if_missing": False
-      }
-    ],
-    "qualification_review_items": [
-      {
-        "id": "E-02",
-        "review_type": "资格评审",
-        "requirement": "",
-        "criterion": "",
-        "required_materials": ["M-01"],
-        "risk": "",
-        "target_chapters": ["S-01"],
-        "source": "",
-        "invalid_if_missing": False
-      }
-    ],
-    "responsiveness_review_items": [
-      {
-        "id": "E-03",
-        "review_type": "响应性评审",
-        "requirement": "",
-        "criterion": "",
-        "required_materials": ["M-01"],
-        "risk": "",
-        "target_chapters": ["S-01"],
-        "source": "",
-        "invalid_if_missing": False
-      }
-    ],
-    "business_scoring_items": [
-      {
-        "id": "B-01",
-        "name": "",
-        "score": "",
-        "standard": "",
-        "source": "",
-        "evidence_requirements": ["合同关键页", "发票", "查验截图"],
-        "writing_focus": "",
-        "easy_loss_points": []
-      }
-    ],
-    "technical_scoring_items": [
-      {
-        "id": "T-01",
-        "name": "",
-        "score": "",
-        "standard": "",
-        "source": "",
-        "writing_focus": "",
-        "evidence_requirements": [],
-        "easy_loss_points": []
-      }
-    ],
-    "price_scoring_items": [
-      {
-        "id": "P-01",
-        "name": "",
-        "score": "",
-        "logic": "",
-        "source": "",
-        "risk": ""
-      }
-    ],
-    "price_rules": {
-      "quote_method": "",
-      "currency": "",
-      "maximum_price_rule": "",
-      "abnormally_low_price_rule": "",
-      "separate_price_volume_required": False,
-      "price_forbidden_in_other_volumes": False,
-      "tax_requirement": "",
-      "decimal_places": "",
-      "uniqueness_requirement": "",
-      "form_requirements": "",
-      "arithmetic_correction_rule": "",
-      "missing_item_rule": "",
-      "prohibited_format_changes": [],
-      "source_ref": ""
-    },
-    "qualification_requirements": [
-      {
-        "id": "Q-01",
-        "name": "",
-        "requirement": "",
-        "source": "",
-        "required_materials": ["M-01"]
-      }
-    ],
-    "formal_response_requirements": [
-      {
-        "id": "F-01",
-        "name": "",
-        "requirement": "",
-        "source": "",
-        "fixed_format": False,
-        "signature_required": False,
-        "attachment_required": False
-      }
-    ],
-    "mandatory_clauses": [
-      {
-        "id": "C-01",
-        "clause": "",
-        "source": "",
-        "response_strategy": "",
-        "invalid_if_not_responded": True
-      }
-    ],
-    "rejection_risks": [
-      {
-        "id": "R-01",
-        "risk": "",
-        "trigger": "",
-        "source": "",
-        "mitigation": "",
-        "blocking": True
-      }
-    ],
-    "fixed_format_forms": [
-      {
-        "id": "FF-01",
-        "name": "",
-        "volume_id": "",
-        "source": "",
-        "required_columns": [],
-        "must_keep_columns": [],
-        "must_keep_text": [],
-        "fillable_fields": [],
-        "fixed_text": "",
-        "fill_rules": "",
-        "seal_required": False
-      }
-    ],
-    "signature_requirements": [
-      {
-        "id": "SIG-01",
-        "target": "",
-        "signer": "",
-        "seal": "",
-        "date_required": False,
-        "electronic_signature_required": False,
-        "source": "",
-        "risk": ""
-      }
-    ],
-    "evidence_chain_requirements": [
-      {
-        "id": "EV-01",
-        "target": "企业业绩/项目负责人/社保/信用/发票",
-        "required_evidence": [],
-        "validation_rule": "",
-        "source": "",
-        "risk": ""
-      }
-    ],
-    "required_materials": [
-      {
-        "id": "M-01",
-        "name": "",
-        "purpose": "",
-        "source": "",
-        "status": "missing",
-        "used_by": ["Q-01"],
-        "volume_id": ""
-      }
-    ],
-    "missing_company_materials": [
-      {
-        "id": "X-01",
-        "name": "",
-        "used_by": ["Q-01", "T-01"],
-        "placeholder": "〖待补充：具体资料名称〗",
-        "blocking": False
-      }
-    ],
-    "generation_warnings": [
-      {
-        "id": "W-01",
-        "warning": "",
-        "severity": "warning",
-        "related_ids": []
-      }
-    ],
-    "response_matrix": get_response_matrix_schema()
-  }
-
-
-def get_response_matrix_schema():
-  """响应矩阵 JSON 模板"""
-  return {
-    "items": [
-      {
-        "id": "RM-01",
-        "source_item_id": "T-01",
-        "source_type": "scoring/review/mandatory/risk/material/format/signature/evidence/price",
-        "requirement_summary": "",
-        "response_strategy": "",
-        "target_chapter_ids": ["1.1"],
-        "required_material_ids": ["M-01"],
-        "risk_ids": ["R-01"],
-        "source_refs": ["SRC-01"],
-        "priority": "high",
-        "status": "pending",
-        "blocking": False
-      }
-    ],
-    "uncovered_ids": ["T-01"],
-    "high_risk_ids": ["RM-01"],
-    "coverage_summary": ""
-  }
-
-
-def get_review_report_schema():
-  """导出前合规审校 JSON 模板"""
-  return {
-    "coverage": [
-      {
-        "item_id": "T-01",
-        "target_type": "scoring",
-        "covered": True,
-        "chapter_ids": ["1.1.1"],
-        "issue": "",
-        "evidence": "",
-        "fix_suggestion": ""
-      }
-    ],
-    "missing_materials": [
-      {
-        "material_id": "M-01",
-        "material_name": "",
-        "used_by": ["T-01"],
-        "chapter_ids": ["2.1.1"],
-        "placeholder": "〖待补充：具体资料名称〗",
-        "placeholder_found": True,
-        "fix_suggestion": ""
-      }
-    ],
-    "rejection_risks": [
-      {
-        "risk_id": "R-01",
-        "handled": False,
-        "issue": ""
-      }
-    ],
-    "duplication_issues": [
-      {
-        "chapter_ids": ["1.2.1", "1.3.1"],
-        "issue": ""
-      }
-    ],
-    "fabrication_risks": [
-      {
-        "chapter_id": "3.1.1",
-        "text": "",
-        "reason": "",
-        "fix_suggestion": ""
-      }
-    ],
-    "fixed_format_issues": [
-      {
-        "item_id": "FF-01",
-        "chapter_ids": ["2.1.1"],
-        "issue": "",
-        "evidence": "",
-        "fix_suggestion": "",
-        "severity": "blocking",
-        "blocking": True
-      }
-    ],
-    "signature_issues": [
-      {
-        "item_id": "SIG-01",
-        "chapter_ids": ["2.1.1"],
-        "issue": "",
-        "evidence": "",
-        "fix_suggestion": "",
-        "severity": "blocking",
-        "blocking": True
-      }
-    ],
-    "price_rule_issues": [
-      {
-        "item_id": "P-01",
-        "chapter_ids": ["3.1.1"],
-        "issue": "",
-        "evidence": "",
-        "fix_suggestion": "",
-        "severity": "blocking",
-        "blocking": True
-      }
-    ],
-    "evidence_chain_issues": [
-      {
-        "item_id": "EV-01",
-        "chapter_ids": ["4.1.1"],
-        "issue": "",
-        "evidence": "",
-        "fix_suggestion": "",
-        "severity": "blocking",
-        "blocking": True
-      }
-    ],
-    "page_reference_issues": [
-      {
-        "item_id": "PAGE-01",
-        "chapter_ids": ["1.1.1"],
-        "issue": "",
-        "evidence": "",
-        "fix_suggestion": "",
-        "severity": "warning",
-        "blocking": False
-      }
-    ],
-    "anonymity_issues": [],
-    "blocking_issues": [],
-    "warnings": [],
-    "revision_plan": {
-      "actions": [
-        {
-          "id": "RP-01",
-          "target_chapter_ids": ["1.1.1"],
-          "action_type": "补写/替换/删减/补材料/人工确认",
-          "instruction": "",
-          "priority": "high",
-          "related_issue_ids": ["T-01"],
-          "blocking": True
-        }
-      ],
-      "summary": ""
-    },
-    "summary": {
-      "ready_to_export": False,
-      "blocking_issues": 0,
-      "warnings": 0,
-      "blocking_issues_count": 0,
-      "warnings_count": 0,
-      "coverage_rate": 0,
-      "blocking_summary": "",
-      "next_actions": []
+        "enterprise_required": bool(material),
+        "asset_required": any(b in {"image", "org_chart", "workflow_chart"} for b in blocks),
+        "expected_depth": expected_depth,
+        "expected_word_count": {"short": 500, "medium": 1200, "long": 2400, "very_long": 3800}.get(expected_depth, 1200),
+        "expected_blocks": blocks,
+        "scoring_item_ids": scoring or [],
+        "requirement_ids": req or [],
+        "risk_ids": [],
+        "material_ids": material or [],
+        "response_matrix_ids": [],
+        "children": children or [],
     }
-  }
 
 
-def generate_analysis_report_prompt(file_content):
-  """生成结构化标准解析报告的提示词"""
-  schema_json = json.dumps(get_analysis_report_schema(), ensure_ascii=False, separators=(",", ":"))
-  rulebook = get_full_bid_rulebook()
-  system_prompt = f"""你是专业招标文件解析专家。你的任务是把招标文件解析为可供后续目录生成、正文生成和合规检查复用的 AnalysisReport JSON。
+def get_generic_service_plan_outline_template() -> List[Dict[str, Any]]:
+    """服务/技术方案分册的跨行业保底目录。具体目录应优先由模型按招标文件生成。"""
+    return [
+        _node("1", "项目理解与服务范围", "准确响应招标范围、服务/实施内容、服务地点、服务期限、交付成果和边界条件。", [
+            _node("1.1", "项目背景与需求理解", "结合招标文件说明项目背景、采购目标、需求边界和响应重点。", expected_depth="short", source_type="tender_direct_response"),
+            _node("1.2", "服务范围与服务内容", "逐项响应招标文件规定的服务、供货、施工、运维、咨询或设计内容。", source_type="tender_direct_response"),
+            _node("1.3", "成果交付与服务标准", "说明交付物、验收口径、服务标准、质量要求和时限要求。", source_type="tender_direct_response"),
+        ], source_type="tender_direct_response"),
+        _node("2", "工作目标与响应承诺", "从质量、进度、服务、安全、合规、成本或交付目标等维度作出可核验响应。", [
+            _node("2.1", "质量目标", "明确成果质量、验收一次通过、缺陷控制和持续改进目标。"),
+            _node("2.2", "进度目标", "响应招标文件的期限、节点、响应时限或交付周期。"),
+            _node("2.3", "服务目标", "说明满意度、响应机制、问题闭环和协同目标。"),
+        ]),
+        _node("3", "组织机构与岗位职责", "说明项目组织机构、岗位职责、接口关系、管理机制和资源调配方式。", [
+            _node("3.1", "项目组织机构", "输出组织机构图占位或结构化组织层级。", expected_depth="short", material=["M-人员组织"], blocks=["org_chart"]),
+            _node("3.2", "岗位职责与协同关系", "逐项说明项目负责人、质量、进度、文档、专业人员或实施人员职责。", material=["M-人员组织"]),
+        ], material=["M-人员组织"], blocks=["org_chart"]),
+        _node("4", "实施方案", "技术/服务方案核心章节，覆盖总体思路、依据原则、实施方法、流程、资源、进度、质量、安全、风险和重点难点。", [
+            _node("4.1", "总体思路", "概述项目策划、资源投入、组织协同、进度质量控制和成果交付。"),
+            _node("4.2", "编制依据与实施原则", "结合招标文件、法律法规、行业规范、技术标准和企业管理体系。"),
+            _node("4.3", "工作方法", "写清实施步骤、输入输出、过程控制、评审确认和变更控制。", expected_depth="long"),
+            _node("4.4", "工作流程", "输出流程图占位或流程表，覆盖启动、执行、检查、交付、验收、归档。", blocks=["workflow_chart"]),
+            _node("4.5", "资源投入计划", "输出人员、设备、软件、车辆、备品备件或服务工具等资源投入表；资料缺失时占位。", material=["M-资源投入"], blocks=["table"]),
+            _node("4.6", "文档与资料管理", "说明资料接收、传递、版本、受控、归档、保密和页码索引。"),
+            _node("4.7", "变更与风险管理", "说明需求变更、范围变更、进度变更、质量风险、安全风险的识别、审批和闭环。"),
+            _node("4.8", "进度计划与保障措施", "响应招标文件节点要求，输出进度计划表、纠偏机制和必要承诺。", blocks=["table"]),
+            _node("4.9", "重点难点分析及对策", "识别本项目关键难点、易失分点、履约风险并提出针对性措施。", expected_depth="long"),
+        ], expected_depth="very_long"),
+        _node("5", "拟投入人员、设备及支撑能力", "说明团队、人员、设备、软件、工具、场地、售后或运维能力。", [
+            _node("5.1", "人员投入计划", "说明人员配置原则、专业分工、替换机制、社保/劳动关系等核验要求。", material=["M-人员表"]),
+            _node("5.2", "拟投入人员表", "输出人员汇总表；缺少人员库时使用待补占位。", material=["M-人员表"], blocks=["table"]),
+            _node("5.3", "设备、工具及软件投入", "输出设备、工具、车辆、软件、检测仪器、平台系统或备品备件清单。", material=["M-设备软件"], blocks=["table"]),
+        ], material=["M-人员表", "M-设备软件"], blocks=["table"]),
+        _node("6", "沟通协调与服务响应", "写组织协调、招标人沟通、内部沟通、会议管理、接口管理、响应时限和闭环机制。", [
+            _node("6.1", "沟通协调机制", "写定期沟通、即时沟通、书面沟通、会议纪要、事项跟踪和闭环管理。"),
+            _node("6.2", "服务响应机制", "写响应渠道、响应时限、升级机制、应急联系人和问题解决流程；联系方式缺失时占位。", material=["M-联系人"]),
+            _node("6.3", "沟通与服务承诺", "输出沟通或服务承诺书，按招标文件和企业资料填写。", blocks=["commitment_letter"]),
+        ], expected_depth="long"),
+        _node("7", "质量保证及履约承诺", "覆盖质量目标、过程质量控制、验收控制、文件资料控制、内审/检查、持续改进、质量承诺和违约责任。", [
+            _node("7.1", "质量保证体系", "说明质量管理组织、制度、程序、标准和责任分工。"),
+            _node("7.2", "过程质量控制措施", "写输入、执行、检查、验证、确认、更改、验收全过程控制。", expected_depth="long"),
+            _node("7.3", "成果验收与持续改进", "写验收标准、问题整改、复盘改进和客户满意度管理。"),
+            _node("7.4", "服务质量承诺", "输出服务质量承诺书，包含质量、期限、安全、保密和交付深度等。", blocks=["commitment_letter"]),
+            _node("7.5", "违约责任承诺", "如招标文件或评分项要求，输出违约责任承诺书。", blocks=["commitment_letter"]),
+        ], expected_depth="very_long"),
+        _node("8", "其他技术支撑与增值服务", "根据招标文件、评分项或样例风格展示管理制度、信息化工具、数字化能力、培训、售后、应急或可视化成果。", [
+            _node("8.1", "企业管理制度", "如评分项要求，覆盖业务管理、行政、财务、人事、档案、职业道德、企业文化等制度。", material=["M-企业制度"]),
+            _node("8.2", "信息化或数字化支撑", "如项目适用，写平台、软件、数据管理、数字化交付、远程协同等能力；资料缺失时占位。", material=["M-数字化能力"], blocks=["image", "table"]),
+            _node("8.3", "成果展示或案例素材", "如评分项或样例要求插入图片、效果图、系统截图、证书或案例素材，缺失时只输出占位。", material=["M-图片素材"], blocks=["image"]),
+        ], material=["M-企业制度", "M-图片素材"], blocks=["image"]),
+    ]
 
-要求：
-1. 只输出合法 JSON，不输出 markdown 代码块，不输出解释文字。
-2. 所有条目必须尽量标注 source，source 写招标文件中的章节、页码、表格或条款位置；确实无法定位时填空字符串。
-3. 未提及的信息填空字符串或空数组，不得猜测。
-4. 企业资料缺失时只登记 missing_company_materials，不得虚构企业名称、资质、业绩、人员、金额、日期、证书编号、合同、发票或联系方式。
-5. 根据输入内容判断 bid_mode_recommendation，只能是 technical_only 或 full_bid。
-6. 技术评分项使用 T-01、T-02 编号；资格要求使用 Q-01 编号；正式响应要求使用 F-01 编号；实质性条款使用 C-01 编号；废标风险使用 R-01 编号；材料使用 M-01 编号；待补资料使用 X-01 编号。
-7. 投标结构使用 S-01 编号；评审项使用 E-01 编号；商务评分项使用 B-01 编号；价格评分项使用 P-01 编号；固定格式使用 FF-01 编号；签章要求使用 SIG-01 编号；证据链要求使用 EV-01 编号。
-8. required_materials.status 只能使用 missing、provided 或 unknown。
-9. 必须同时提取形式评审、资格评审、响应性评审、商务评分、技术评分、价格规则、固定格式、签字盖章、页码占位、证据链要求、报价隔离要求、卷册规则和暗标/匿名要求；若招标文件没有对应内容则输出空数组或空字符串。
-10. 如果文档明显只要求技术标，bid_mode_recommendation 输出 technical_only；如果出现完整资格/商务/报价/承诺/附件组卷要求，输出 full_bid。
-11. bid_structure 必须体现卷册隔离思路：资格、商务、技术、报价、承诺、附件等应按招标文件要求拆分；价格文件单独递交或不得进入技术/商务文件时，必须在对应节点 purpose 或 source 中写明。
-12. 对暗标、双盲、匿名技术标要求，必须在 mandatory_clauses、formal_response_requirements 或 rejection_risks 中单独编号。
-13. 高风险内容不得合并：否决项、实质性条款、固定格式、签章、报价、暗标、资格硬条件必须分别输出。
-14. 为避免 JSON 被截断，每个数组最多输出最关键 8 项；单个字段内容尽量压缩到 80 字以内；不得为了完整复述原文而输出长段落。
-15. 若同类要求很多，优先保留否决项、实质性条款、评分项、签章/格式要求和材料要求，其余合并概括到 risk、writing_focus 或 source。
-16. 必须生成 response_matrix：把评分项、审查项、实质性条款、废标风险、材料、固定格式、签章、报价和暗标要求逐项映射到后续目录/正文响应策略；不得把 response_matrix 留空。
-17. source_refs 只记录最关键出处，每个 excerpt 不超过 120 字；volume_rules 必须体现技术/商务/报价/资格/附件是否隔离、是否允许报价、是否暗标。
+
+def get_design_service_outline_template() -> List[Dict[str, Any]]:
+    """兼容旧调用。现在返回通用服务/技术方案模板，而非单一行业专项模板。"""
+    return get_generic_service_plan_outline_template()
+
+
+def get_reference_bid_style_profile_schema() -> Dict[str, Any]:
+    return {
+        "profile_name": "",
+        "document_scope": "full_bid | technical_only | technical_service_plan | service_plan | business_volume | qualification_volume | price_volume | unknown",
+        "recommended_use_case": "",
+        "cover_profile": {
+            "has_cover": True,
+            "title_pattern": "",
+            "project_name_position": "",
+            "bidder_name_position": "",
+            "signature_seal_position": "",
+            "date_format": "YYYY年MM月DD日",
+        },
+        "toc_profile": {
+            "has_toc": True,
+            "toc_depth": 2,
+            "page_number_required": True,
+            "toc_should_be_generated_by_word": True,
+        },
+        "outline_template": [
+            {
+                "id": "1",
+                "title": "",
+                "level": 1,
+                "children": [],
+                "source_type": "tender_mapped | scoring_response | enterprise_showcase | profile_expansion | fixed_form | material_attachment",
+                "scoring_purpose": "",
+                "expected_depth": "short | medium | long | very_long",
+                "tables_required": [],
+                "image_slots": [],
+                "enterprise_required": False,
+                "asset_required": False,
+            }
+        ],
+        "writing_style": {
+            "voice": "第一人称公司主体，如“我公司”",
+            "tone": "正式、承诺式、专业投标文件语气",
+            "paragraph_style": "条理化分点",
+            "common_patterns": [],
+            "forbidden_patterns": ["AI自述", "泛泛宣传", "历史项目残留"],
+        },
+        "section_generation_rules": [
+            {
+                "chapter_title": "",
+                "content_source_priority": ["tender_analysis", "enterprise_profile", "template_library", "asset_library"],
+                "must_include": [],
+                "must_not_include": [],
+                "table_or_asset_policy": "",
+            }
+        ],
+        "table_models": [
+            {
+                "chapter_title": "",
+                "table_name": "",
+                "columns": [],
+                "rows_policy": "",
+                "enterprise_required": False,
+            }
+        ],
+        "image_slots": [
+            {
+                "chapter_title": "",
+                "slot_name": "",
+                "asset_type": "org_chart | workflow_chart | software_screenshot | product_image | project_rendering | certificate_image | other",
+                "asset_required": True,
+                "fallback_placeholder": "〖插入图片：图片名称〗",
+            }
+        ],
+        "enterprise_data_requirements": [
+            {"name": "", "used_by_chapters": [], "required": True, "fallback": "〖待补充：资料名称〗"}
+        ],
+        "quality_risks": [{"risk": "", "location": "", "fix_rule": ""}],
+    }
+
+
+
+def get_bid_document_requirements_schema() -> Dict[str, Any]:
+    """招标文件中“投标文件/投标文件格式/投标文件组成/编制要求”的专门解析模板。"""
+    return {
+        "source_chapters": [
+            {
+                "id": "BD-SRC-01",
+                "chapter_title": "",
+                "location": "章节/页码/条款/表格",
+                "excerpt": "不超过120字原文摘录",
+            }
+        ],
+        "document_scope_required": "full_bid | technical_volume | service_plan_volume | business_volume | qualification_volume | price_volume | unknown",
+        "composition": [
+            {
+                "id": "BD-01",
+                "order": 1,
+                "title": "",
+                "required": True,
+                "applicability": "required | optional | not_applicable | conditional",
+                "volume_id": "",
+                "chapter_type": "cover | toc | form | authorization | bond | price | qualification | business | technical | service_plan | construction_plan | goods_supply | deviation_table | commitment | other",
+                "fixed_format": False,
+                "allow_self_drafting": False,
+                "signature_required": False,
+                "seal_required": False,
+                "attachment_required": False,
+                "price_related": False,
+                "anonymity_sensitive": False,
+                "source_ref": "BD-SRC-01",
+                "must_keep_text": [],
+                "must_keep_columns": [],
+                "fillable_fields": [],
+                "children": [],
+            }
+        ],
+        "scheme_or_technical_outline_requirements": [
+            {
+                "id": "BD-SP-01",
+                "parent_title": "服务方案/技术方案/施工组织设计/供货方案/设计方案",
+                "order": 1,
+                "title": "",
+                "required": True,
+                "allow_expand": True,
+                "source_ref": "BD-SRC-01",
+                "target_chapter_hint": "",
+            }
+        ],
+        "fixed_forms": [
+            {
+                "id": "BD-FF-01",
+                "form_name": "",
+                "belongs_to": "BD-01",
+                "must_keep_columns": [],
+                "must_keep_text": [],
+                "fillable_fields": [],
+                "signature_required": False,
+                "seal_required": False,
+                "date_required": False,
+                "source_ref": "BD-SRC-01",
+            }
+        ],
+        "formatting_and_submission_rules": {
+            "language": "",
+            "toc_required": False,
+            "page_number_required": False,
+            "binding_or_upload_rules": "",
+            "electronic_signature_rules": "",
+            "encryption_or_platform_rules": "",
+            "source_ref": "",
+        },
+        "excluded_when_generating_technical_only": [],
+        "priority_rule": "投标文件编制要求优先于样例风格；样例只用于扩写深度和版式，不得覆盖招标文件格式。",
+    }
+
+def get_analysis_report_schema() -> Dict[str, Any]:
+    """结构化标准解析报告 JSON 模板。字段兼容 models.schemas.AnalysisReport。"""
+    return {
+        "project": {
+            "name": "", "number": "", "package_name": "", "package_or_lot": "", "purchaser": "", "agency": "",
+            "procurement_method": "", "project_type": "", "budget": "", "maximum_price": "", "funding_source": "",
+            "service_scope": "", "service_period": "", "service_location": "", "quality_requirements": "",
+            "bid_validity": "", "bid_bond": "", "performance_bond": "", "bid_deadline": "", "opening_time": "",
+            "submission_method": "", "electronic_platform": "", "submission_requirements": "", "signature_requirements": "",
+        },
+        "bid_mode_recommendation": "technical_only",
+        "source_refs": [{"id": "SRC-01", "location": "章节/页码/表格/条款", "excerpt": "不超过120字原文摘录", "related_ids": ["T-01"]}],
+        "bid_document_requirements": get_bid_document_requirements_schema(),
+        "volume_rules": [{"id": "V-TECH", "name": "技术标/服务方案", "scope": "", "separate_submission": False, "price_allowed": False, "anonymity_required": False, "seal_signature_rule": "", "source": ""}],
+        "anonymity_rules": {"enabled": False, "scope": "", "forbidden_identifiers": [], "formatting_rules": [], "source": ""},
+        "bid_structure": [{"id": "S-01", "parent_id": "", "title": "", "purpose": "", "category": "资格/商务/技术/报价/承诺/附件/服务方案/实施方案", "volume_id": "V-TECH", "required": True, "fixed_format": False, "signature_required": False, "attachment_required": False, "seal_required": False, "price_related": False, "anonymity_sensitive": False, "source": ""}],
+        "formal_review_items": [{"id": "E-01", "review_type": "形式评审", "requirement": "", "criterion": "", "required_materials": [], "risk": "", "target_chapters": [], "source": "", "invalid_if_missing": False}],
+        "qualification_review_items": [{"id": "E-02", "review_type": "资格评审", "requirement": "", "criterion": "", "required_materials": [], "risk": "", "target_chapters": [], "source": "", "invalid_if_missing": False}],
+        "responsiveness_review_items": [{"id": "E-03", "review_type": "响应性评审", "requirement": "", "criterion": "", "required_materials": [], "risk": "", "target_chapters": [], "source": "", "invalid_if_missing": False}],
+        "business_scoring_items": [{"id": "B-01", "name": "", "score": "", "standard": "", "source": "", "evidence_requirements": [], "writing_focus": "", "easy_loss_points": []}],
+        "technical_scoring_items": [{"id": "T-01", "name": "", "score": "", "standard": "", "source": "", "writing_focus": "", "evidence_requirements": [], "easy_loss_points": []}],
+        "price_scoring_items": [{"id": "P-01", "name": "", "score": "", "logic": "", "source": "", "risk": ""}],
+        "price_rules": {"quote_method": "", "currency": "", "maximum_price_rule": "", "abnormally_low_price_rule": "", "separate_price_volume_required": False, "price_forbidden_in_other_volumes": False, "tax_requirement": "", "decimal_places": "", "uniqueness_requirement": "", "form_requirements": "", "arithmetic_correction_rule": "", "missing_item_rule": "", "prohibited_format_changes": [], "source_ref": ""},
+        "qualification_requirements": [{"id": "Q-01", "name": "", "requirement": "", "source": "", "required_materials": []}],
+        "formal_response_requirements": [{"id": "F-01", "name": "", "requirement": "", "source": "", "fixed_format": False, "signature_required": False, "attachment_required": False}],
+        "mandatory_clauses": [{"id": "C-01", "clause": "", "source": "", "response_strategy": "", "invalid_if_not_responded": False}],
+        "rejection_risks": [{"id": "R-01", "risk": "", "trigger": "", "source": "", "mitigation": "", "blocking": True}],
+        "fixed_format_forms": [{"id": "FF-01", "name": "", "volume_id": "", "source": "", "required_columns": [], "must_keep_columns": [], "must_keep_text": [], "fillable_fields": [], "fixed_text": "", "fill_rules": "", "seal_required": False}],
+        "signature_requirements": [{"id": "SIG-01", "target": "", "signer": "", "seal": "", "date_required": False, "electronic_signature_required": False, "source": "", "risk": ""}],
+        "evidence_chain_requirements": [{"id": "EV-01", "target": "企业业绩/人员/资质/信用/发票/产品参数/检测报告/其他", "required_evidence": [], "validation_rule": "", "source": "", "risk": ""}],
+        "required_materials": [{"id": "M-01", "name": "", "purpose": "", "source": "", "status": "missing", "used_by": [], "volume_id": ""}],
+        "missing_company_materials": [{"id": "X-01", "name": "", "used_by": [], "placeholder": "〖待补充：具体资料名称〗", "blocking": False}],
+        "generation_warnings": [{"id": "W-01", "warning": "", "severity": "warning", "related_ids": []}],
+        "response_matrix": get_response_matrix_schema(),
+        "reference_bid_style_profile": {},
+        "document_blocks_plan": {},
+    }
+
+
+def get_response_matrix_schema() -> Dict[str, Any]:
+    return {
+        "items": [
+            {
+                "id": "RM-01",
+                "source_item_id": "T-01",
+                "source_type": "scoring/review/mandatory/risk/material/format/signature/evidence/price/profile_expansion",
+                "requirement_summary": "",
+                "response_strategy": "",
+                "target_chapter_ids": [],
+                "required_material_ids": [],
+                "risk_ids": [],
+                "source_refs": [],
+                "priority": "high",
+                "status": "pending",
+                "blocking": False,
+            }
+        ],
+        "uncovered_ids": [],
+        "high_risk_ids": [],
+        "coverage_summary": "",
+    }
+
+
+def get_document_blocks_schema() -> Dict[str, Any]:
+    return {
+        "document_blocks": [
+            {
+                "chapter_id": "",
+                "chapter_title": "",
+                "blocks": [
+                    {
+                        "block_type": "paragraph | table | org_chart | workflow_chart | image | commitment_letter | material_attachment | page_break",
+                        "block_name": "",
+                        "data_source": "tender | enterprise_profile | staff_roster | equipment_library | asset_library | generated | manual",
+                        "required": True,
+                        "asset_id": "",
+                        "placeholder": "",
+                        "table_schema": {"columns": [], "row_policy": ""},
+                        "chart_schema": {"nodes": [], "edges": []},
+                        "commitment_schema": {"to": "", "items": [], "signer": "{bidder_name}", "date": "{bid_date}"},
+                    }
+                ],
+            }
+        ],
+        "missing_assets": [{"chapter_id": "", "asset_name": "", "fallback_placeholder": ""}],
+        "missing_enterprise_data": [{"chapter_id": "", "data_name": "", "fallback_placeholder": ""}],
+    }
+
+
+def get_review_report_schema() -> Dict[str, Any]:
+    return {
+        "coverage": [{"item_id": "T-01", "target_type": "scoring", "covered": True, "chapter_ids": [], "issue": "", "evidence": "", "fix_suggestion": ""}],
+        "missing_materials": [{"material_id": "M-01", "material_name": "", "used_by": [], "chapter_ids": [], "placeholder": "〖待补充：资料名称〗", "placeholder_found": True, "fix_suggestion": ""}],
+        "rejection_risks": [{"risk_id": "R-01", "handled": False, "issue": ""}],
+        "duplication_issues": [{"chapter_ids": [], "issue": ""}],
+        "fabrication_risks": [{"chapter_id": "", "text": "", "reason": "", "fix_suggestion": ""}],
+        "fixed_format_issues": [],
+        "signature_issues": [],
+        "price_rule_issues": [],
+        "evidence_chain_issues": [],
+        "page_reference_issues": [],
+        "anonymity_issues": [],
+        "blocking_issues": [],
+        "warnings": [],
+        "revision_plan": {"actions": [{"id": "RP-01", "target_chapter_ids": [], "action_type": "补写/替换/删减/补材料/人工确认", "instruction": "", "priority": "high", "related_issue_ids": [], "blocking": True}], "summary": ""},
+        "summary": {"ready_to_export": False, "blocking_issues": 0, "warnings": 0, "blocking_issues_count": 0, "warnings_count": 0, "coverage_rate": 0, "blocking_summary": "", "next_actions": []},
+    }
+
+
+def get_consistency_revision_schema() -> Dict[str, Any]:
+    return {
+        "ready_for_export": False,
+        "issues": [
+            {"id": "ISS-01", "severity": "blocking | high | medium | low", "issue_type": "project_name | tenderer_name | bidder_name | date | service_period | schedule_commitment | historical_residue | hallucination | scope_error | missing_block | scoring_coverage | other", "chapter_id": "", "original_text": "", "problem": "", "fix_suggestion": ""}
+        ],
+        "coverage_check": [{"requirement_or_scoring_id": "", "covered": True, "chapter_ids": [], "comment": ""}],
+        "missing_blocks": [{"chapter_id": "", "block_name": "", "fix_suggestion": ""}],
+        "summary": {"blocking_count": 0, "high_count": 0, "can_export_after_auto_fix": False, "manual_data_needed": []},
+    }
+
+
+def generate_reference_bid_style_profile_prompt(reference_bid_text: str) -> Tuple[str, str]:
+    schema_json = _json(get_reference_bid_style_profile_schema(), indent=2)
+    system_prompt = f"""你是投标文件样例反向建模专家。你的任务不是总结内容，而是从成熟投标文件样例中提取可复用的生成规则。
+
+必须识别：文件范围、封面规则、目录层级、章节结构、正文风格、表格样式、承诺书样式、图文素材位置、企业资料依赖、图片素材依赖、质量风险。
+
+硬性要求：
+1. 只输出合法 JSON，不输出 markdown。
+2. 不要照抄样例正文，不要改写样例正文。
+3. 必须保留原始目录层级和特殊块类型。
+4. 对“应由企业资料提供”的内容标记 enterprise_required=true。
+5. 对“应由图片/附件素材库提供”的内容标记 asset_required=true。
+6. 如果样例中存在历史项目残留、日期不一致、投标人名称不一致、错别字、行业错配内容，写入 quality_risks，后续生成时应修正而不是照抄。
+7. 不得把样例所在行业固化为所有项目的默认行业；只提取风格与结构。
+
+JSON schema：
+{schema_json}
+"""
+    user_prompt = f"""请解析以下目标投标文件样例，生成 ReferenceBidStyleProfile JSON。
+
+<reference_bid_text>
+{reference_bid_text}
+</reference_bid_text>
+
+直接返回 JSON。"""
+    return system_prompt, user_prompt
+
+
+def generate_analysis_report_prompt(file_content: str) -> Tuple[str, str]:
+    schema_json = _json(get_analysis_report_schema(), indent=2)
+    rulebook = get_full_bid_rulebook()
+    system_prompt = f"""你是资深招标文件解析专家。你的任务是把招标文件解析为可供后续目录生成、正文生成、图表素材规划和合规审校复用的 AnalysisReport JSON。
+
+硬性要求：
+1. 只输出合法 JSON，不输出 markdown。
+2. 不得编造招标文件未出现的信息；缺失信息填空字符串、空数组或 null。
+3. 所有关键条目必须尽量填写 source 或 source_ref，写明章节名、条款号、页码、表格名或短原文。
+4. 对“★、*、▲、实质性要求、不允许偏离、废标、投标无效、否决投标、资格不通过、必须、不得、应当”等高风险内容必须单独提取。
+5. 对固定格式表单、签字盖章、报价文件、偏离表、承诺函、授权委托书、资格证明材料、暗标要求必须单独提取。
+6. 必须定位并解析招标文件中名称类似“投标文件”“投标文件格式”“投标文件的组成”“投标文件的编制”“投标文件格式要求”“技术方案/服务方案/施工组织设计/供货方案应包括”的章节；解析结果写入 bid_document_requirements，不能只写入普通说明。
+7. bid_document_requirements.composition 必须反映投标文件要求的章节顺序、必交/不适用/可选状态、固定格式、签字盖章、附件、报价相关、暗标敏感等属性。
+8. 如果方案类章节写有“应包括但不限于”或“服务纲要应包括”，必须逐项写入 bid_document_requirements.scheme_or_technical_outline_requirements，并作为后续技术/服务分册目录硬约束。
+9. 必须识别推荐输出范围 bid_mode_recommendation，可用值：full_bid、technical_only、technical_service_plan、service_plan、business_volume、qualification_volume、price_volume。不要只根据某个行业词判断，要根据招标文件要求、投标文件组成和用户目标推断。
+10. 完整投标文件格式要求、技术/服务方案要求、商务/资格/报价要求要分卷册识别；如果目标只是技术标，不要把商务、报价、资格强行放入技术目录，但要保留为 excluded_when_generating_technical_only、volume_rules 或审校信息。
+11. 评分项按 technical_scoring_items、business_scoring_items、price_scoring_items 分类；资格/形式/响应性评审单独分类。
+12. 报价规则、报价隔离、暗标、证据链、签章、固定格式、投标文件格式章节是高风险项，不得合并丢失。
+13. 为避免 JSON 截断，每个数组最多输出最关键 10 项；但 bid_document_requirements.composition 中的投标文件必备一级组成不得省略。
+14. 必须同步生成 response_matrix 初稿；如果条目很多，可覆盖高分值、高风险、阻塞项和投标文件格式硬约束。
 
 {rulebook}
 
-JSON 格式模板：
+JSON schema：
 {schema_json}
 """
+    user_prompt = f"""请解析以下招标文件内容，输出 AnalysisReport JSON。
 
-  user_prompt = f"""请解析以下招标文件内容，输出 AnalysisReport JSON：
-
-<tender_document>
+<tender_file_content>
 {file_content}
-</tender_document>
+</tender_file_content>
 
-直接返回 JSON，不要任何额外说明或格式标记。"""
-  return system_prompt, user_prompt
-
-
-def generate_response_matrix_prompt(analysis_report):
-  """基于 AnalysisReport 生成独立响应矩阵的提示词"""
-  schema_json = json.dumps(get_response_matrix_schema(), ensure_ascii=False, separators=(",", ":"))
-  analysis_report_json = json.dumps(analysis_report or {}, ensure_ascii=False, separators=(",", ":"))
-  rulebook = get_full_bid_rulebook()
-  system_prompt = f"""你是专业投标响应矩阵设计专家。你的任务是把已解析的 AnalysisReport 转换为 ResponseMatrix JSON。
-
-要求：
-1. 只输出合法 JSON，不输出 markdown 代码块，不输出解释文字。
-2. 只能使用传入的 AnalysisReport，不得重新解析、不得新增招标文件中不存在的评分项、审查项、材料项或风险项。
-3. 每个技术/商务/价格评分项、形式/资格/响应性评审项、实质性条款、废标风险、固定格式、签章、证据链、材料和报价隔离要求，都应至少形成一条矩阵或被合并说明。
-4. source_item_id 必须引用 AnalysisReport 中已有 ID；target_chapter_ids 可先引用建议章节或结构节点 ID，后续目录生成会再细化。
-5. priority=high 用于高分值、否决项、固定格式、签章、报价、暗标、资格硬条件和证据链要求；blocking=true 用于未覆盖会影响导出或可能否决投标的项目。
-6. uncovered_ids 初始包含尚未绑定具体正文的来源 ID；目录生成完成后可逐步缩减。
-7. 每条 requirement_summary 和 response_strategy 控制在 80 字以内。
-
-{rulebook}
-
-JSON 格式模板：
-{schema_json}
-"""
-  user_prompt = f"""请基于以下 AnalysisReport 生成 ResponseMatrix：
-
-<analysis_report>
-{analysis_report_json}
-</analysis_report>
-
-直接返回 JSON，不要任何额外说明或格式标记。"""
-  return system_prompt, user_prompt
+直接返回 JSON。"""
+    return system_prompt, user_prompt
 
 
-def generate_compliance_review_prompt(analysis_report, outline, project_overview="", response_matrix=None):
-  """生成导出前合规审校提示词"""
-  schema_json = json.dumps(get_review_report_schema(), ensure_ascii=False, indent=2)
-  analysis_report_json = json.dumps(analysis_report or {}, ensure_ascii=False, indent=2)
-  response_matrix_json = json.dumps(response_matrix or {}, ensure_ascii=False, indent=2)
-  outline_json = json.dumps(outline or [], ensure_ascii=False, indent=2)
-  rulebook = get_full_bid_rulebook()
-  system_prompt = f"""你是专业投标文件合规审校专家。你的任务是在 Word 导出前检查完整标书正文、表格内容、占位符、附件清单和目录映射是否覆盖评分项、审查项和风险点。
+def generate_response_matrix_prompt(analysis_report: Dict[str, Any], reference_bid_style_profile: Dict[str, Any] | None = None) -> Tuple[str, str]:
+    schema_json = _json(get_response_matrix_schema(), indent=2)
+    rulebook = get_full_bid_rulebook()
+    system_prompt = f"""你是投标响应矩阵规划专家。你的任务是把 AnalysisReport 转换为 ResponseMatrix JSON，并在有样例风格时吸收其结构习惯。
 
-要求：
-1. 只输出合法 ReviewReport JSON，不输出 markdown 代码块，不输出解释文字。
-2. 只能依据传入的 AnalysisReport、ResponseMatrix 和 outline_with_content 审校，不得另行推断新的评分项、审查项或材料项。
-3. coverage 检查 ResponseMatrix 和 AnalysisReport 中 bid_structure、formal_review_items、qualification_review_items、responsiveness_review_items、business_scoring_items、technical_scoring_items、price_scoring_items、qualification_requirements、formal_response_requirements、mandatory_clauses 是否被正文或目录覆盖。
-4. missing_materials 检查 required_materials 和 missing_company_materials 是否在相关章节中保留了明确占位或材料清单。
-5. rejection_risks 检查 rejection_risks 是否已有响应或规避说明。
-6. duplication_issues 检查明显重复章节或重复正文。
-7. fabrication_risks 检查疑似虚构企业名称、金额、日期、证书编号、业绩、人员、合同、发票、联系方式等风险。
-8. fixed_format_issues 检查固定格式表头、列名、固定文字、行列数量是否被改动或缺失。
-9. signature_issues 检查签字盖章位置、签署主体、盖章要求是否遗漏。
-10. price_rule_issues 检查报价方式、税率、小数位、唯一报价、算术修正、缺漏项处理、费用明细表格式要求；若价格文件要求单独成册或不得混入技术/商务文件，必须检查目录和正文是否隔离。
-11. evidence_chain_issues 检查业绩、人员、社保、发票、税务查验、信用截图、保证金凭证等证据链是否完整。
-12. page_reference_issues 检查索引表和响应页码；未最终排版时应使用〖页码待编排〗。
-13. 如 AnalysisReport 包含暗标、双盲或匿名要求，必须检查正文是否出现企业名称、人员姓名、业绩名称、联系方式、Logo、商标等身份识别信息。
-14. 若存在未覆盖评分项/评审项、未处理废标风险、固定格式被破坏、签章遗漏、报价规则不满足、价格文件未隔离、暗标身份泄露、证据链缺失或缺失证明材料未标注，summary.ready_to_export 必须为 false。
-15. 所有阻塞项 severity 使用 blocking 且 blocking=true；提示项 severity 使用 warning。
-16. 必须输出 blocking_issues、warnings 和 revision_plan。revision_plan 要把每个阻塞项转成可执行修订动作，写明目标章节、动作类型和修订指令。
-17. summary.blocking_issues、summary.blocking_issues_count、summary.warnings、summary.warnings_count 必须与问题列表数量保持一致；summary.coverage_rate 输出 0 到 100 的数字。
+目标：
+1. 确保每个评分项、资格项、形式项、响应性条款、实质性条款、废标风险、固定格式、签章要求、报价规则、证明材料都有对应响应策略。
+2. 必须把 AnalysisReport.bid_document_requirements.composition 与 scheme_or_technical_outline_requirements 纳入矩阵；这些条目是目录和正文生成的硬约束。
+3. 识别哪些内容可以生成正文，哪些必须填表，哪些必须附材料，哪些必须人工确认，哪些只允许出现在报价卷。
+4. 为后续目录、正文、图表块和审校提供强映射关系。
+
+硬性要求：
+1. 只输出合法 JSON。
+2. 不得新增 AnalysisReport 中不存在的强制条款 ID。
+3. 对 blocking=true 的风险必须给出响应章节建议和处理策略。
+4. 评分项 source_item_id 引用 T/B/P；评审/资格/形式/实质性条款引用 E/Q/F/C；风险引用 R；固定格式/签章/证据链/材料引用 FF/SIG/EV/M/X。
+5. 报价、金额、税率缺失时不得生成具体数值。
+6. 可根据 ReferenceBidStyleProfile 增加 profile_expansion 类型条目，但必须说明它是样例扩展，不得伪装为招标文件强制要求。
+7. 如果用户目标为 full_bid，composition 中 required=true 且 applicability != not_applicable 的项目必须有矩阵条目；如果用户目标为技术/服务分册，scheme_or_technical_outline_requirements 中 required=true 的项目必须有矩阵条目。
+8. 固定格式表单、签章、盖章、日期、附件、偏差表、报价表等格式项必须标记 response_method 为 fill_form/material_attachment/human_confirm 或在 response_strategy 中明确不得自由改写。
 
 {rulebook}
 
-JSON 格式模板：
+JSON schema：
 {schema_json}
 """
+    user_prompt = f"""请基于以下 AnalysisReport 和 ReferenceBidStyleProfile 生成 ResponseMatrix。
 
-  user_prompt = f"""请对以下标书内容进行导出前合规审校：
+<analysis_report_json>
+{_json(analysis_report or {}, indent=2)}
+</analysis_report_json>
 
-<project_overview>
-{project_overview or ""}
-</project_overview>
+<reference_bid_style_profile_json>
+{_json(reference_bid_style_profile or {}, indent=2)}
+</reference_bid_style_profile_json>
 
-<analysis_report>
-{analysis_report_json}
-</analysis_report>
-
-<response_matrix>
-{response_matrix_json}
-</response_matrix>
-
-<outline_with_content>
-{outline_json}
-</outline_with_content>
-
-直接返回 ReviewReport JSON，不要任何额外说明或格式标记。"""
-  return system_prompt, user_prompt
+直接返回 JSON。"""
+    return system_prompt, user_prompt
 
 
-def read_expand_outline_prompt():
-  '''从简版技术方案中提取目录的提示词'''
-  system_prompt = """你是一个专业的标书解析与编制专家，当前任务是从用户提交的简版技术方案中提取并重建目录结构。
+def generate_level1_outline_prompt(
+    overview: str,
+    requirements: str,
+    analysis_report: Dict[str, Any] | None,
+    bid_mode: str | None,
+    schema_json: str,
+    reference_bid_style_profile: Dict[str, Any] | None = None,
+    document_blocks_plan: Dict[str, Any] | None = None,
+) -> Tuple[str, str]:
+    report = analysis_report or {}
+    response_matrix = report.get("response_matrix") or {}
+    rulebook = get_full_bid_rulebook()
+    service_template = _json(get_generic_service_plan_outline_template(), indent=2)
+    system_prompt = f"""你是资深投标文件目录规划专家。你的任务是根据 AnalysisReport、ResponseMatrix、用户目标和可选样例风格，生成一级目录 JSON。
 
-  当前阶段只允许从用户提交的简版技术方案中提取或重建目录 JSON。
-  如上游已生成标准解析报告，目录必须复用该报告，不得在本阶段重新解释出新的评分项、审查项、材料项或风险项。
-  只有当用户明确下达“开始生成标书”指令时，才进入正文生成阶段。
+硬性要求：
+1. 只输出合法 JSON，不输出 markdown。
+2. 不得重新解析招标文件；只能使用传入的 AnalysisReport 和 ResponseMatrix。
+3. 目录必须服从 bid_document_requirements、volume_rules、bid_structure、报价隔离、暗标/匿名和固定格式要求；其中 bid_document_requirements 的优先级最高。
+4. 如果输出范围是 technical_only、technical_service_plan 或 service_plan，不得生成完整投标文件中的投标函、报价、保证金、资格审查资料等正文卷册；但必须严格覆盖 bid_document_requirements.scheme_or_technical_outline_requirements 中列明的技术/服务/实施方案子项，并把排除的完整投标文件章节写入描述或 coverage_summary。
+5. 如果输出范围是 full_bid，必须按 bid_document_requirements.composition 的顺序覆盖投标函、授权/身份证明、联合体协议、保证金、报价、资格审查资料、技术/服务/实施方案、其他资料、偏差表等必要卷册；不适用项不得删除风险说明，应按招标文件写“不适用”或设置为 not_applicable。
+6. 如果有 ReferenceBidStyleProfile，应优先吸收其目录层级、标题风格、表格/承诺/图片位置；但不得机械照抄行业特定内容、历史项目残留，也不得覆盖 bid_document_requirements。
+7. 每个一级节点必须包含：id、volume_id、title、chapter_type、description、fixed_format_sensitive、price_sensitive、anonymity_sensitive、expected_word_count、scoring_item_ids、requirement_ids、risk_ids、material_ids、response_matrix_ids、children。
+8. scoring_item_ids 只能放 T/B/P；requirement_ids 放 E/Q/F/C；risk_ids 放 R；material_ids 放 M/X/EV/FF/SIG。
+9. 分值高、阻塞风险高、证据链复杂的章节应有更高 expected_word_count 和更细 children。
+10. 目录标题应优先采用招标文件“投标文件/投标文件格式”中的章节名称；只有在招标文件允许自拟或仅给出参考纲要时，才可按样例风格优化标题。
+11. 不生成正文。
 
-  当前任务只做“目录提取/目录重建”，不要生成正文，不要输出解析报告。
+通用服务/技术方案保底目录参考，仅在招标文件适合服务/技术方案分册且无更明确格式时参考：
+{service_template}
 
-  要求：
-  1. 目录结构要全面覆盖原技术方案已经体现出的全部必要章节，允许输出多级目录
-  2. 如果技术方案中已经存在明确章节名称，优先保留原章节名称
-  3. 如果技术方案中没有明确章节名称，则结合全文内容，提炼出专业、规范、可用于正式投标文件的章节名称
-  4. 目录应服务于后续正式标书生成，因此 description 不能空泛，要写清“本章节要写什么、解决什么问题、需插入什么材料或证明”
-  5. 如果原文明显只包含技术标内容，则输出技术标目录；如果原文明显包含商务、资格、技术混合结构，则按实际结构重建完整目录
-  6. 对表格类、函件类、承诺类、证明材料类章节，也必须建立相应目录节点，不能只保留方案型章节
-  7. 返回标准 JSON 格式，包含章节编号、标题、描述和子章节，编号必须连贯
-  8. 除了 JSON 结果外，不要输出任何其他内容，不要输出 markdown 代码块，不要输出解析过程
+{rulebook}
 
-  JSON格式要求：
-  {
-    "outline": [
-      {
-        "id": "1",
-        "title": "",
-        "description": "",
-        "children": [
-          {
-            "id": "1.1",
-            "title": "",
-            "description": "",
-            "children":[
-                {
-                  "id": "1.1.1",
-                  "title": "",
-                  "description": ""
-                }
-            ]
-          }
-        ]
-      }
-    ]
-  }
-  """
-  return system_prompt
-  
-def generate_outline_prompt(overview, requirements):
-  system_prompt = """你是一个专业的标书解析与编制专家，尤其适配本地 DeepSeek 类大模型。根据提供的项目概述和评分要求，生成投标文件目录结构。
+输出 JSON schema：
+{schema_json}
+"""
+    user_prompt = f"""请生成一级目录 JSON。允许每个一级目录直接携带 children；如果有成熟样例目录，请在符合招标文件的前提下吸收其结构。
 
-  当前阶段只允许输出目录 JSON。
-  如上游已生成标准解析报告，目录必须复用该报告，不得在本阶段重新解释出新的评分项、审查项、材料项或风险项。
-  等企业资料补齐后，只有在用户明确说“开始生成标书”时，才进入正文生成阶段。
+<overview>{overview}</overview>
+<requirements>{requirements}</requirements>
+<bid_mode>{bid_mode or report.get('bid_mode_recommendation') or ''}</bid_mode>
+<analysis_report_json>{_json(report, indent=2)}</analysis_report_json>
+<response_matrix_json>{_json(response_matrix, indent=2)}</response_matrix_json>
+<reference_bid_style_profile_json>{_json(reference_bid_style_profile or report.get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile_json>
+<document_blocks_plan_json>{_json(document_blocks_plan or report.get('document_blocks_plan') or {}, indent=2)}</document_blocks_plan_json>
 
-  当前任务只执行到“生成目录”，绝对不能提前生成正文。
-
-  要求：
-  1. 目录结构要全面覆盖当前输入能够支持的全部必要章节
-  2. 若当前输入仅体现技术评分要求，则生成技术标目录；若输入已明显包含商务、资格、报价、形式评审或完整招标结构要求，则生成完整投标文件目录
-  3. 章节名称要专业、准确，符合正式投标文件规范，不得口语化
-  4. 一级目录应优先对应评分要求或招标文件明确要求；如评分要求只有内容没有标题，应转写成正式目录标题
-  5. 一共包括三级目录
-  6. 每个 description 要写明该章节的核心写作内容、对应评分点/审查点、拟附证明材料或支撑内容
-  7. 目录应能支撑后续“开始生成标书”后的正式章节内容生成，不能只写空泛题目
-  8. 返回标准 JSON 格式，包含章节编号、标题、描述和子章节
-  9. 除了 JSON 结果外，不要输出任何其他内容，不要输出 markdown 代码块，不要输出解析报告
-
-  JSON格式要求：
-  {
-    "outline": [
-      {
-        "id": "1",
-        "title": "",
-        "description": "",
-        "children": [
-          {
-            "id": "1.1",
-            "title": "",
-            "description": "",
-            "children":[
-                {
-                  "id": "1.1.1",
-                  "title": "",
-                  "description": ""
-                }
-            ]
-          }
-        ]
-      }
-    ]
-  }
-  """
-              
-  user_prompt = f"""请基于以下项目信息生成标书目录结构：
-
-  项目概述：
-  {overview}
-
-  技术评分要求：
-  {requirements}
-
-  请直接输出目录 JSON。
-  当前只到“生成目录”这个阶段，不要开始生成标书正文。"""
-  return system_prompt, user_prompt
+直接返回 JSON 对象或 JSON 数组。"""
+    return system_prompt, user_prompt
 
 
-  
-def generate_outline_with_old_prompt(overview, requirements, old_outline):
-  system_prompt = """你是一个专业的标书解析与编制专家，尤其适配本地 DeepSeek 类大模型。根据提供的项目概述、评分要求和用户已有目录，生成投标文件目录结构。
-  用户会提供一个自己编写的目录，你要在充分吸收该目录的基础上，校正缺漏，确保最终目录满足评分要求和正式投标文件要求。
+def generate_level23_outline_prompt(
+    current_outline_json: Dict[str, Any],
+    other_outline: str,
+    overview: str,
+    requirements: str,
+    analysis_report: Dict[str, Any] | None,
+    bid_mode: str | None,
+    response_matrix: Dict[str, Any] | None,
+    reference_bid_style_profile: Dict[str, Any] | None = None,
+    document_blocks_plan: Dict[str, Any] | None = None,
+) -> Tuple[str, str]:
+    schema_json = _json(current_outline_json, indent=2)
+    rulebook = get_full_bid_rulebook()
+    system_prompt = f"""你是标书二三级目录设计专家。当前阶段只补全当前一级章节的 children、description、映射字段和预期内容块，不生成正文。
 
-  当前阶段只允许输出目录 JSON。
-  如上游已生成标准解析报告，目录必须复用该报告，不得在本阶段重新解释出新的评分项、审查项、材料项或风险项。
-  等企业资料补齐后，只有在用户明确说“开始生成标书”时，才进入正文生成阶段。
+硬性要求：
+1. 禁止修改当前一级章节 id、title、volume_id、chapter_type。
+2. 不得新增 AnalysisReport 和 ResponseMatrix 中不存在的强制条款 ID。
+3. 如果当前一级章节在 bid_document_requirements.composition 或 scheme_or_technical_outline_requirements 中有对应要求，二三级目录必须覆盖这些要求；不得因为样例目录不同而漏项。
+4. 如果当前一级章节已有成熟样例 children，应优先保留其合理结构；但必须修正行业错配、历史项目残留和与招标文件冲突的内容。
+5. 价格敏感内容只能出现在允许价格的卷册；暗标章节不得设计暴露投标人身份的标题或素材位。
+6. 证明材料类章节应设计“材料清单、证明用途、核验要点、页码索引”。
+7. 技术/服务/实施方案类章节应按评分标准拆成“理解、方法、流程、组织、进度、质量、安全、风险、成果、保障”中最合适的结构。
+8. 固定格式表单类章节只能设计填报项和核验项，不得改动表头、列名和固定文字。
+9. 对招标文件写明“应包括但不限于”的方案纲要，必须逐项拆出二级或三级节点，或在 description 中说明由哪个节点覆盖。
+10. description 要写清本节点要写什么、响应哪些评分项、需要哪些表格/承诺/图片/企业资料。
 
-  当前任务只执行到“生成目录”，不要生成正文。
+{rulebook}
 
-  要求：
-  1. 尽量保留用户已有目录中合理、专业、可复用的章节名称和层级结构
-  2. 对缺失的评分点、审查点、证明材料章节必须补齐
-  3. 若当前输入仅体现技术评分要求，则生成技术标目录；若输入已明显包含商务、资格、报价、形式评审或完整招标结构要求，则生成完整投标文件目录
-  4. 章节名称要专业、准确，符合投标文件规范
-  5. 一共包括三级目录
-  6. 每个 description 要写清章节用途、对应审查点/评分点、拟附材料或写作重点
-  7. 返回标准 JSON 格式，包含章节编号、标题、描述和子章节
-  8. 除了 JSON 结果外，不要输出任何其他内容，不要输出 markdown 代码块，不要输出解析报告
+输出 JSON schema：
+{schema_json}
+"""
+    user_prompt = f"""请补全当前一级章节的二级、三级目录。
 
-  JSON格式要求：
-  {
-    "outline": [
-      {
-        "id": "1",
-        "title": "",
-        "description": "",
-        "children": [
-          {
-            "id": "1.1",
-            "title": "",
-            "description": "",
-            "children":[
-                {
-                  "id": "1.1.1",
-                  "title": "",
-                  "description": ""
-                }
-            ]
-          }
-        ]
-      }
-    ]
-  }
-  """
-              
-  user_prompt = f"""请基于以下项目信息生成标书目录结构：
-  用户自己编写的目录：
-  {old_outline}
+<current_level1_node>{_json(current_outline_json, indent=2)}</current_level1_node>
+<other_outline>{other_outline}</other_outline>
+<overview>{overview}</overview>
+<requirements>{requirements}</requirements>
+<bid_mode>{bid_mode or ''}</bid_mode>
+<analysis_report_json>{_json(analysis_report or {}, indent=2)}</analysis_report_json>
+<response_matrix_json>{_json(response_matrix or {}, indent=2)}</response_matrix_json>
+<reference_bid_style_profile_json>{_json(reference_bid_style_profile or (analysis_report or {}).get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile_json>
+<document_blocks_plan_json>{_json(document_blocks_plan or (analysis_report or {}).get('document_blocks_plan') or {}, indent=2)}</document_blocks_plan_json>
 
-  项目概述：
-  {overview}
+直接返回 JSON。"""
+    return system_prompt, user_prompt
 
-  技术评分要求：
-  {requirements}
 
-  请结合用户目录输出最终目录 JSON。
-  当前只到“生成目录”这个阶段，不要开始生成标书正文。"""
-  return system_prompt, user_prompt
+def generate_document_blocks_prompt(
+    analysis_report: Dict[str, Any] | None,
+    outline: List[Dict[str, Any]] | Dict[str, Any],
+    response_matrix: Dict[str, Any] | None = None,
+    reference_bid_style_profile: Dict[str, Any] | None = None,
+    enterprise_materials: List[Dict[str, Any]] | None = None,
+    asset_library: List[Dict[str, Any]] | Dict[str, Any] | None = None,
+) -> Tuple[str, str]:
+    schema_json = _json(get_document_blocks_schema(), indent=2)
+    system_prompt = f"""你是技术标图表与素材规划专家。你的任务是根据目录、响应矩阵和样例风格，规划每个章节应插入的表格、流程图、组织架构图、图片、承诺书、证明材料或页码占位。
+
+硬性要求：
+1. 只输出合法 JSON。
+2. 不得编造图片、证书、截图、人员、设备、软件或案例；没有素材时输出 placeholder。
+3. 如素材库有匹配图片或附件，输出 asset_id；没有则输出 fallback placeholder。
+4. 表格必须给出表名、列名、行生成规则和数据来源。
+5. 承诺书必须给出致函对象、承诺事项、署名变量、日期变量。
+6. 组织机构图、流程图可以输出结构化 nodes/edges，由后端渲染或人工替换。
+7. Word 目录页码不得由模型生成，应由 Word 自动更新。
+
+JSON schema：
+{schema_json}
+"""
+    user_prompt = f"""请输出图表与素材规划 JSON。
+
+<analysis_report_json>{_json(analysis_report or {}, indent=2)}</analysis_report_json>
+<response_matrix_json>{_json(response_matrix or (analysis_report or {}).get('response_matrix') or {}, indent=2)}</response_matrix_json>
+<reference_bid_style_profile_json>{_json(reference_bid_style_profile or (analysis_report or {}).get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile_json>
+<outline_json>{_json(outline or [], indent=2)}</outline_json>
+<enterprise_materials_json>{_json(enterprise_materials or [], indent=2)}</enterprise_materials_json>
+<asset_library_json>{_json(asset_library or [], indent=2)}</asset_library_json>
+
+直接返回 JSON。"""
+    return system_prompt, user_prompt
+
+
+def generate_chapter_content_prompt(
+    chapter: Dict[str, Any],
+    parent_chapters: List[Dict[str, Any]] | None,
+    sibling_chapters: List[Dict[str, Any]] | None,
+    project_overview: str,
+    analysis_report: Dict[str, Any] | None = None,
+    bid_mode: str | None = None,
+    generated_summaries: List[Dict[str, Any]] | None = None,
+    enterprise_materials: List[Dict[str, Any]] | None = None,
+    missing_materials: List[Dict[str, Any]] | None = None,
+    response_matrix: Dict[str, Any] | None = None,
+    reference_bid_style_profile: Dict[str, Any] | None = None,
+    document_blocks_plan: Dict[str, Any] | None = None,
+    bidder_name: str = "{bidder_name}",
+    bid_date: str = "{bid_date}",
+) -> Tuple[str, str]:
+    report = analysis_report or {}
+    project = report.get("project") or {}
+    response_matrix = response_matrix or report.get("response_matrix") or {}
+    rulebook = get_full_bid_rulebook()
+    system_prompt = f"""你是资深投标文件编制专家。你的任务是为当前叶子章节生成可直接放入投标文件的正文。
+
+硬性规则：
+1. 只输出当前章节正文，不输出章节标题。
+2. 不输出 markdown 代码块，不输出 AI 自述，不解释生成过程。
+3. 不得重新解析招标文件；只能使用传入的 AnalysisReport、ResponseMatrix、目录节点、样例风格、图表规划和企业资料。
+4. 不得编造企业资质、人员姓名、证书编号、电话号码、软件清单、设备数量、项目业绩、图片、日期、金额、报价或税率。
+5. 凡企业资料缺失，必须使用：〖待补充：资料名称〗、〖待确认：事项〗、〖待提供扫描件：资料名称〗、〖插入图片：图片名称〗。
+6. 正式投标文件语气，主体称谓默认使用“我公司”；如暗标要求禁止身份识别，则不得出现投标人名称、人员姓名、联系方式、Logo、商标、可识别案例名。
+7. 当前项目必须围绕 AnalysisReport.project.name 展开，不得写成其他项目；历史项目名称、历史日期不得残留。
+8. 涉及服务范围、供货范围、施工范围、交付内容、服务期限、工期、质量要求、响应时限时，必须准确引用 AnalysisReport 中的招标要求；没有明确要求时写 〖以招标文件要求为准〗。
+9. 涉及进度、工期、交付周期、响应时限时，只能使用 AnalysisReport 中提取的期限或当前章节映射的 C/SCH/RM 条目；不得套用历史样例中的天数。
+10. 涉及质量承诺时，应覆盖法律法规、行业标准、招标人要求、过程质量控制、验收整改、违约责任；如招标文件没有违约责任要求，应写为按合同约定承担责任。
+11. 涉及沟通协调时，可写定期沟通、即时沟通、书面沟通、会议纪要、问题闭环、响应升级；具体联系人和电话缺失时必须占位。
+12. 涉及组织机构时，输出组织架构图占位或结构化职责说明；人员姓名、证书、履历缺失时占位。
+13. 涉及设备、软件、产品、备品备件、仪器、车辆、平台时，必须依据企业资料或资源库；缺失时用表格占位，不得虚构品牌、数量、型号。
+14. 涉及图片、证书、截图、效果图、系统截图、案例展示时，先写展示目的和插入位置，再输出图片占位；不得假装已有图片。
+15. 当前章节如对应 bid_document_requirements.composition 或 fixed_forms，必须严格按该要求写作；固定格式表单、承诺函、偏离表、报价表等章节不得改表头、列名、固定文字和行列结构。
+16. 当前章节如属于技术/服务/实施方案，应逐项覆盖 bid_document_requirements.scheme_or_technical_outline_requirements 中映射到本章节的要点；不得只按历史样例自由扩写。
+17. 当前章节如未被招标文件“投标文件/投标文件格式”要求，但来自样例 profile_expansion，必须确保不与招标文件目录、评分项、卷册隔离和固定格式冲突。
+18. 正文中不得写死页码。
+17. 与同级章节不得重复；同级已覆盖的内容，本节只深化、引用或建立索引。
+
+写作风格：
+1. 使用“目标—措施—流程—保障—承诺”的结构。
+2. 多用 1）、2）、3）；a）、b）、c）分点结构。
+3. 内容要具体，避免只写口号。
+4. 高分章节、阻塞风险章节、证据链章节写得更细；低风险说明性章节简洁准确。
+
+{rulebook}
+"""
+    user_prompt = f"""请生成当前章节正文。
+
+<project_variables>
+{_json({
+    "project_name": project.get("name") or "{project_name}",
+    "tenderer_name": project.get("purchaser") or "{tenderer_name}",
+    "bidder_name": bidder_name,
+    "bid_date": bid_date,
+    "service_scope": project.get("service_scope", ""),
+    "service_period": project.get("service_period", ""),
+    "service_location": project.get("service_location", ""),
+    "quality_requirements": project.get("quality_requirements", ""),
+}, indent=2)}
+</project_variables>
+<bid_mode>{bid_mode or report.get('bid_mode_recommendation') or ''}</bid_mode>
+<current_chapter>{_json(chapter or {}, indent=2)}</current_chapter>
+<parent_chapters>{_json(parent_chapters or [], indent=2)}</parent_chapters>
+<sibling_chapters>{_json(sibling_chapters or [], indent=2)}</sibling_chapters>
+<generated_summaries>{_json(generated_summaries or [], indent=2)}</generated_summaries>
+<project_overview>{project_overview}</project_overview>
+<analysis_report>{_json(report, indent=2)}</analysis_report>
+<response_matrix>{_json(response_matrix, indent=2)}</response_matrix>
+<reference_bid_style_profile>{_json(reference_bid_style_profile or report.get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile>
+<document_blocks_plan>{_json(document_blocks_plan or report.get('document_blocks_plan') or {}, indent=2)}</document_blocks_plan>
+<enterprise_materials>{_json(enterprise_materials or [], indent=2)}</enterprise_materials>
+<missing_materials>{_json(missing_materials or report.get('missing_company_materials') or [], indent=2)}</missing_materials>
+
+直接输出当前章节正文，不要输出标题。"""
+    return system_prompt, user_prompt
+
+
+def generate_compliance_review_prompt(
+    analysis_report: Dict[str, Any],
+    outline: List[Dict[str, Any]],
+    project_overview: str = "",
+    response_matrix: Dict[str, Any] | None = None,
+    reference_bid_style_profile: Dict[str, Any] | None = None,
+    document_blocks_plan: Dict[str, Any] | None = None,
+) -> Tuple[str, str]:
+    schema_json = _json(get_review_report_schema(), indent=2)
+    rulebook = get_full_bid_rulebook()
+    system_prompt = f"""你是投标文件导出前合规审校专家。你的任务是在 Word 导出前，对完整正文、表格、占位符、附件清单、图表素材、目录映射进行覆盖、格式、材料、报价隔离、暗标、日期一致性、历史残留和虚构风险检查。
+
+必须检查：
+1. 项目名称、招标人、投标人、日期、服务期限/工期/交付期是否统一；不得出现历史项目名称、历史招标人或历史日期。
+2. 输出范围是否正确：technical_only/service_plan 不得混入报价、保证金、投标函、资格审查资料正文；full_bid 则不得遗漏招标文件要求的完整卷册。
+3. 是否严格遵守 AnalysisReport.bid_document_requirements：full_bid 要检查 composition 顺序与必备章节，技术/服务分册要检查 scheme_or_technical_outline_requirements 全覆盖，固定格式要检查表头、固定文字、签章栏和附件要求。
+4. ResponseMatrix 和 AnalysisReport 中的评分项、审查项、实质性条款、材料项、风险项是否覆盖.
+4. 招标文件要求的方案目录、承诺书、表格、证明材料、固定格式、签章、报价隔离、暗标规则是否满足。
+5. 企业资料缺失是否保留明确占位；是否把缺失资料写成已具备。
+6. 图表与素材规划中的必需表格、组织图、流程图、承诺书、图片/证书/截图占位是否存在。
+7. 页码、附件索引、响应页码是否使用 〖页码待编排〗 或等待 Word 自动更新。
+
+硬性要求：
+1. 只输出合法 ReviewReport JSON，不输出 markdown。
+2. 只能依据传入 AnalysisReport、ResponseMatrix、ReferenceBidStyleProfile、document_blocks_plan 和 outline_with_content 审校，不得新增招标要求。
+3. blocking=true 的废标风险、实质性条款、固定格式、签章、报价隔离、暗标身份泄露、企业资料虚构未处理时，summary.ready_to_export=false。
+4. 发现历史残留日期、项目名称、招标人名称，severity=blocking 或 high，并写入 blocking_issues 或 warnings。
+5. revision_plan 必须给出可执行修订动作。
+
+{rulebook}
+
+JSON schema：
+{schema_json}
+"""
+    user_prompt = f"""请对以下标书内容进行导出前合规审校。
+
+<project_overview>{project_overview or ''}</project_overview>
+<analysis_report>{_json(analysis_report or {}, indent=2)}</analysis_report>
+<response_matrix>{_json(response_matrix or (analysis_report or {}).get('response_matrix') or {}, indent=2)}</response_matrix>
+<reference_bid_style_profile>{_json(reference_bid_style_profile or (analysis_report or {}).get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile>
+<document_blocks_plan>{_json(document_blocks_plan or (analysis_report or {}).get('document_blocks_plan') or {}, indent=2)}</document_blocks_plan>
+<outline_with_content>{_json(outline or [], indent=2)}</outline_with_content>
+
+直接返回 ReviewReport JSON。"""
+    return system_prompt, user_prompt
+
+
+def generate_consistency_revision_prompt(
+    analysis_report: Dict[str, Any] | None,
+    full_bid_draft: Dict[str, Any] | List[Dict[str, Any]],
+    response_matrix: Dict[str, Any] | None = None,
+    reference_bid_style_profile: Dict[str, Any] | None = None,
+    document_blocks_plan: Dict[str, Any] | None = None,
+) -> Tuple[str, str]:
+    schema_json = _json(get_consistency_revision_schema(), indent=2)
+    system_prompt = f"""你是投标文件全文一致性修订专家。你的任务是在 Word 导出前检查全文一致性，只输出问题和修订建议，不直接改写全文。
+
+检查范围：项目名称、招标人、投标人、日期、服务期限/工期/交付期、承诺周期、历史项目残留、行业错配、企业资料虚构、输出范围错误、缺少图表/承诺/素材块、评分项覆盖、投标文件格式章节/组成要求是否被遵守。
+
+硬性要求：
+1. 只输出合法 JSON。
+2. 不要直接改写全文，只输出问题和修订建议。
+3. 发现历史残留内容，severity 至少为 high。
+4. 发现日期、项目名称、招标人不一致，severity 至少为 high。
+5. 发现服务期限/工期/交付期承诺与招标文件不一致，severity=blocking。
+6. 发现企业资料虚构，severity=blocking。
+7. 发现输出范围是技术/服务方案却出现报价、保证金、投标函正文，severity=high 或 blocking。
+
+JSON schema：
+{schema_json}
+"""
+    user_prompt = f"""请输出全文一致性修订报告。
+
+<analysis_report>{_json(analysis_report or {}, indent=2)}</analysis_report>
+<response_matrix>{_json(response_matrix or (analysis_report or {}).get('response_matrix') or {}, indent=2)}</response_matrix>
+<reference_bid_style_profile>{_json(reference_bid_style_profile or (analysis_report or {}).get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile>
+<document_blocks_plan>{_json(document_blocks_plan or (analysis_report or {}).get('document_blocks_plan') or {}, indent=2)}</document_blocks_plan>
+<full_bid_draft>{_json(full_bid_draft or {}, indent=2)}</full_bid_draft>
+
+直接返回 JSON。"""
+    return system_prompt, user_prompt
+
+
+def read_expand_outline_prompt() -> str:
+    template = _json(get_generic_service_plan_outline_template(), indent=2)
+    return f"""你是投标文件样例反向建模专家。当前任务是从用户提交的简版技术方案、历史投标文件或样例文件中提取并重建目录结构。
+
+当前阶段只允许输出目录 JSON，不生成正文，不输出解析过程。
+如果文本存在明确章节名称，优先保留；如果没有明确章节名称，提炼专业、规范、可用于正式投标文件的章节名称。
+对表格类、函件类、承诺类、证明材料类、图片展示类章节必须建立目录节点。
+不得把样例行业固化为所有项目默认行业；只抽取目录结构和风格。若文本中包含“投标文件/投标文件格式/投标文件组成/编制要求”，必须优先抽取这些硬约束章节。
+
+通用服务/技术方案目录参考：
+{template}
+
+返回 JSON：{{"outline": [...]}}，不要 markdown。"""
+
+
+def generate_outline_prompt(overview: str, requirements: str) -> Tuple[str, str]:
+    schema = {"outline": get_generic_service_plan_outline_template()}
+    system_prompt = f"""你是通用投标文件目录生成专家。当前只生成目录 JSON，不生成正文。
+根据输入判断是完整投标文件、技术标、服务方案、施工组织设计、供货方案、资格卷还是报价卷；如果输入包含投标文件格式/组成要求，目录必须优先遵守；不得强行套用某个行业模板。
+JSON 格式参考：{_json(schema)}"""
+    user_prompt = f"""请基于以下项目信息生成标书目录结构：
+项目概述：{overview}
+技术/服务/评分要求：{requirements}
+请直接输出目录 JSON。"""
+    return system_prompt, user_prompt
+
+
+def generate_outline_with_old_prompt(overview: str, requirements: str, old_outline: str) -> Tuple[str, str]:
+    system_prompt = """你是通用投标文件目录校正专家。当前只生成目录 JSON，不生成正文。
+你需要充分吸收用户已有目录，补齐评分项、审查项、证明材料、表格、承诺书和图表素材节点；不得强行套用某个行业模板。"""
+    user_prompt = f"""用户已有目录：{old_outline}
+项目概述：{overview}
+技术/服务/评分要求：{requirements}
+请结合用户目录输出最终目录 JSON。"""
+    return system_prompt, user_prompt
