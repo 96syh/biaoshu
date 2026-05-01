@@ -472,6 +472,7 @@ export interface AppState {
   currentStep: number;
   config: ConfigData;
   fileContent: string;
+  uploadedFileName?: string;
   projectOverview: string;
   techRequirements: string;
   analysisReport?: AnalysisReport;

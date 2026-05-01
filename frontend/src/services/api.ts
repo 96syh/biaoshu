@@ -35,6 +35,10 @@ const getDefaultApiBaseUrl = () => {
       return 'http://127.0.0.1:8000';
     }
 
+    if (isLocalDevHost && window.location.port === '3010') {
+      return 'http://127.0.0.1:8010';
+    }
+
     return window.location.origin;
   }
 
@@ -70,6 +74,7 @@ export interface FileUploadResponse {
   message: string;
   file_content?: string;
   old_outline?: string;
+  parser_info?: Record<string, unknown>;
   reference_bid_style_profile?: Record<string, unknown>;
   document_blocks_plan?: Record<string, unknown>;
 }
@@ -109,6 +114,7 @@ export interface AnalysisReportRequest {
 export interface OutlineRequest {
   overview: string;
   requirements: string;
+  file_content?: string;
   uploaded_expand?: boolean;
   old_outline?: string;
   old_document?: string;

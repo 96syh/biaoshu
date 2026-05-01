@@ -1,6 +1,6 @@
 """文档处理相关API路由"""
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from ..models.schemas import (
     AnalysisReportRequest,
     AnalysisRequest,
@@ -25,8 +25,17 @@ from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from urllib.parse import quote
+from pathlib import Path
 
 router = APIRouter(prefix="/api/document", tags=["文档处理"])
+
+
+def sanitize_docx_filename(filename: str) -> str:
+    """清理保存到本地文件系统的 docx 文件名。"""
+    safe = re.sub(r'[\\/:*?"<>|\r\n]+', "_", filename or "标书文档.docx").strip()
+    if not safe.lower().endswith(".docx"):
+        safe = f"{safe}.docx"
+    return safe or "标书文档.docx"
 
 
 def set_run_font_simsun(run: docx.text.run.Run) -> None:
@@ -55,12 +64,17 @@ async def upload_file(file: UploadFile = File(...)):
             )
         
         # 处理文件并提取文本
-        file_content = await FileService.process_uploaded_file(file)
+        parse_result = await FileService.process_uploaded_file_with_metadata(file)
+        file_content = parse_result.get("file_content", "")
+        parser_info = parse_result.get("parser_info", {})
+        parser_name = parser_info.get("parser") or "unknown"
+        fallback_note = "（已降级到内置解析器）" if parser_info.get("fallback_used") else ""
         
         return FileUploadResponse(
             success=True,
-            message=f"文件 {file.filename} 上传成功",
-            file_content=file_content
+            message=f"文件 {file.filename} 上传成功，解析器：{parser_name}{fallback_note}",
+            file_content=file_content,
+            parser_info=parser_info,
         )
         
     except Exception as e:
@@ -701,6 +715,22 @@ async def export_word(request: WordExportRequest):
         buffer.seek(0)
 
         filename = f"{request.project_name or '标书文档'}.docx"
+        if request.export_dir:
+            export_dir = Path(request.export_dir).expanduser()
+            export_dir.mkdir(parents=True, exist_ok=True)
+            if not export_dir.is_dir():
+                raise RuntimeError(f"保存路径不是目录：{export_dir}")
+
+            safe_filename = sanitize_docx_filename(filename)
+            output_path = export_dir / safe_filename
+            output_path.write_bytes(buffer.getvalue())
+            return JSONResponse({
+                "success": True,
+                "message": "Word 文件已保存到指定目录",
+                "file_path": str(output_path),
+                "filename": safe_filename,
+            })
+
         # 使用 RFC 5987 格式对文件名进行 URL 编码，避免非 ASCII 字符导致的编码错误
         encoded_filename = quote(filename)
         content_disposition = f"attachment; filename*=UTF-8''{encoded_filename}"

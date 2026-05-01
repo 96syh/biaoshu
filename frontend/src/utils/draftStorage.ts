@@ -17,6 +17,7 @@ export type DraftState = Pick<
   AppState,
   | 'currentStep'
   | 'fileContent'
+  | 'uploadedFileName'
   | 'projectOverview'
   | 'techRequirements'
   | 'analysisReport'
@@ -45,9 +46,20 @@ const safeJsonParse = <T,>(raw: string | null): T | null => {
   }
 };
 
+const isGeneratedMediaTitle = (value?: string) =>
+  /-{2,}\s*media\/image\d+\.(png|jpg|jpeg|gif|webp)\s*-{2,}/i.test((value || '').trim());
+
+const cleanTitle = (value?: string) => {
+  const title = (value || '').trim();
+  if (!title || isGeneratedMediaTitle(title)) return '';
+  return title;
+};
+
 const draftTitle = (draft: Partial<DraftState>) =>
-  draft.outlineData?.project_name
-  || draft.analysisReport?.project?.name
+  cleanTitle(draft.outlineData?.project_name)
+  || cleanTitle(draft.analysisReport?.project?.name)
+  || cleanTitle(draft.uploadedFileName)
+  || cleanTitle(draft.analysisReport?.project?.number)
   || '未命名标书';
 
 const draftStats = (draft: Partial<DraftState>) => {

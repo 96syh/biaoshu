@@ -25,8 +25,12 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3003",
         "http://localhost:3004", 
         "http://127.0.0.1:3004",
+        "http://localhost:3010",
+        "http://127.0.0.1:3010",
         "http://localhost:8000",
-        "http://127.0.0.1:8000"
+        "http://127.0.0.1:8000",
+        "http://localhost:8010",
+        "http://127.0.0.1:8010"
     ]
     
     # 文件上传设置

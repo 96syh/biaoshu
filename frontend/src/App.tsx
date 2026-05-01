@@ -55,7 +55,29 @@ type ProgressState = {
 };
 type GenerationControlState = 'idle' | 'running' | 'paused' | 'stopped';
 type DraftOutlineRow = { id: string; title: string; level: number; status: string };
+type OutlineEditorForm = { id: string; title: string; description: string };
 type ProjectSummary = Partial<AnalysisReport['project']> & { __fallback?: boolean };
+type TenderParseTabKey = 'basic' | 'qualification' | 'technical' | 'business' | 'other' | 'risk' | 'document' | 'process' | 'supplement';
+type TenderParseSection = {
+  id: string;
+  title: string;
+  content: string[];
+  evidence: string[];
+  count: number;
+};
+type TenderParseTab = {
+  key: TenderParseTabKey;
+  label: string;
+  sections: TenderParseSection[];
+};
+type TenderScoringRow = {
+  id: string;
+  item: string;
+  score: string;
+  requirement: string;
+  subitems: string[];
+  evidence: string[];
+};
 const BID_MODE_OPTIONS: Array<{ value: BidMode; label: string }> = [
   { value: 'technical_only', label: '技术标' },
   { value: 'full_bid', label: '完整标' },
@@ -104,6 +126,8 @@ const NAV_ITEMS: Array<{ key: NavKey; label: string; description: string; icon: 
 
 const FLOW_STEPS = ['上传', '标准解析', '目录映射', '正文生成', '合规审校', '导出'];
 const ANALYSIS_STEPS = ['文件解析', '条款识别', '评分项提取', '合规要求提取'];
+const ANALYSIS_REPORT_TIMEOUT_MS = 30 * 60 * 1000;
+const BLOCKING_REPORT_WARNING_PATTERN = /兜底|未完整返回|模型输出未完整|解析失败|超时/;
 const toLiteLLMConfig = (config?: Partial<ConfigData>): ConfigData => ({
   provider: DEFAULT_PROVIDER_ID,
   api_key: config?.api_key || '',
@@ -123,6 +147,40 @@ const extractJsonPayload = (value: string) => {
   const closing = candidate[start] === '{' ? '}' : ']';
   const end = candidate.lastIndexOf(closing);
   return end > start ? candidate.slice(start, end + 1).trim() : candidate;
+};
+
+const parseJsonPayload = <T,>(raw: string, label: string): T => {
+  const payload = extractJsonPayload(raw);
+  if (!payload) {
+    throw new Error(`${label}没有返回可解析的 JSON，请重试或检查模型输出。`);
+  }
+  try {
+    return JSON.parse(payload) as T;
+  } catch (error: any) {
+    const message = error?.message === 'Unexpected end of JSON input'
+      ? `${label}返回的 JSON 不完整。系统已停止后续生成，不会使用兜底目录；请重新解析。`
+      : `${label}返回的 JSON 格式异常：${error?.message || '未知错误'}`;
+    throw new Error(message);
+  }
+};
+
+const getBlockingAnalysisReportWarning = (report?: AnalysisReport | null) => {
+  if (!report) return '';
+  const warningTexts = (report.generation_warnings || []).map(item => `${item.severity || ''} ${item.warning || ''}`);
+  const riskTexts = (report.rejection_risks || [])
+    .filter(item => item.source === '系统解析状态')
+    .map(item => item.risk || '');
+  const matched = [...warningTexts, ...riskTexts].find(text => BLOCKING_REPORT_WARNING_PATTERN.test(text));
+  return matched || '';
+};
+
+const isGeneratedMediaTitle = (value?: string | null) =>
+  /-{2,}\s*media\/image\d+\.(png|jpg|jpeg|gif|webp)\s*-{2,}/i.test((value || '').trim());
+
+const cleanDisplayTitle = (value?: string | null) => {
+  const title = (value || '').trim();
+  if (!title || isGeneratedMediaTitle(title)) return '';
+  return title;
 };
 
 const collectEntries = (items: OutlineItem[], parents: OutlineItem[] = [], top?: OutlineItem): ChapterEntry[] =>
@@ -155,6 +213,83 @@ const updateOutlineItem = (items: OutlineItem[], id: string, patch: Partial<Outl
     return { ...item, children: updateOutlineItem(item.children, id, patch) };
   });
 
+const findOutlineItem = (items: OutlineItem[], id: string): OutlineItem | null => {
+  for (const item of items) {
+    if (item.id === id) return item;
+    if (item.children?.length) {
+      const found = findOutlineItem(item.children, id);
+      if (found) return found;
+    }
+  }
+  return null;
+};
+
+const containsOutlineItem = (item: OutlineItem, id?: string): boolean => {
+  if (!id) return false;
+  if (item.id === id) return true;
+  return Boolean(item.children?.some(child => containsOutlineItem(child, id)));
+};
+
+const nextChildId = (parent: OutlineItem) => {
+  const prefix = `${parent.id}.`;
+  const used = new Set((parent.children || []).map(child => child.id));
+  const maxIndex = (parent.children || []).reduce((max, child) => {
+    if (!child.id.startsWith(prefix)) return max;
+    const index = Number.parseInt(child.id.slice(prefix.length).split('.')[0], 10);
+    return Number.isFinite(index) ? Math.max(max, index) : max;
+  }, 0);
+  let index = maxIndex + 1;
+  let candidate = `${prefix}${index}`;
+  while (used.has(candidate)) {
+    index += 1;
+    candidate = `${prefix}${index}`;
+  }
+  return candidate;
+};
+
+const makeOutlineChild = (parent: OutlineItem): OutlineItem => ({
+  id: nextChildId(parent),
+  title: '新章节',
+  description: '请补充本章节的写作范围、响应要点和材料要求。',
+  volume_id: parent.volume_id,
+  chapter_type: parent.chapter_type,
+  fixed_format_sensitive: parent.fixed_format_sensitive,
+  price_sensitive: parent.price_sensitive,
+  anonymity_sensitive: parent.anonymity_sensitive,
+  scoring_item_ids: [],
+  requirement_ids: [],
+  risk_ids: [],
+  material_ids: [],
+  response_matrix_ids: [],
+  source_type: 'manual',
+  expected_depth: 'editable',
+  children: undefined,
+  content: undefined,
+});
+
+const addOutlineChild = (items: OutlineItem[], parentId: string): { items: OutlineItem[]; child: OutlineItem | null } => {
+  let created: OutlineItem | null = null;
+  const nextItems = items.map((item) => {
+    if (item.id === parentId) {
+      created = makeOutlineChild(item);
+      return { ...item, children: [...(item.children || []), created] };
+    }
+    if (!item.children?.length) return item;
+    const result = addOutlineChild(item.children, parentId);
+    if (result.child) {
+      created = result.child;
+      return { ...item, children: result.items };
+    }
+    return item;
+  });
+  return { items: nextItems, child: created };
+};
+
+const deleteOutlineItem = (items: OutlineItem[], id: string): OutlineItem[] =>
+  items
+    .filter(item => item.id !== id)
+    .map(item => item.children?.length ? { ...item, children: deleteOutlineItem(item.children, id) } : item);
+
 const buildExportOutline = (items: OutlineItem[], contentById: Record<string, string>): OutlineItem[] =>
   items.map((item) => ({
     ...item,
@@ -180,6 +315,7 @@ const riskLevel = (item: OutlineItem) => {
 const isMeaningfulValue = (value?: string | null) => {
   const normalized = (value || '').trim();
   if (!normalized) return false;
+  if (isGeneratedMediaTitle(normalized)) return false;
   return !['待模型解析', '待解析', '无', '暂无', '未提供', '未明确', '不详', 'null', 'undefined'].includes(normalized);
 };
 
@@ -197,13 +333,19 @@ const buildProjectSummary = (
   overview: string,
   requirements: string,
   fileContent: string,
+  uploadedFileName?: string,
 ): ProjectSummary | undefined => {
   if (!report?.project) return undefined;
   const sourceText = [overview, requirements, fileContent.slice(0, 30000)].filter(Boolean).join('\n');
   const project = report.project;
   const fallback: ProjectSummary = {
     ...project,
-    name: isMeaningfulValue(project.name) ? project.name : findFieldInText(sourceText, ['项目名称', '采购项目名称', '招标项目名称', '项目']),
+    name: isMeaningfulValue(project.name)
+      ? project.name
+      : cleanDisplayTitle(findFieldInText(sourceText, ['项目名称', '采购项目名称', '招标项目名称', '项目']))
+        || cleanDisplayTitle(uploadedFileName)
+        || cleanDisplayTitle(project.number)
+        || '未命名标书',
     number: isMeaningfulValue(project.number) ? project.number : findFieldInText(sourceText, ['项目编号', '采购项目编号', '招标编号', '项目代码']),
     purchaser: isMeaningfulValue(project.purchaser) ? project.purchaser : findFieldInText(sourceText, ['采购人', '招标人', '采购单位', '建设单位']),
     service_period: isMeaningfulValue(project.service_period) ? project.service_period : findFieldInText(sourceText, ['服务期限', '服务期', '履约期限', '工期']),
@@ -248,6 +390,476 @@ const summarizeRequirementsFromReport = (report: AnalysisReport) => {
   ]);
   pushItems('废标和高风险项', report.rejection_risks || []);
   return lines.join('\n') || '未识别到明确评分或响应要求，请核对招标文件。';
+};
+
+const toText = (value?: unknown) => String(value ?? '').trim();
+
+const asList = <T,>(value?: T[] | null): T[] => (Array.isArray(value) ? value : []);
+
+const toRecordItems = <T,>(value?: T[] | null): Array<Record<string, unknown>> =>
+  asList(value).map(item => item as unknown as Record<string, unknown>);
+
+const isScoringParseTab = (key?: TenderParseTabKey) =>
+  key === 'technical' || key === 'business' || key === 'other';
+
+const uniqueTexts = (values: string[], limit = 5) => {
+  const seen = new Set<string>();
+  return values
+    .map(value => value.trim())
+    .filter(value => {
+      if (!value || seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    })
+    .slice(0, limit);
+};
+
+const pickEvidence = (report: AnalysisReport, ...candidates: unknown[]) => {
+  const raw = candidates.flatMap(candidate => (Array.isArray(candidate) ? candidate : [candidate])).map(toText).filter(isMeaningfulValue);
+  const matchedRefs = asList(report.source_refs).filter(ref => {
+    const refTokens = [ref.id, ref.location, ...(ref.related_ids || [])].filter(Boolean);
+    return raw.some(value => refTokens.some(token => value.includes(token) || token.includes(value)));
+  });
+  return uniqueTexts([
+    ...raw,
+    ...matchedRefs.map(ref => `${ref.location}：${ref.excerpt}`),
+  ]);
+};
+
+const appendParseSection = (
+  sections: TenderParseSection[],
+  id: string,
+  title: string,
+  content: unknown[],
+  evidence: unknown[],
+  count = 1,
+) => {
+  const contentLines = uniqueTexts(content.map(toText).filter(isMeaningfulValue), 12);
+  const evidenceLines = uniqueTexts(evidence.map(toText).filter(isMeaningfulValue), 6);
+  if (!contentLines.length && !evidenceLines.length) return;
+  sections.push({ id, title, content: contentLines, evidence: evidenceLines, count });
+};
+
+const requirementLine = (item: Record<string, unknown>) => {
+  const head = toText(item.name || item.review_type || item.target || item.clause || item.risk || item.id);
+  const body = toText(item.requirement || item.standard || item.criterion || item.logic || item.clause || item.risk || item.fixed_text);
+  const score = toText(item.score);
+  const strategy = toText(item.writing_focus || item.response_strategy || item.mitigation || item.fill_rules);
+  return [
+    head ? `${head}${score ? `（${score}）` : ''}` : '',
+    body ? `要求：${body}` : '',
+    strategy ? `响应建议：${strategy}` : '',
+  ].filter(Boolean).join('\n');
+};
+
+const splitScoringSubitems = (value: string) => {
+  const normalized = value
+    .replace(/\r/g, '\n')
+    .replace(/；/g, '；\n')
+    .replace(/。\s*(?=\d+[.、]|[（(]?\d+[）)]|[一二三四五六七八九十]+[、.])/g, '。\n');
+  return uniqueTexts(
+    normalized
+      .split(/\n+/)
+      .map(item => item.replace(/^[\s\-•●]+/, '').trim())
+      .filter(item => item.length > 0),
+    16,
+  );
+};
+
+const buildScoringRows = (
+  report: AnalysisReport,
+  key: TenderParseTabKey,
+): TenderScoringRow[] => {
+  const rawItems = key === 'technical'
+    ? toRecordItems(report.technical_scoring_items)
+    : key === 'business'
+      ? toRecordItems(report.business_scoring_items)
+      : [
+        ...toRecordItems(report.price_scoring_items),
+        ...(report.price_rules ? [{
+          id: 'PRICE-RULE',
+          name: '投标报价',
+          score: toText((report.price_rules as any).score) || '按公式计算',
+          logic: [
+            report.price_rules.quote_method,
+            report.price_rules.maximum_price_rule,
+            report.price_rules.abnormally_low_price_rule,
+            report.price_rules.arithmetic_correction_rule,
+            report.price_rules.missing_item_rule,
+          ].filter(isMeaningfulValue).join('\n'),
+          source: report.price_rules.source_ref,
+        } as Record<string, unknown>] : []),
+      ];
+
+  return rawItems.slice(0, 40).map((item, index) => {
+    const requirement = toText(item.standard || item.logic || item.requirement || item.criterion || item.risk);
+    const evidence = pickEvidence(report, item.id, item.source, item.source_ref);
+    return {
+      id: toText(item.id) || `${key}-${index + 1}`,
+      item: toText(item.name || item.review_type || item.target || item.id) || `评分项${index + 1}`,
+      score: toText(item.score || item.weight || item.points || item.value) || '未明确',
+      requirement: requirement || '未识别到明确得分要求',
+      subitems: splitScoringSubitems(requirement),
+      evidence,
+    };
+  });
+};
+
+const buildItemSections = (
+  report: AnalysisReport,
+  prefix: string,
+  items: Array<Record<string, unknown>>,
+  fallbackTitle: string,
+) => items.slice(0, 10).reduce<TenderParseSection[]>((sections, item, index) => {
+  const id = toText(item.id) || `${prefix}-${index + 1}`;
+  const title = toText(item.name || item.review_type || item.target || item.risk || item.clause) || `${fallbackTitle}${index + 1}`;
+  appendParseSection(
+    sections,
+    `${prefix}-${id}`,
+    title,
+    [
+      requirementLine(item),
+      asList(item.required_materials as string[]).length ? `材料：${asList(item.required_materials as string[]).join('、')}` : '',
+      asList(item.evidence_requirements as string[]).length ? `证据：${asList(item.evidence_requirements as string[]).join('、')}` : '',
+      asList(item.easy_loss_points as string[]).length ? `易失分点：${asList(item.easy_loss_points as string[]).join('、')}` : '',
+    ],
+    pickEvidence(report, item.id, item.source, item.source_ref),
+  );
+  return sections;
+}, []);
+
+const MISSING_PARSE_TEXT = '暂未扫描到相关内容描述';
+
+const lineOrMissing = (label: string, value: unknown) => `${label}：${toText(value) || MISSING_PARSE_TEXT}`;
+
+const collectRequirementLines = (
+  items: Array<Record<string, unknown>>,
+  keywords: string[],
+  limit = 8,
+) => {
+  const matched = items.filter(item => {
+    const haystack = [
+      item.name,
+      item.review_type,
+      item.target,
+      item.clause,
+      item.requirement,
+      item.standard,
+      item.criterion,
+      item.logic,
+      item.risk,
+      item.source,
+    ].map(toText).join(' ');
+    return keywords.some(keyword => haystack.includes(keyword));
+  });
+  return matched.slice(0, limit).map(item => requirementLine(item));
+};
+
+const fixedRequirementBlock = (
+  title: string,
+  items: Array<Record<string, unknown>>,
+  keywords: string[],
+) => {
+  const lines = collectRequirementLines(items, keywords, 4);
+  return `${title}\n${lines.length ? lines.join('\n') : MISSING_PARSE_TEXT}`;
+};
+
+const linesOrMissing = (lines: string[]) => (lines.length ? lines : [MISSING_PARSE_TEXT]);
+
+const buildTenderParseTabs = (report: AnalysisReport | null): TenderParseTab[] => {
+  if (!report) return [];
+  const project = report.project || {};
+  const bidDoc = (report as any).bid_document_requirements || {};
+  const selectedTarget = bidDoc.selected_generation_target || {};
+  const baseOutline = asList<Record<string, unknown>>(selectedTarget.base_outline_items);
+  const schemeOutline = asList<Record<string, unknown>>(bidDoc.scheme_or_technical_outline_requirements);
+  const composition = asList<Record<string, unknown>>(bidDoc.composition);
+  const qualificationItems = [
+    ...toRecordItems(report.qualification_review_items),
+    ...toRecordItems(report.qualification_requirements),
+  ];
+  const formalItems = toRecordItems(report.formal_review_items);
+  const responsivenessItems = [
+    ...toRecordItems(report.responsiveness_review_items),
+    ...toRecordItems(report.formal_response_requirements),
+    ...toRecordItems(report.mandatory_clauses),
+  ];
+  const riskItems = [
+    ...toRecordItems(report.rejection_risks),
+    ...toRecordItems(report.mandatory_clauses),
+    ...responsivenessItems,
+  ];
+  const allRequirementItems = [
+    ...qualificationItems,
+    ...formalItems,
+    ...responsivenessItems,
+    ...riskItems,
+    ...toRecordItems(report.required_materials),
+    ...toRecordItems(report.fixed_format_forms),
+    ...toRecordItems(report.signature_requirements),
+    ...toRecordItems(report.evidence_chain_requirements),
+  ];
+
+  const basicSections: TenderParseSection[] = [];
+  appendParseSection(basicSections, 'basic-owner', '招标人/代理信息', [
+    lineOrMissing('招标人', project.purchaser),
+    lineOrMissing('招标代理机构', project.agency),
+    lineOrMissing('联系方式', (project as any).contact || (project as any).contact_phone),
+    lineOrMissing('联系地址', (project as any).address),
+  ], pickEvidence(report, project.name, project.number, project.purchaser));
+  appendParseSection(basicSections, 'basic-project', '项目信息', [
+    lineOrMissing('项目名称', project.name),
+    lineOrMissing('项目编号', project.number),
+    lineOrMissing('标包/标段', project.package_name || project.package_or_lot),
+    lineOrMissing('采购方式', project.procurement_method),
+    lineOrMissing('预算/最高限价', project.budget || project.maximum_price),
+  ], pickEvidence(report, project.service_scope, project.quality_requirements));
+  appendParseSection(basicSections, 'basic-time', '关键时间/内容', [
+    lineOrMissing('投标截止时间', project.bid_deadline),
+    lineOrMissing('开标时间', project.opening_time),
+    lineOrMissing('服务期限/工期', project.service_period),
+    lineOrMissing('采购/服务内容', project.service_scope),
+  ], pickEvidence(report, project.service_period, project.bid_deadline, project.opening_time));
+  appendParseSection(basicSections, 'basic-bond', '保证金相关', [
+    lineOrMissing('投标保证金', project.bid_bond),
+    lineOrMissing('履约保证金', project.performance_bond),
+  ], pickEvidence(report, project.bid_bond, project.performance_bond));
+  appendParseSection(basicSections, 'basic-other', '其他信息', [
+    lineOrMissing('服务地点', project.service_location),
+    lineOrMissing('质量要求', project.quality_requirements),
+    lineOrMissing('投标有效期', project.bid_validity),
+    lineOrMissing('递交方式', project.submission_method || project.submission_requirements),
+    lineOrMissing('电子平台', project.electronic_platform),
+  ], pickEvidence(report, project.service_period, project.bid_deadline, project.opening_time));
+
+  const technicalSections = [
+    ...buildItemSections(report, 'tech-score', toRecordItems(report.technical_scoring_items), '技术评分'),
+    ...buildItemSections(report, 'tech-outline', [...baseOutline, ...schemeOutline], '服务纲要'),
+  ];
+  if (!technicalSections.length) {
+    appendParseSection(technicalSections, 'tech-empty', '服务纲要', ['未识别到明确服务纲要或技术评分条目。'], []);
+  }
+
+  const documentSections: TenderParseSection[] = [];
+  appendParseSection(documentSections, 'document-composition', '投标文件组成', linesOrMissing(composition.map(item => requirementLine(item))), pickEvidence(report, ...composition.map(item => item.source)), composition.length);
+  appendParseSection(documentSections, 'document-price', '投标报价要求', [
+    lineOrMissing('报价方式', report.price_rules?.quote_method),
+    lineOrMissing('最高限价/限价规则', report.price_rules?.maximum_price_rule),
+    lineOrMissing('算术修正规则', report.price_rules?.arithmetic_correction_rule),
+    lineOrMissing('报价格式', report.price_rules?.form_requirements),
+  ], pickEvidence(report, report.price_rules?.source_ref));
+  appendParseSection(documentSections, 'document-submit', '投标文件递交方式', [
+    lineOrMissing('递交方式', project.submission_method || project.submission_requirements),
+    lineOrMissing('电子平台', project.electronic_platform),
+    lineOrMissing('截止时间', project.bid_deadline),
+    lineOrMissing('签章要求', project.signature_requirements),
+  ], pickEvidence(report, project.submission_method, project.submission_requirements, project.electronic_platform));
+  appendParseSection(documentSections, 'document-scheme', '方案要求', [
+    toText(selectedTarget.target_title) ? `生成对象：${selectedTarget.target_title}` : MISSING_PARSE_TEXT,
+    toText(selectedTarget.base_outline_strategy) ? `目录策略：${selectedTarget.base_outline_strategy}` : '',
+    schemeOutline.map(item => requirementLine(item)).join('\n'),
+    baseOutline.map(item => requirementLine(item)).join('\n'),
+    asList(report.fixed_format_forms).map(item => `${item.name}：${item.fill_rules || item.fixed_text || item.source}`).join('\n'),
+  ], pickEvidence(report, selectedTarget.source, ...asList(report.fixed_format_forms).map(item => item.source)));
+
+  const processSections: TenderParseSection[] = [];
+  appendParseSection(processSections, 'process-opening', '开标', [
+    lineOrMissing('开标时间', project.opening_time || project.bid_deadline),
+    lineOrMissing('开标方式/平台', project.electronic_platform || project.submission_method),
+    ...collectRequirementLines(allRequirementItems, ['开标', '解密', '签到', '开标大厅'], 6),
+  ], pickEvidence(report, project.electronic_platform, project.opening_time));
+  appendParseSection(processSections, 'process-review', '评标', linesOrMissing(collectRequirementLines([...formalItems, ...responsivenessItems], ['评标', '评审', '澄清', '修正'], 8)), pickEvidence(report, ...formalItems.map(item => item.source), ...responsivenessItems.map(item => item.source)));
+  appendParseSection(processSections, 'process-award', '定标', linesOrMissing(collectRequirementLines(allRequirementItems, ['定标', '中标', '推荐中标', '候选人'], 8)), pickEvidence(report, ...allRequirementItems.map(item => item.source)));
+  appendParseSection(processSections, 'process-followup', '后续要求', linesOrMissing(collectRequirementLines(allRequirementItems, ['合同', '履约', '服务费', '通知书', '公示', '质疑'], 8)), pickEvidence(report, ...allRequirementItems.map(item => item.source)));
+
+  const supplementSections: TenderParseSection[] = [];
+  appendParseSection(supplementSections, 'supplement-tech-spec', '技术规格', [
+    lineOrMissing('服务/技术范围', project.service_scope),
+    lineOrMissing('质量要求', project.quality_requirements),
+    ...collectRequirementLines([...toRecordItems(report.technical_scoring_items), ...schemeOutline], ['技术', '规格', '服务', '设计', '方案'], 6),
+  ], pickEvidence(report, project.service_scope, project.quality_requirements));
+  appendParseSection(supplementSections, 'supplement-contract-time', '合同时间', [lineOrMissing('服务期限/合同时间', project.service_period)], pickEvidence(report, project.service_period));
+  appendParseSection(supplementSections, 'supplement-background', '项目背景', [
+    lineOrMissing('项目名称', project.name),
+    lineOrMissing('项目类型', project.project_type),
+    lineOrMissing('资金来源', project.funding_source),
+  ], pickEvidence(report, project.name, project.funding_source));
+  appendParseSection(supplementSections, 'supplement-format', '方案与格式要求', [
+    toText(selectedTarget.target_title) ? `生成对象：${selectedTarget.target_title}` : MISSING_PARSE_TEXT,
+    ...schemeOutline.slice(0, 8).map(item => requirementLine(item)),
+  ], pickEvidence(report, selectedTarget.source));
+  appendParseSection(supplementSections, 'supplement-special', '其他特殊要求', [
+    ...collectRequirementLines(allRequirementItems, ['特殊', '必须', '不得', '承诺', '偏离', '暗标'], 8),
+    ...asList(report.generation_warnings).map(item => `${item.severity}：${item.warning}`),
+  ], pickEvidence(report, ...allRequirementItems.map(item => item.source)));
+  appendParseSection(supplementSections, 'supplement-sample', '样品要求', linesOrMissing(collectRequirementLines(allRequirementItems, ['样品', '样本', '演示'], 4)), pickEvidence(report, ...allRequirementItems.map(item => item.source)));
+  appendParseSection(supplementSections, 'supplement-payment', '付款方式', linesOrMissing(collectRequirementLines(allRequirementItems, ['付款', '支付', '价款', '结算'], 4)), pickEvidence(report, ...allRequirementItems.map(item => item.source)));
+  appendParseSection(supplementSections, 'supplement-share', '中标份额分配规则', linesOrMissing(collectRequirementLines(allRequirementItems, ['份额', '分配', '中标份额'], 4)), pickEvidence(report, ...allRequirementItems.map(item => item.source)));
+  appendParseSection(supplementSections, 'supplement-count', '中标数量规则', linesOrMissing(collectRequirementLines(allRequirementItems, ['中标数量', '入围', '候选人数量', '标包数量'], 4)), pickEvidence(report, ...allRequirementItems.map(item => item.source)));
+
+  const tabs: TenderParseTab[] = [
+    { key: 'basic', label: '基础信息', sections: basicSections },
+    { key: 'qualification', label: '资格审查', sections: [
+      {
+        id: 'qualification-review',
+        title: '资格评审',
+        content: [
+          fixedRequirementBlock('资质条件', qualificationItems, ['资质', '资格条件', '资格']),
+          fixedRequirementBlock('业绩要求', qualificationItems, ['业绩']),
+          fixedRequirementBlock('财务要求', qualificationItems, ['财务', '审计']),
+          fixedRequirementBlock('信誉要求', qualificationItems, ['信誉', '信用', '失信', '黑名单', '行贿']),
+          fixedRequirementBlock('人员资格要求', qualificationItems, ['人员', '项目负责人', '资格证', '注册']),
+          fixedRequirementBlock('联合体投标要求', qualificationItems, ['联合体', '分包']),
+          fixedRequirementBlock('安全生产许可证要求', qualificationItems, ['安全生产许可证']),
+          fixedRequirementBlock('投标资格评审否决项', riskItems, ['资格', '否决', '废标', '不得参加', '取消投标资格']),
+        ],
+        evidence: pickEvidence(report, ...qualificationItems.map(item => item.source)),
+        count: qualificationItems.length,
+      },
+      {
+        id: 'qualification-formal',
+        title: '形式评审标准',
+        content: formalItems.length ? formalItems.slice(0, 12).map(item => requirementLine(item)) : [MISSING_PARSE_TEXT],
+        evidence: pickEvidence(report, ...formalItems.map(item => item.source)),
+        count: formalItems.length,
+      },
+      {
+        id: 'qualification-responsive',
+        title: '响应性评审标准',
+        content: responsivenessItems.length ? responsivenessItems.slice(0, 12).map(item => requirementLine(item)) : [MISSING_PARSE_TEXT],
+        evidence: pickEvidence(report, ...responsivenessItems.map(item => item.source)),
+        count: responsivenessItems.length,
+      },
+    ] },
+    { key: 'technical', label: '技术评分', sections: technicalSections },
+    { key: 'business', label: '商务评分', sections: buildItemSections(report, 'biz-score', toRecordItems(report.business_scoring_items), '商务评分') },
+    { key: 'other', label: '其他评分', sections: [
+      ...buildItemSections(report, 'price-score', toRecordItems(report.price_scoring_items), '价格评分'),
+      ...buildItemSections(report, 'price-rule', report.price_rules ? [report.price_rules as unknown as Record<string, unknown>] : [], '报价规则'),
+    ] },
+    { key: 'risk', label: '无效标与废标项', sections: [
+      ...buildItemSections(report, 'risk-reject', toRecordItems(report.rejection_risks), '废标风险'),
+      ...buildItemSections(report, 'risk-clause', toRecordItems(report.mandatory_clauses), '实质性条款'),
+    ] },
+    { key: 'document', label: '投标文件要求', sections: documentSections },
+    { key: 'process', label: '开评定标流程', sections: processSections },
+    { key: 'supplement', label: '补充信息归纳', sections: supplementSections },
+  ];
+
+  return tabs.map(tab => ({
+    ...tab,
+    sections: tab.sections.length ? tab.sections : [{ id: `${tab.key}-empty`, title: '未识别到明确条目', content: ['当前解析报告未返回该类结构化内容，建议核对源文件或重新解析。'], evidence: [], count: 0 }],
+  }));
+};
+
+const makeFallbackOutlineNode = (
+  id: string,
+  title: string,
+  description: string,
+  patch: Partial<OutlineItem> = {},
+): OutlineItem => ({
+  id,
+  title,
+  description,
+  volume_id: patch.volume_id || 'V-TECH',
+  chapter_type: patch.chapter_type || 'technical',
+  source_type: patch.source_type || 'client_fallback',
+  fixed_format_sensitive: Boolean(patch.fixed_format_sensitive),
+  price_sensitive: Boolean(patch.price_sensitive),
+  anonymity_sensitive: Boolean(patch.anonymity_sensitive),
+  expected_word_count: patch.expected_word_count || 1200,
+  expected_depth: patch.expected_depth || 'medium',
+  expected_blocks: patch.expected_blocks || ['paragraph'],
+  scoring_item_ids: patch.scoring_item_ids || [],
+  requirement_ids: patch.requirement_ids || [],
+  risk_ids: patch.risk_ids || [],
+  material_ids: patch.material_ids || [],
+  response_matrix_ids: patch.response_matrix_ids || [],
+  children: patch.children,
+});
+
+const buildClientFallbackOutline = (
+  report: AnalysisReport,
+  bidMode: BidMode,
+  referenceBidStyleProfile: Record<string, unknown>,
+  documentBlocksPlan: Record<string, unknown>,
+): OutlineData => {
+  const bidDoc = (report as any).bid_document_requirements || {};
+  const composition = Array.isArray(bidDoc.composition) ? bidDoc.composition : [];
+  const selectedTarget = bidDoc.selected_generation_target || {};
+  const targetTitle = cleanDisplayTitle(selectedTarget.target_title);
+  const wrapperTitles = new Set(['服务方案', '技术方案', '设计方案', '实施方案', '施工组织设计', '供货方案', '售后服务方案']);
+  const seenTargetTitles = new Set<string>();
+  const rawTargetItems = [
+    ...(Array.isArray(selectedTarget.base_outline_items) ? selectedTarget.base_outline_items : []),
+    ...(Array.isArray(bidDoc.scheme_or_technical_outline_requirements) ? bidDoc.scheme_or_technical_outline_requirements : []),
+  ];
+  const hasMultiTargetItems = new Set(rawTargetItems.map((item: any) => cleanDisplayTitle(item?.title)).filter(Boolean)).size > 1;
+  const targetItems = rawTargetItems.filter((item: any) => {
+    const title = cleanDisplayTitle(item?.title);
+    if (!title || seenTargetTitles.has(title)) return false;
+    if (!hasMultiTargetItems && (title === targetTitle || wrapperTitles.has(title))) return false;
+    seenTargetTitles.add(title);
+    return true;
+  });
+  const technicalItems = (report.technical_scoring_items || []).filter(item => cleanDisplayTitle(item.name));
+  const matrix = report.response_matrix;
+
+  let outline: OutlineItem[] = [];
+  if (bidMode === 'full_bid' && composition.length) {
+    outline = composition.slice(0, 16).map((item: any, index: number) => {
+      const isTech = /技术|服务|设计|方案|施工组织|供货/.test(item.title || '');
+      const children = isTech && targetItems.length
+        ? targetItems.slice(0, 12).map((target: any, childIndex: number) => makeFallbackOutlineNode(
+          `${index + 1}.${childIndex + 1}`,
+          cleanDisplayTitle(target.title) || `方案要求${childIndex + 1}`,
+          '按招标文件方案纲要逐项响应，补齐评分项、材料和风险映射。',
+          { volume_id: item.volume_id || 'V-TECH', scoring_item_ids: technicalItems.slice(0, 8).map(score => score.id) },
+        ))
+        : undefined;
+      return makeFallbackOutlineNode(
+        String(index + 1),
+        cleanDisplayTitle(item.title) || `投标文件组成${index + 1}`,
+        '按招标文件投标文件组成、固定格式、签章、附件和页码要求编制。',
+        {
+          volume_id: item.volume_id || (isTech ? 'V-TECH' : 'V-BIZ'),
+          chapter_type: item.chapter_type || (isTech ? 'technical' : 'business'),
+          fixed_format_sensitive: Boolean(item.fixed_format),
+          price_sensitive: Boolean(item.price_related),
+          children,
+        },
+      );
+    });
+  } else if (targetItems.length) {
+    outline = targetItems.slice(0, 20).map((item: any, index: number) => makeFallbackOutlineNode(
+      String(index + 1),
+      cleanDisplayTitle(item.title) || `方案要求${index + 1}`,
+      '按选中的技术/服务/设计方案生成对象逐项响应，避免混入商务、报价和资格卷正文。',
+      {
+        scoring_item_ids: technicalItems.slice(0, 8).map(score => score.id),
+        response_matrix_ids: matrix?.items?.slice(0, 8).map(item => item.id) || [],
+      },
+    ));
+  } else {
+    outline = (technicalItems.length ? technicalItems : [{ id: 'T-01', name: '项目理解与实施方案' } as any])
+      .slice(0, 12)
+      .map((item, index) => makeFallbackOutlineNode(
+        String(index + 1),
+        cleanDisplayTitle(item.name) || `技术评分响应${index + 1}`,
+        '按技术/服务评分项生成目录主线，后续正文需逐项覆盖评分标准。',
+        { scoring_item_ids: item.id ? [item.id] : [] },
+      ));
+  }
+
+  return {
+    outline,
+    project_name: cleanDisplayTitle(report.project?.name) || cleanDisplayTitle(report.project?.number) || '投标文件',
+    response_matrix: matrix,
+    coverage_summary: matrix?.coverage_summary || '模型返回不完整 JSON，已使用解析报告生成兜底目录。',
+    reference_bid_style_profile: referenceBidStyleProfile,
+    document_blocks_plan: documentBlocksPlan,
+    bid_mode: bidMode,
+  };
 };
 
 const parseOutlineDraftRows = (raw: string): DraftOutlineRow[] => {
@@ -370,7 +982,7 @@ const App = () => {
 
   const [activeNav, setActiveNav] = useState<NavKey>('project');
   const [configOpen, setConfigOpen] = useState(false);
-  const [uploadedFileName, setUploadedFileName] = useState('');
+  const [uploadedFileName, setUploadedFileName] = useState(state.uploadedFileName || '');
   const [referenceFileName, setReferenceFileName] = useState('');
   const [busy, setBusy] = useState('');
   const [progress, setProgress] = useState<ProgressState | null>(null);
@@ -386,11 +998,17 @@ const App = () => {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [localConfig, setLocalConfig] = useState<ConfigData>(state.config);
   const [selectedBidMode, setSelectedBidMode] = useState<BidMode>('full_bid');
+  const [matrixExpanded, setMatrixExpanded] = useState(false);
+  const [activeParseTabKey, setActiveParseTabKey] = useState<TenderParseTabKey>('basic');
+  const [activeParseSectionId, setActiveParseSectionId] = useState('');
   const [activeDocId, setActiveDocId] = useState('');
   const [outlineDraftRows, setOutlineDraftRows] = useState<DraftOutlineRow[]>([]);
+  const [editingOutlineId, setEditingOutlineId] = useState('');
+  const [outlineEditorForm, setOutlineEditorForm] = useState<OutlineEditorForm>({ id: '', title: '', description: '' });
   const [streamingChapterId, setStreamingChapterId] = useState('');
   const [generationControl, setGenerationControl] = useState<GenerationControlState>('idle');
   const [generationProgress, setGenerationProgress] = useState<ProgressState | null>(null);
+  const [exportDirectory, setExportDirectory] = useState('~/Downloads');
   const [historyRecords, setHistoryRecords] = useState<DraftHistoryRecord[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
@@ -407,13 +1025,25 @@ const App = () => {
   const activeDocumentBlocksPlan = effectiveOutline?.document_blocks_plan || activeReport?.document_blocks_plan || documentBlocksPlan;
   const activeResponseMatrix = effectiveOutline?.response_matrix || activeReport?.response_matrix || null;
   const responseMatrixItems = activeResponseMatrix?.items || [];
+  const visibleMatrixItems = matrixExpanded ? responseMatrixItems : responseMatrixItems.slice(0, 5);
   const highRiskMatrixCount = responseMatrixItems.filter(item => item.priority === 'high' || item.blocking).length;
   const uncoveredMatrixCount = activeResponseMatrix?.uncovered_ids?.length || responseMatrixItems.filter(item => item.status !== 'covered').length;
+  const tenderParseTabs = useMemo(() => buildTenderParseTabs(activeReport), [activeReport]);
+  const activeParseTab = tenderParseTabs.find(tab => tab.key === activeParseTabKey) || tenderParseTabs[0];
+  const activeParseSection = activeParseTab?.sections.find(section => section.id === activeParseSectionId) || activeParseTab?.sections[0];
+  const activeScoringRows = useMemo(
+    () => activeReport && activeParseTab ? buildScoringRows(activeReport, activeParseTab.key) : [],
+    [activeReport, activeParseTab],
+  );
   const entries = useMemo(() => effectiveOutline ? collectEntries(effectiveOutline.outline) : [], [effectiveOutline]);
   const selectedEntry = entries.find(entry => entry.item.id === state.selectedChapter) || entries[0];
+  const editingOutlineItem = useMemo(
+    () => effectiveOutline && editingOutlineId ? findOutlineItem(effectiveOutline.outline, editingOutlineId) : null,
+    [effectiveOutline, editingOutlineId],
+  );
   const project = useMemo(
-    () => buildProjectSummary(activeReport, state.projectOverview, state.techRequirements, state.fileContent),
-    [activeReport, state.projectOverview, state.techRequirements, state.fileContent],
+    () => buildProjectSummary(activeReport, state.projectOverview, state.techRequirements, state.fileContent, uploadedFileName || state.uploadedFileName),
+    [activeReport, state.projectOverview, state.techRequirements, state.fileContent, uploadedFileName, state.uploadedFileName],
   );
   const completedLeaves = entries.filter(entry => entry.item.content?.trim()).length;
   const coverage = entries.length > 0 ? Math.round((completedLeaves / entries.length) * 100) : 0;
@@ -427,9 +1057,18 @@ const App = () => {
   const infoIssues = reviewReport
     ? reviewReport.duplication_issues.length + reviewReport.fabrication_risks.length + reviewReport.rejection_risks.filter(item => item.handled).length + (reviewReport.revision_plan?.actions.length || 0)
     : null;
-  const projectTitle = project?.name || effectiveOutline?.project_name || '待解析项目';
+  const projectTitle = cleanDisplayTitle(project?.name)
+    || cleanDisplayTitle(effectiveOutline?.project_name)
+    || cleanDisplayTitle(uploadedFileName || state.uploadedFileName)
+    || '待解析项目';
 
   useEffect(() => setLocalConfig(state.config), [state.config]);
+
+  useEffect(() => {
+    if (state.uploadedFileName && state.uploadedFileName !== uploadedFileName) {
+      setUploadedFileName(state.uploadedFileName);
+    }
+  }, [state.uploadedFileName, uploadedFileName]);
 
   useEffect(() => {
     setHistoryRecords(draftStorage.loadHistory());
@@ -478,6 +1117,19 @@ const App = () => {
   }, [activeReport?.bid_mode_recommendation]);
 
   useEffect(() => {
+    if (!tenderParseTabs.length) return;
+    const currentTab = tenderParseTabs.find(tab => tab.key === activeParseTabKey);
+    if (!currentTab) {
+      setActiveParseTabKey(tenderParseTabs[0].key);
+      setActiveParseSectionId(tenderParseTabs[0].sections[0]?.id || '');
+      return;
+    }
+    if (!currentTab.sections.some(section => section.id === activeParseSectionId)) {
+      setActiveParseSectionId(currentTab.sections[0]?.id || '');
+    }
+  }, [activeParseSectionId, activeParseTabKey, tenderParseTabs]);
+
+  useEffect(() => {
     if (!state.outlineData?.outline?.length) return;
     const result = ensureOutlineThirdLevel(state.outlineData.outline);
     if (result.changed) {
@@ -489,6 +1141,81 @@ const App = () => {
   const setSuccess = (text: string) => setNotice({ type: 'success', text });
   const setInfo = (text: string) => setNotice({ type: 'info', text });
   const refreshHistory = () => setHistoryRecords(draftStorage.loadHistory());
+
+  const openOutlineEditor = (item: OutlineItem) => {
+    setEditingOutlineId(item.id);
+    setOutlineEditorForm({
+      id: item.id,
+      title: item.title,
+      description: item.description || '',
+    });
+    if (!item.children?.length) updateSelectedChapter(item.id);
+  };
+
+  const closeOutlineEditor = () => {
+    setEditingOutlineId('');
+    setOutlineEditorForm({ id: '', title: '', description: '' });
+  };
+
+  const saveOutlineEditor = () => {
+    if (!effectiveOutline || !editingOutlineId) return;
+    const title = outlineEditorForm.title.trim();
+    if (!title) {
+      setError('章节标题不能为空');
+      return;
+    }
+    const nextOutline = {
+      ...effectiveOutline,
+      outline: updateOutlineItem(effectiveOutline.outline, editingOutlineId, {
+        title,
+        description: outlineEditorForm.description.trim(),
+      }),
+    };
+    updateOutline(nextOutline);
+    setOutlineDraftRows(flattenOutlineDraftRows(nextOutline.outline));
+    setSuccess(`已更新目录节点 ${editingOutlineId}`);
+  };
+
+  const handleAddOutlineChild = (parent: OutlineItem) => {
+    if (!effectiveOutline) return;
+    const result = addOutlineChild(effectiveOutline.outline, parent.id);
+    if (!result.child) {
+      setError('新增子章节失败，请重新选择目录节点');
+      return;
+    }
+    const nextOutline = { ...effectiveOutline, outline: result.items };
+    updateOutline(nextOutline);
+    updateSelectedChapter(result.child.id);
+    setActiveDocId(result.child.id);
+    setOutlineDraftRows(flattenOutlineDraftRows(nextOutline.outline));
+    openOutlineEditor(result.child);
+    setSuccess(`已新增子章节 ${result.child.id}`);
+  };
+
+  const handleDeleteOutlineItem = (item: OutlineItem) => {
+    if (!effectiveOutline) return;
+    if (effectiveOutline.outline.length <= 1 && effectiveOutline.outline[0]?.id === item.id) {
+      setError('至少需要保留一个顶层章节');
+      return;
+    }
+    const hasContent = Boolean(item.content?.trim() || collectEntries(item.children || []).some(entry => entry.item.content?.trim()));
+    const prompt = hasContent
+      ? `确定删除“${item.id} ${item.title}”及其下级章节吗？已生成正文也会从当前草稿目录中移除。`
+      : `确定删除“${item.id} ${item.title}”及其下级章节吗？`;
+    if (!window.confirm(prompt)) return;
+    const nextItems = deleteOutlineItem(effectiveOutline.outline, item.id);
+    const nextOutline = { ...effectiveOutline, outline: nextItems };
+    updateOutline(nextOutline);
+    setOutlineDraftRows(flattenOutlineDraftRows(nextItems));
+    const stillSelected = state.selectedChapter ? findOutlineItem(nextItems, state.selectedChapter) : null;
+    if (!stillSelected) {
+      const first = collectEntries(nextItems)[0];
+      updateSelectedChapter(first?.item.id || '');
+      setActiveDocId(first?.item.id || '');
+    }
+    if (editingOutlineId === item.id || !findOutlineItem(nextItems, editingOutlineId)) closeOutlineEditor();
+    setSuccess(`已删除目录节点 ${item.id}`);
+  };
 
   const clampProgress = (value: number) => Math.max(0, Math.min(100, Math.round(value)));
 
@@ -626,10 +1353,11 @@ const App = () => {
 
   const restoreHistoryRecord = (record: DraftHistoryRecord) => {
     const activated = draftStorage.activateHistory(record.id);
-    restoreDraft((activated || record).draft);
+    const draft = (activated || record).draft;
+    restoreDraft(draft);
     setReviewReport(null);
-    setActiveDocId(record.draft.selectedChapter || '');
-    setUploadedFileName(record.title);
+    setActiveDocId(draft.selectedChapter || '');
+    setUploadedFileName(draft.uploadedFileName || record.title);
     refreshHistory();
     setSuccess(`已恢复历史记录：${record.title}`);
     if (record.draft.outlineData) {
@@ -666,7 +1394,18 @@ const App = () => {
       const response = await documentApi.uploadFile(file);
       if (!response.data.success || !response.data.file_content) throw new Error(response.data.message || '上传失败');
       setUploadedFileName(file.name);
-      updateFileContent(response.data.file_content);
+      setReferenceFileName('');
+      setReviewReport(null);
+      setConsistencyReport(null);
+      setReferenceProfile({});
+      setDocumentBlocksPlan({});
+      setActiveDocId('');
+      setOutlineDraftRows([]);
+      setStreamingChapterId('');
+      setOutlineLiveText('');
+      setContentStreamText('');
+      setStreamText('');
+      updateFileContent(response.data.file_content, file.name);
       completeProgress('文件已上传，文本读取完成', taskVersion);
       setSuccess('招标文件已上传，开始进行标准解析');
     } catch (error: any) {
@@ -726,11 +1465,21 @@ const App = () => {
         if (payload.error) throw new Error(payload.message || '结构化解析失败');
         if (typeof payload.chunk === 'string') {
           reportRaw += payload.chunk;
-          advanceProgress('正在结构化项目、评分、风险、材料和响应矩阵', Math.min(92, 20 + Math.floor(reportRaw.length / 220)), reportRaw.length > 900 ? 3 : 2, taskVersion);
+          const nextStep = reportRaw.length > 1600 ? 3 : reportRaw.length > 700 ? 2 : 1;
+          const detail = nextStep === 3
+            ? '合规要求提取中：正在汇总风险、材料和响应矩阵'
+            : nextStep === 2
+              ? '评分项提取中：正在识别分值、标准和易失分点'
+              : '条款识别中：正在抽取项目基础信息和投标文件组成';
+          advanceProgress(detail, Math.min(92, 20 + Math.floor(reportRaw.length / 220)), nextStep, taskVersion);
         }
-      }), '结构化解析超时，请检查模型服务或尝试换用更快的模型', taskVersion);
+      }), '模型解析超时：标准解析长时间未完成，系统已停止后续目录生成，未使用兜底报告。', taskVersion, ANALYSIS_REPORT_TIMEOUT_MS);
       advanceProgress('正在校验并写入结构化解析结果', 96, 3, taskVersion);
-      const report = JSON.parse(extractJsonPayload(reportRaw)) as AnalysisReport;
+      const report = parseJsonPayload<AnalysisReport>(reportRaw, '标准解析');
+      const blockingWarning = getBlockingAnalysisReportWarning(report);
+      if (blockingWarning) {
+        throw new Error(`标准解析未完整完成：${blockingWarning}。请重新解析，目录阶段不会使用该报告。`);
+      }
       report.bid_mode_recommendation = normalizeBidMode(report.bid_mode_recommendation);
       if (Object.keys(referenceProfile).length) {
         report.reference_bid_style_profile = referenceProfile;
@@ -754,6 +1503,11 @@ const App = () => {
       setError('请先完成标准解析');
       return;
     }
+    const blockingWarning = getBlockingAnalysisReportWarning(state.analysisReport);
+    if (blockingWarning) {
+      setError(`标准解析未完整完成：${blockingWarning}。请先重新解析，目录阶段不会使用兜底报告。`);
+      return;
+    }
     setBusy('outline');
     const taskVersion = startProgress('目录生成', ['构建输入', '生成目录', '映射评分风险'], '正在准备目录生成上下文', 8);
     setStreamText('');
@@ -771,6 +1525,7 @@ const App = () => {
       const response = await outlineApi.generateOutlineStream({
         overview: state.projectOverview,
         requirements: state.techRequirements,
+        file_content: state.fileContent,
         analysis_report: state.analysisReport,
         bid_mode: normalizeBidMode(selectedBidMode),
         reference_bid_style_profile: activeReferenceProfile,
@@ -802,10 +1557,24 @@ const App = () => {
         }
       });
       advanceProgress('正在写入目录结构和评分映射', 96, 2, taskVersion);
-      const outline = JSON.parse(extractJsonPayload(raw)) as OutlineData;
+      let outline: OutlineData;
+      try {
+        outline = parseJsonPayload<OutlineData>(raw, '目录生成');
+      } catch (parseError: any) {
+        outline = buildClientFallbackOutline(
+          state.analysisReport as AnalysisReport,
+          normalizeBidMode(selectedBidMode),
+          activeReferenceProfile,
+          activeDocumentBlocksPlan,
+        );
+        setInfo(parseError.message || '模型返回不完整 JSON，已使用解析报告生成兜底目录');
+      }
       const nextOutline = {
         ...outline,
-        project_name: state.analysisReport.project?.name || '投标文件',
+        project_name: cleanDisplayTitle(state.analysisReport.project?.name)
+          || cleanDisplayTitle(uploadedFileName || state.uploadedFileName)
+          || cleanDisplayTitle(state.analysisReport.project?.number)
+          || '投标文件',
         project_overview: state.projectOverview,
         analysis_report: state.analysisReport,
         response_matrix: outline.response_matrix || state.analysisReport.response_matrix,
@@ -1048,7 +1817,7 @@ const App = () => {
         }
       });
       advanceProgress('正在写入合规审校报告', 96, 2);
-      const report = JSON.parse(extractJsonPayload(raw)) as ReviewReport;
+      const report = parseJsonPayload<ReviewReport>(raw, '合规审校');
       setReviewReport(report);
       completeProgress('合规审校完成', taskVersion);
       setSuccess(report.summary.ready_to_export ? '审校通过，可以导出 Word' : '审校完成，请处理阻塞项');
@@ -1083,7 +1852,7 @@ const App = () => {
           advanceProgress('正在生成图表、表格、图片和承诺书规划', Math.min(92, 12 + Math.floor(raw.length / 180)), raw.length > 800 ? 1 : 0, taskVersion);
         }
       });
-      const plan = JSON.parse(extractJsonPayload(raw)) as Record<string, unknown>;
+      const plan = parseJsonPayload<Record<string, unknown>>(raw, '图表素材规划');
       setDocumentBlocksPlan(plan);
       updateOutline({ ...effectiveOutline, document_blocks_plan: plan, reference_bid_style_profile: activeReferenceProfile });
       if (state.analysisReport) {
@@ -1128,7 +1897,7 @@ const App = () => {
           advanceProgress('正在检查历史残留、承诺冲突和虚构风险', Math.min(92, 12 + Math.floor(raw.length / 180)), raw.length > 800 ? 1 : 0, taskVersion);
         }
       });
-      const report = JSON.parse(extractJsonPayload(raw)) as ConsistencyRevisionReport;
+      const report = parseJsonPayload<ConsistencyRevisionReport>(raw, '全文一致性修订');
       setConsistencyReport(report);
       completeProgress('一致性修订报告完成', taskVersion);
       setSuccess(report.ready_for_export ? '一致性检查通过' : `一致性检查完成，发现 ${report.issues?.length || 0} 项问题`);
@@ -1150,43 +1919,29 @@ const App = () => {
     try {
       const contentById = Object.fromEntries(entries.map(entry => [entry.item.id, entry.item.content || '']));
       advanceProgress('正在生成 Word 文件', 70, 1);
+      const targetExportDir = exportDirectory.trim();
       const response = await documentApi.exportWord({
         project_name: effectiveOutline.project_name || project?.name || '投标文件',
         project_overview: effectiveOutline.project_overview || state.projectOverview,
         outline: buildExportOutline(effectiveOutline.outline, contentById),
         document_blocks_plan: activeDocumentBlocksPlan,
+        export_dir: targetExportDir || undefined,
       });
-      if (!response.ok) throw new Error('导出失败');
-      const blob = await response.blob();
       const filename = `${effectiveOutline.project_name || project?.name || '投标文件'}.docx`;
-      const picker = (window as any).showSaveFilePicker;
-      if (picker) {
-        try {
-          const handle = await picker({
-            suggestedName: filename,
-            types: [{
-              description: 'Word 文档',
-              accept: {
-                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
-              },
-            }],
-          });
-          const writable = await handle.createWritable();
-          await writable.write(blob);
-          await writable.close();
-        } catch (error: any) {
-          if (error?.name === 'AbortError') {
-            setProgress(null);
-            setInfo('已取消保存 Word 文件');
-            return;
-          }
-          throw error;
-        }
-      } else {
-        saveAs(blob, filename);
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => null);
+        throw new Error(errorPayload?.detail || errorPayload?.message || '导出失败');
       }
+      if (targetExportDir) {
+        const payload = await response.json();
+        completeProgress('Word 文件已生成', taskVersion);
+        setSuccess(`Word 文件已保存：${payload.file_path || targetExportDir}`);
+        return;
+      }
+      const blob = await response.blob();
+      saveAs(blob, filename);
       completeProgress('Word 文件已生成', taskVersion);
-      setSuccess(`Word 文件已保存：${filename}`);
+      setSuccess(`Word 文件已生成：${filename}`);
     } catch (error: any) {
       failProgress(error.message || '导出失败', undefined, taskVersion);
       setError(error.message || '导出失败');
@@ -1568,7 +2323,10 @@ const App = () => {
                       <div key={item} className={`check-row check-row--${status === '失败' ? 'error' : status === '进行中' ? 'active' : status === '已完成' ? 'done' : 'idle'}`}>
                         <CheckCircleIcon className={`h-4 w-4 ${status === '已完成' ? 'text-emerald-600' : status === '失败' ? 'text-rose-600' : status === '进行中' ? 'text-amber-500' : 'text-slate-300'}`} />
                         <span>{item}</span>
-                        <strong>{status}</strong>
+                        <strong>
+                          {status === '进行中' && <i className="status-pulse" />}
+                          {status}
+                        </strong>
                       </div>
                     );
                   })}
@@ -1600,10 +2358,126 @@ const App = () => {
                   ))}
                 </div>
 
+                <div className="ops-panel tender-parse-panel">
+                  <div className="ops-panel__head">
+                    <h2>招标文件解析归纳</h2>
+                    <span>{activeReport ? '按评审页签组织' : '待解析'}</span>
+                  </div>
+                  {activeReport && activeParseTab && activeParseSection ? (
+                    <>
+                      <div className="tender-parse-tabs">
+                        {tenderParseTabs.map(tab => (
+                          <button
+                            key={tab.key}
+                            type="button"
+                            className={tab.key === activeParseTab.key ? 'active' : ''}
+                            onClick={() => {
+                              setActiveParseTabKey(tab.key);
+                              setActiveParseSectionId(tab.sections[0]?.id || '');
+                            }}
+                          >
+                            <CheckCircleIcon className="h-4 w-4" />
+                            <span>{tab.label}</span>
+                            <em>{tab.sections.reduce((sum, section) => sum + section.count, 0)}</em>
+                          </button>
+                        ))}
+                      </div>
+                      {isScoringParseTab(activeParseTab.key) ? (
+                        <div className="tender-score-table-wrap">
+                          <table className="tender-score-table">
+                            <thead>
+                              <tr>
+                                <th>评分项</th>
+                                <th>分值</th>
+                                <th>得分要求</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {activeScoringRows.length ? activeScoringRows.map(row => (
+                                <tr key={row.id}>
+                                  <td>{row.item}</td>
+                                  <td>{row.score}</td>
+                                  <td>
+                                    <div className="score-requirement">
+                                      {(row.subitems.length ? row.subitems : [row.requirement]).map((subitem, index) => (
+                                        <p key={`${row.id}-subitem-${index}`}>{subitem}</p>
+                                      ))}
+                                      {row.evidence.length > 0 && (
+                                        <div className="score-evidence">
+                                          {row.evidence.slice(0, 2).map((line, index) => (
+                                            <span key={`${row.id}-evidence-${index}`}>{line}</span>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )) : (
+                                <tr>
+                                  <td colSpan={3}>当前解析报告未返回该类评分表，建议重新解析或人工核对评分办法章节。</td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div className="tender-parse-workbench">
+                          <nav className="tender-parse-sections" aria-label="解析章节">
+                            {activeParseTab.sections.map(section => (
+                              <button
+                                key={section.id}
+                                type="button"
+                                className={section.id === activeParseSection.id ? 'active' : ''}
+                                onClick={() => setActiveParseSectionId(section.id)}
+                              >
+                                <span>{section.title}</span>
+                                <em>{section.count ? `${section.count} 项` : '待核对'}</em>
+                              </button>
+                            ))}
+                          </nav>
+                          <article className="tender-parse-detail">
+                            <div className="tender-parse-detail__head">
+                              <strong>{activeParseSection.title}</strong>
+                              <span>{activeParseTab.label}</span>
+                            </div>
+                            <div className="tender-parse-content">
+                              {activeParseSection.content.map((line, index) => (
+                                <p key={`${activeParseSection.id}-content-${index}`}>{line}</p>
+                              ))}
+                            </div>
+                            <div className="tender-parse-evidence">
+                              <strong>原文证据</strong>
+                              {activeParseSection.evidence.length ? (
+                                activeParseSection.evidence.map((line, index) => (
+                                  <span key={`${activeParseSection.id}-evidence-${index}`}>{line}</span>
+                                ))
+                              ) : (
+                                <span>当前条目未返回可定位原文，建议重新解析或人工核对源文件。</span>
+                              )}
+                            </div>
+                          </article>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="empty-state empty-state--compact">
+                      <strong>等待标准解析</strong>
+                      <span>完成后会按基础信息、资格审查、技术评分、废标项、投标文件要求等页签展示，并保留每项原文证据。</span>
+                    </div>
+                  )}
+                </div>
+
                 <div className="ops-panel response-matrix-panel">
                   <div className="ops-panel__head">
                     <h2>响应矩阵</h2>
-                    <span>{activeResponseMatrix ? `${responseMatrixItems.length} 项` : '待生成'}</span>
+                    <div className="panel-head-actions">
+                      <span>{activeResponseMatrix ? `${responseMatrixItems.length} 项` : '待生成'}</span>
+                      {activeResponseMatrix && responseMatrixItems.length > 5 && (
+                        <button type="button" className="text-link" onClick={() => setMatrixExpanded(prev => !prev)}>
+                          {matrixExpanded ? '收起' : '展开全部'}
+                        </button>
+                      )}
+                    </div>
                   </div>
                   {activeResponseMatrix ? (
                     <>
@@ -1613,11 +2487,19 @@ const App = () => {
                         <Metric label="待覆盖" value={`${uncoveredMatrixCount}`} tone="amber" />
                       </div>
                       <div className="matrix-mini-list">
-                        {responseMatrixItems.slice(0, 5).map(item => (
+                        {visibleMatrixItems.map(item => (
                           <div key={item.id} className="matrix-mini-row">
                             <strong>{item.id}</strong>
                             <span>{item.requirement_summary || item.source_item_id}</span>
                             <em>{item.priority === 'high' || item.blocking ? '高优先级' : item.source_type}</em>
+                            {matrixExpanded && (
+                              <div className="matrix-mini-detail">
+                                <span>策略：{item.response_strategy || '待目录阶段映射'}</span>
+                                <span>目标章节：{item.target_chapter_ids?.length ? item.target_chapter_ids.join('、') : '待生成目录后确定'}</span>
+                                <span>材料：{item.required_material_ids?.length ? item.required_material_ids.join('、') : '无明确材料'}</span>
+                                <span>风险：{item.risk_ids?.length ? item.risk_ids.join('、') : '无关联风险'}</span>
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -1676,13 +2558,63 @@ const App = () => {
                       <span>{activeResponseMatrix.coverage_summary || `共 ${responseMatrixItems.length} 项，待覆盖 ${uncoveredMatrixCount} 项`}</span>
                     </div>
                   )}
+                  {editingOutlineItem && (
+                    <div className="outline-edit-panel">
+                      <div className="outline-edit-panel__head">
+                        <div>
+                          <strong>编辑目录节点</strong>
+                          <span>修改会直接进入当前草稿，并用于后续正文生成。</span>
+                        </div>
+                        <button type="button" className="ops-icon-button" onClick={closeOutlineEditor} aria-label="关闭编辑面板">
+                          <XMarkIcon className="h-4 w-4" />
+                        </button>
+                      </div>
+                      <div className="outline-edit-grid">
+                        <label className="outline-edit-field">
+                          <span>编号</span>
+                          <input value={outlineEditorForm.id} disabled />
+                        </label>
+                        <label className="outline-edit-field">
+                          <span>标题</span>
+                          <input
+                            value={outlineEditorForm.title}
+                            onChange={event => setOutlineEditorForm(prev => ({ ...prev, title: event.target.value }))}
+                            placeholder="请输入章节标题"
+                          />
+                        </label>
+                        <label className="outline-edit-field outline-edit-field--wide">
+                          <span>写作说明</span>
+                          <textarea
+                            value={outlineEditorForm.description}
+                            onChange={event => setOutlineEditorForm(prev => ({ ...prev, description: event.target.value }))}
+                            rows={3}
+                            placeholder="补充本章写作范围、响应重点、材料要求"
+                          />
+                        </label>
+                      </div>
+                      <div className="outline-edit-actions">
+                        <button type="button" onClick={() => handleAddOutlineChild(editingOutlineItem)}>新增子级</button>
+                        <button type="button" className="danger-text-button" onClick={() => handleDeleteOutlineItem(editingOutlineItem)}>删除节点</button>
+                        <button type="button" className="solid-button" onClick={saveOutlineEditor}>保存修改</button>
+                      </div>
+                    </div>
+                  )}
                   {effectiveOutline ? (
                     <div className="outline-table outline-table--page">
                       <div className="outline-table__head">
-                        <span>章节名称</span><span>评分项映射</span><span>风险</span><span>材料</span>
+                        <span>章节名称</span><span>操作</span><span>评分项映射</span><span>风险</span><span>材料</span>
                       </div>
                       {effectiveOutline.outline.map(section => (
-                        <OutlineRows key={section.id} item={section} selectedId={selectedEntry?.item.id} onSelect={updateSelectedChapter} />
+                        <OutlineRows
+                          key={section.id}
+                          item={section}
+                          selectedId={selectedEntry?.item.id}
+                          editingId={editingOutlineId}
+                          onSelect={updateSelectedChapter}
+                          onEdit={openOutlineEditor}
+                          onAddChild={handleAddOutlineChild}
+                          onDelete={handleDeleteOutlineItem}
+                        />
                       ))}
                     </div>
                   ) : (
@@ -1749,6 +2681,14 @@ const App = () => {
                       <ArrowDownTrayIcon className="h-4 w-4" /> 导出 Word
                     </button>
                   </div>
+                  <label className="export-path-control">
+                    <span>保存目录</span>
+                    <input
+                      value={exportDirectory}
+                      onChange={event => setExportDirectory(event.target.value)}
+                      placeholder="例如 ~/Downloads 或 /Users/songyuheng/Desktop"
+                    />
+                  </label>
                   {generationProgress && (
                     <div className="content-progress-strip">
                       <TaskProgress progress={generationProgress} />
@@ -2003,14 +2943,19 @@ const App = () => {
 interface OutlineRowsProps {
   item: OutlineItem;
   selectedId?: string;
+  editingId?: string;
   level?: number;
   onSelect: (id: string) => void;
+  onEdit: (item: OutlineItem) => void;
+  onAddChild: (item: OutlineItem) => void;
+  onDelete: (item: OutlineItem) => void;
 }
 
-const OutlineRows = ({ item, selectedId, level = 0, onSelect }: OutlineRowsProps) => {
+const OutlineRows = ({ item, selectedId, editingId, level = 0, onSelect, onEdit, onAddChild, onDelete }: OutlineRowsProps) => {
   const hasChildren = Boolean(item.children?.length);
   const [expanded, setExpanded] = useState(level === 0);
-  const active = item.id === selectedId || Boolean(item.children?.some(child => child.id === selectedId));
+  const active = containsOutlineItem(item, selectedId) || containsOutlineItem(item, editingId);
+  const editing = item.id === editingId;
   const materialCount = item.material_ids?.length || 0;
   const expectsMaterial = Boolean(
     item.enterprise_required
@@ -2024,28 +2969,44 @@ const OutlineRows = ({ item, selectedId, level = 0, onSelect }: OutlineRowsProps
     : expectsMaterial
       ? '该章节需要企业资料、表格、图片或承诺书，但当前未映射到具体材料 ID。通常是招标文件未列出明确材料编号，或解析/目录映射未匹配到材料清单。'
       : '该章节当前不依赖单独证明材料，正文会直接按招标要求展开。';
+  const handleRowAction = () => {
+    if (hasChildren) {
+      setExpanded(prev => !prev);
+      return;
+    }
+    onSelect(item.id);
+  };
+  useEffect(() => {
+    if (hasChildren && active) setExpanded(true);
+  }, [active, hasChildren]);
   return (
     <>
-      <button
-        type="button"
-        className={`outline-row ${active ? 'outline-row--active' : ''}`}
+      <div
+        role="button"
+        tabIndex={0}
+        className={`outline-row ${active ? 'outline-row--active' : ''} ${editing ? 'outline-row--editing' : ''}`}
         style={{ paddingLeft: 18 + level * 24 }}
-        onClick={() => {
-          if (hasChildren) {
-            setExpanded(prev => !prev);
-            return;
+        onClick={handleRowAction}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            handleRowAction();
           }
-          onSelect(item.id);
         }}
       >
         <span className="outline-name">
           {hasChildren ? <ChevronRightIcon className={`outline-chevron h-3.5 w-3.5 ${expanded ? 'outline-chevron--open' : ''}`} /> : <span className="tree-branch" />}
           <strong>{item.id}　{item.title}</strong>
         </span>
+        <span className="outline-row-actions">
+          <button type="button" onClick={(event) => { event.stopPropagation(); onEdit(item); }}>编辑</button>
+          <button type="button" onClick={(event) => { event.stopPropagation(); onAddChild(item); }}>子级</button>
+          <button type="button" className="danger-text-button" onClick={(event) => { event.stopPropagation(); onDelete(item); }}>删除</button>
+        </span>
         <span className="chip chip--green">评分项 {item.scoring_item_ids?.length || '-'}</span>
         <span className={`chip ${riskLevel(item) === '高风险' ? 'chip--red' : riskLevel(item) === '中风险' ? 'chip--amber' : 'chip--green'}`}>{riskLevel(item)}</span>
         <span className={`chip ${materialTone}`} title={materialHelp}>{materialLabel}</span>
-      </button>
+      </div>
       {active && (
         <div className="outline-row-detail" style={{ paddingLeft: 42 + level * 24 }}>
           <span>{item.description || '该节点用于承接招标文件对应要求。'}</span>
@@ -2053,7 +3014,17 @@ const OutlineRows = ({ item, selectedId, level = 0, onSelect }: OutlineRowsProps
         </div>
       )}
       {expanded && item.children?.map(child => (
-        <OutlineRows key={child.id} item={child} selectedId={selectedId} level={level + 1} onSelect={onSelect} />
+        <OutlineRows
+          key={child.id}
+          item={child}
+          selectedId={selectedId}
+          editingId={editingId}
+          level={level + 1}
+          onSelect={onSelect}
+          onEdit={onEdit}
+          onAddChild={onAddChild}
+          onDelete={onDelete}
+        />
       ))}
     </>
   );

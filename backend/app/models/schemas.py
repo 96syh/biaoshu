@@ -59,6 +59,7 @@ class FileUploadResponse(BaseModel):
     message: str
     file_content: Optional[str] = None
     old_outline: Optional[str] = None
+    parser_info: Dict[str, Any] = Field(default_factory=dict, description="文档解析器、输出格式和降级信息")
     reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="样例投标文件风格剖面")
     document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
 
@@ -196,6 +197,23 @@ class SchemeOutlineRequirement(BaseModel):
     target_chapter_hint: str = Field("", description="建议映射章节")
 
 
+class SelectedGenerationTarget(BaseModel):
+    """本次目录与正文生成应聚焦的投标文件组成项。用于解决“只生成服务方案/设计方案”而非整本投标文件的问题。"""
+    target_id: str = Field("", description="选中的组成项ID，如 BD-07 或 BD-SP-01")
+    target_title: str = Field("", description="选中的生成对象标题，如 服务方案/设计方案/技术方案")
+    parent_composition_id: str = Field("", description="所属投标文件组成项ID")
+    target_source: str = Field("", description="来源章节、页码或条款，如 第六章七服务方案 / 3.1.1(7)设计方案")
+    target_source_type: str = Field("", description="composition_item/format_section/scoring_section/user_selected/inferred")
+    generation_scope: str = Field("scheme_section_only", description="scheme_section_only/full_bid/volume_only/unknown")
+    use_as_outline_basis: bool = Field(True, description="是否作为目录硬依据")
+    base_outline_strategy: str = Field("", description="scheme_outline/format_section_children/technical_scoring_items/reference_profile_fallback/generic_fallback")
+    base_outline_items: List[Dict[str, Any]] = Field(default_factory=list, description="目录基础项，含 order/title/source_ref/derived_from 等")
+    excluded_composition_item_ids: List[str] = Field(default_factory=list, description="生成技术/方案分册时应排除的完整投标文件组成项ID")
+    excluded_composition_titles: List[str] = Field(default_factory=list, description="生成技术/方案分册时应排除的完整投标文件组成项标题")
+    selection_reason: str = Field("", description="为什么选中该章节作为生成对象")
+    confidence: str = Field("medium", description="high/medium/low")
+
+
 class BidDocumentFixedForm(BaseModel):
     """投标文件格式中的固定表单或固定函件"""
     id: str = Field(..., description="固定格式ID，如 BD-FF-01")
@@ -227,6 +245,7 @@ class BidDocumentRequirements(BaseModel):
     document_scope_required: str = Field("unknown", description="full_bid/technical_volume/service_plan_volume/business_volume/qualification_volume/price_volume/unknown")
     composition: List[BidDocumentCompositionItem] = Field(default_factory=list, description="投标文件组成、顺序和格式要求")
     scheme_or_technical_outline_requirements: List[SchemeOutlineRequirement] = Field(default_factory=list, description="方案类章节应包括的提纲")
+    selected_generation_target: SelectedGenerationTarget = Field(default_factory=SelectedGenerationTarget, description="本次目录与正文生成应聚焦的投标文件组成项")
     fixed_forms: List[BidDocumentFixedForm] = Field(default_factory=list, description="固定格式表单或函件")
     formatting_and_submission_rules: BidDocumentFormattingRules = Field(default_factory=BidDocumentFormattingRules, description="投标文件格式、递交和平台要求")
     excluded_when_generating_technical_only: List[str] = Field(default_factory=list, description="生成技术/服务分册时应排除的完整投标文件章节")
@@ -538,6 +557,7 @@ class OutlineRequest(BaseModel):
     """目录生成请求"""
     overview: str = Field(..., description="项目概述")
     requirements: str = Field(..., description="技术评分要求")
+    file_content: Optional[str] = Field(None, description="招标文件全文，用于目录阶段补齐方案纲要子项")
     uploaded_expand: Optional[bool] = Field(False, description="是否已上传方案扩写文件")
     old_outline: Optional[str] = Field(None, description="上传的方案扩写文件解析出的旧目录JSON")
     old_document: Optional[str] = Field(None, description="上传的方案扩写文件解析出的旧文档")
@@ -724,3 +744,4 @@ class WordExportRequest(BaseModel):
     project_overview: Optional[str] = Field(None, description="项目概述")
     outline: List[OutlineItem] = Field(..., description="目录结构，包含内容")
     document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
+    export_dir: Optional[str] = Field(None, description="可选：由本地后端直接保存 Word 的目录")

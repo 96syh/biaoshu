@@ -16,6 +16,7 @@ const initialState: AppState = {
     api_mode: 'chat',
   },
   fileContent: '',
+  uploadedFileName: '',
   projectOverview: '',
   techRequirements: '',
   analysisReport: undefined,
@@ -41,11 +42,30 @@ export const useAppState = () => {
     });
   }, []);
 
-  const updateFileContent = useCallback((fileContent: string) => {
+  const updateFileContent = useCallback((fileContent: string, uploadedFileName = '') => {
     setState(prev => {
       draftStorage.startNewHistory();
-      const next = { ...prev, fileContent };
-      draftStorage.saveDraft({ fileContent });
+      const next = {
+        ...prev,
+        currentStep: 0,
+        fileContent,
+        uploadedFileName,
+        projectOverview: '',
+        techRequirements: '',
+        analysisReport: undefined,
+        outlineData: null,
+        selectedChapter: '',
+      };
+      draftStorage.saveDraft({
+        currentStep: 0,
+        fileContent,
+        uploadedFileName,
+        projectOverview: '',
+        techRequirements: '',
+        analysisReport: undefined,
+        outlineData: null,
+        selectedChapter: '',
+      });
       return next;
     });
   }, []);
@@ -91,6 +111,7 @@ export const useAppState = () => {
     AppState,
     | 'currentStep'
     | 'fileContent'
+    | 'uploadedFileName'
     | 'projectOverview'
     | 'techRequirements'
     | 'analysisReport'

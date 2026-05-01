@@ -29,13 +29,15 @@ def get_full_bid_rulebook() -> str:
 4. 未在招标文件或企业资料中出现的信息，必须使用：〖待补充：资料名称〗、〖待确认：事项〗、〖待提供扫描件：资料名称〗、〖待提供查询截图：事项〗、〖以招标文件要求为准〗、〖页码待编排〗。
 5. 不得把“不满足、未提供、待确认”的事项写成“满足、已具备、已完成、已提供”。
 
-二、投标文件编制要求与格式硬约束
-1. 招标文件中的“投标文件”“投标文件格式”“投标文件的组成”“投标文件的编制”“投标文件格式要求”“技术/服务/施工/供货方案应包括”等章节，是目录生成、正文生成和导出审校的硬约束，优先级高于历史样例、通用模板和模型自由发挥。
-2. 必须单独解析投标文件应包括哪些卷册、章节、表格、承诺函、证明材料和附件；必须记录章节顺序、是否必交、是否固定格式、是否需要签字盖章、是否需要附件、是否允许自拟。
-3. 若用户目标是 full_bid，目录必须按招标文件“投标文件/投标文件格式”列明的顺序完整生成，不得遗漏投标函、授权/身份证明、联合体协议、保证金、报价、资格审查资料、技术/服务方案、其他资料、偏差表等必需项；不适用章节应保留“不适用/本项目不适用”处理规则或按招标文件要求处理。
-4. 若用户目标是 technical_only、technical_service_plan 或 service_plan，只生成对应技术/服务分册正文，但仍必须遵守招标文件中对该分册的“应包括但不限于”章节要求；完整投标文件中的商务、报价、资格、保证金等内容应进入 excluded_full_bid_sections 或审校提示，不得混入技术分册正文。
-5. 对招标文件明确给出的固定表格和固定格式，必须保留表头、列名、固定文字、顺序、签章栏、日期栏和附件说明；只允许填写空白项或使用占位符，不得擅自改写格式含义。
-6. 对标注“以上内容仅供参考模板，可以根据投标人情况自行拟定”的方案类内容，可以扩展和优化，但必须覆盖其列明的全部要点，且不得与评分办法、实质性条款和卷册隔离规则冲突。
+二、投标文件编制要求、生成对象定位与格式硬约束
+1. 招标文件中的“投标文件”“投标文件格式”“投标文件的组成”“投标文件的编制”“投标文件格式要求”“技术/服务/施工/供货/设计方案应包括”等章节，是目录生成、正文生成和导出审校的硬约束，优先级高于历史样例、通用模板和模型自由发挥。
+2. 必须先做“生成对象定位”：从投标文件组成和投标文件格式中找出本次真正需要写正文的方案类组成项，例如“服务方案”“设计方案”“技术方案”“实施方案”“施工组织设计”“供货方案”“售后服务方案”等；不要把整章“投标文件格式”或整本投标文件误认为都要写。
+3. 必须单独解析投标文件应包括哪些卷册、章节、表格、承诺函、证明材料和附件；同时必须写出 selected_generation_target，说明本次目录应基于哪个组成项生成，以及哪些完整投标文件组成项只做排除/审校提示。
+4. 如果招标文件中有多个位置描述同一目标，例如“3.1.1（7）设计方案”和“第六章 六、设计方案”，应合并理解：前者用于确认生成对象，后者用于提取详细目录要求；如果第六章没有详细子项，则用第三章技术评分项作为目录基础。
+5. 若用户目标是 full_bid，目录必须按招标文件“投标文件/投标文件格式”列明的顺序完整生成，不得遗漏投标函、授权/身份证明、联合体协议、保证金、报价、资格审查资料、技术/服务/设计方案、其他资料、偏差表等必需项；不适用章节应保留“不适用/本项目不适用”处理规则或按招标文件要求处理。
+6. 若用户目标是 technical_only、technical_service_plan、service_plan 或未明确但存在 selected_generation_target，只生成 selected_generation_target 对应的方案分册/方案章节，不得混入投标函、报价、保证金、资格审查资料等完整投标文件正文。
+7. 对招标文件明确给出的固定表格和固定格式，必须保留表头、列名、固定文字、顺序、签章栏、日期栏和附件说明；只允许填写空白项或使用占位符，不得擅自改写格式含义。
+8. 对标注“以上内容仅供参考模板，可以根据投标人情况自行拟定”的方案类内容，可以扩展和优化，但必须覆盖其列明的全部要点，且不得与评分办法、实质性条款和卷册隔离规则冲突。
 
 三、格式、签章与实质性响应
 1. 对“★”“*”“▲”“实质性要求”“不允许偏离”“投标无效”“废标”“否决投标”“资格审查不通过”“必须”“不得”“应当”等内容，必须单独识别、编号、响应和审校。
@@ -262,7 +264,7 @@ def get_bid_document_requirements_schema() -> Dict[str, Any]:
                 "required": True,
                 "applicability": "required | optional | not_applicable | conditional",
                 "volume_id": "",
-                "chapter_type": "cover | toc | form | authorization | bond | price | qualification | business | technical | service_plan | construction_plan | goods_supply | deviation_table | commitment | other",
+                "chapter_type": "cover | toc | form | authorization | bond | price | qualification | business | technical | service_plan | construction_plan | goods_supply | design_plan | deviation_table | commitment | other",
                 "fixed_format": False,
                 "allow_self_drafting": False,
                 "signature_required": False,
@@ -280,7 +282,7 @@ def get_bid_document_requirements_schema() -> Dict[str, Any]:
         "scheme_or_technical_outline_requirements": [
             {
                 "id": "BD-SP-01",
-                "parent_title": "服务方案/技术方案/施工组织设计/供货方案/设计方案",
+                "parent_title": "服务方案/设计方案/技术方案/施工组织设计/供货方案/实施方案",
                 "order": 1,
                 "title": "",
                 "required": True,
@@ -289,6 +291,30 @@ def get_bid_document_requirements_schema() -> Dict[str, Any]:
                 "target_chapter_hint": "",
             }
         ],
+        "selected_generation_target": {
+            "target_id": "BD-07",
+            "target_title": "服务方案/设计方案/技术方案/施工组织设计/供货方案/实施方案",
+            "parent_composition_id": "BD-07",
+            "target_source": "3.1.1(7)设计方案 / 第六章七服务方案 / 第六章六设计方案 等",
+            "target_source_type": "composition_item | format_section | scoring_section | user_selected | inferred",
+            "generation_scope": "scheme_section_only | full_bid | volume_only | unknown",
+            "use_as_outline_basis": True,
+            "base_outline_strategy": "scheme_outline | format_section_children | technical_scoring_items | reference_profile_fallback | generic_fallback",
+            "base_outline_items": [
+                {
+                    "id": "BD-SP-01",
+                    "order": 1,
+                    "title": "招标文件列明的方案子项或评分项标题",
+                    "source_ref": "BD-SRC-01",
+                    "derived_from": "scheme_or_technical_outline_requirements | technical_scoring_items | reference_profile",
+                    "must_preserve_title": True,
+                }
+            ],
+            "excluded_composition_item_ids": [],
+            "excluded_composition_titles": [],
+            "selection_reason": "",
+            "confidence": "high | medium | low",
+        },
         "fixed_forms": [
             {
                 "id": "BD-FF-01",
@@ -313,8 +339,9 @@ def get_bid_document_requirements_schema() -> Dict[str, Any]:
             "source_ref": "",
         },
         "excluded_when_generating_technical_only": [],
-        "priority_rule": "投标文件编制要求优先于样例风格；样例只用于扩写深度和版式，不得覆盖招标文件格式。",
+        "priority_rule": "先定位本次要生成的方案类组成项，再生成该组成项下的目录；投标文件编制要求优先于样例风格。",
     }
+
 
 def get_analysis_report_schema() -> Dict[str, Any]:
     """结构化标准解析报告 JSON 模板。字段兼容 models.schemas.AnalysisReport。"""
@@ -361,7 +388,7 @@ def get_response_matrix_schema() -> Dict[str, Any]:
             {
                 "id": "RM-01",
                 "source_item_id": "T-01",
-                "source_type": "scoring/review/mandatory/risk/material/format/signature/evidence/price/profile_expansion",
+                "source_type": "scoring/review/mandatory/risk/material/format/signature/evidence/price/selected_generation_target/selected_outline_item/excluded_full_bid_section/profile_expansion",
                 "requirement_summary": "",
                 "response_strategy": "",
                 "target_chapter_ids": [],
@@ -476,15 +503,36 @@ def generate_analysis_report_prompt(file_content: str) -> Tuple[str, str]:
 3. 所有关键条目必须尽量填写 source 或 source_ref，写明章节名、条款号、页码、表格名或短原文。
 4. 对“★、*、▲、实质性要求、不允许偏离、废标、投标无效、否决投标、资格不通过、必须、不得、应当”等高风险内容必须单独提取。
 5. 对固定格式表单、签字盖章、报价文件、偏离表、承诺函、授权委托书、资格证明材料、暗标要求必须单独提取。
-6. 必须定位并解析招标文件中名称类似“投标文件”“投标文件格式”“投标文件的组成”“投标文件的编制”“投标文件格式要求”“技术方案/服务方案/施工组织设计/供货方案应包括”的章节；解析结果写入 bid_document_requirements，不能只写入普通说明。
+6. 必须定位并解析招标文件中名称类似“投标文件”“投标文件格式”“投标文件的组成”“投标文件的编制”“投标文件格式要求”“技术方案/服务方案/设计方案/施工组织设计/供货方案应包括”的章节；解析结果写入 bid_document_requirements，不能只写入普通说明。
 7. bid_document_requirements.composition 必须反映投标文件要求的章节顺序、必交/不适用/可选状态、固定格式、签字盖章、附件、报价相关、暗标敏感等属性。
-8. 如果方案类章节写有“应包括但不限于”或“服务纲要应包括”，必须逐项写入 bid_document_requirements.scheme_or_technical_outline_requirements，并作为后续技术/服务分册目录硬约束。
-9. 必须识别推荐输出范围 bid_mode_recommendation，可用值：full_bid、technical_only、technical_service_plan、service_plan、business_volume、qualification_volume、price_volume。不要只根据某个行业词判断，要根据招标文件要求、投标文件组成和用户目标推断。
-10. 完整投标文件格式要求、技术/服务方案要求、商务/资格/报价要求要分卷册识别；如果目标只是技术标，不要把商务、报价、资格强行放入技术目录，但要保留为 excluded_when_generating_technical_only、volume_rules 或审校信息。
-11. 评分项按 technical_scoring_items、business_scoring_items、price_scoring_items 分类；资格/形式/响应性评审单独分类。
-12. 报价规则、报价隔离、暗标、证据链、签章、固定格式、投标文件格式章节是高风险项，不得合并丢失。
-13. 为避免 JSON 截断，每个数组最多输出最关键 10 项；但 bid_document_requirements.composition 中的投标文件必备一级组成不得省略。
-14. 必须同步生成 response_matrix 初稿；如果条目很多，可覆盖高分值、高风险、阻塞项和投标文件格式硬约束。
+8. 必须生成 bid_document_requirements.selected_generation_target：
+   - 如果“投标文件组成”中有“服务方案/设计方案/技术方案/实施方案/施工组织设计/供货方案”等方案类项，且用户未明确要求 full_bid，应把该方案类项选为本次目录生成对象；
+   - 如果同时存在“3.1.1（7）设计方案”和“第六章 六、设计方案”，应把二者合并为同一 target，3.1.1 用于确认它是投标文件组成项，第六章用于提取详细格式或提纲；
+   - 如果第六章只列出“设计方案/服务方案”但没有子项，则 selected_generation_target.base_outline_strategy="technical_scoring_items"，后续目录按技术评分项展开；
+   - 如果第六章或格式章节写明“设计方案应包括/服务方案应包括”，必须将这些子项写入 base_outline_items，后续目录优先逐项采用这些标题。
+9. 如果方案类章节写有“应包括但不限于”或“服务纲要应包括”，必须逐项写入 bid_document_requirements.scheme_or_technical_outline_requirements，并作为后续技术/服务分册目录硬约束。
+10. 必须识别推荐输出范围 bid_mode_recommendation，可用值：full_bid、technical_only、technical_service_plan、service_plan、business_volume、qualification_volume、price_volume。默认情况下，只要存在 selected_generation_target 且用户没有要求完整标书，bid_mode_recommendation 应推荐 technical_only/technical_service_plan/service_plan，而不是 full_bid。
+11. 完整投标文件格式要求、技术/服务/设计方案要求、商务/资格/报价要求要分卷册识别；如果目标只是方案分册，不要把商务、报价、资格强行放入技术目录，但要保留为 selected_generation_target.excluded_composition_titles、excluded_when_generating_technical_only、volume_rules 或审校信息。
+12. 评分项按 technical_scoring_items、business_scoring_items、price_scoring_items 分类；资格/形式/响应性评审单独分类。
+   - 技术评分、商务评分、其他/价格评分必须按原评分表逐行提取，不得合并成一个总条目。
+   - 每个评分项必须填写 name、score、standard/source；standard 内必须保留该行的全部子项、扣分规则、满分条件、最低分规则和证明材料要求。
+   - 如果同一评分项下有多个子项或分档规则，standard 用换行、序号或分号拆开，保证前端能显示为“评分项 / 分值 / 得分要求”三列表格。
+   - 不允许只写“按招标文件执行”“详见评分办法”；必须摘录该评分行的实际得分要求。
+   - 其他评分、信用扣分、失信行为扣分、报价公式、价格分、经营场所、管理制度等不属于技术/商务主观评分的条目，统一放入 price_scoring_items，用 name 标明原评分项名称。
+13. 报价规则、报价隔离、暗标、证据链、签章、固定格式、投标文件格式章节是高风险项，不得合并丢失。
+14. 为避免 JSON 截断，普通数组最多输出最关键 10 项；但 technical_scoring_items、business_scoring_items、price_scoring_items 和 bid_document_requirements.composition 不受 10 项限制，应尽量完整保留原表行，最多 40 项。
+15. 必须同步生成 response_matrix 初稿；如果条目很多，可覆盖高分值、高风险、阻塞项和投标文件格式硬约束。
+16. 解析粒度要支撑前端按“基础信息、资格审查、技术评分、商务评分、其他评分、无效标与废标项、投标文件要求、开评定标流程、补充信息归纳”九类页签展示；不要把这些内容合并成一段概述。
+17. 必须优先定位“服务纲要/技术规格/评分办法/合同服务范围/资格要求/响应性条款”等关键章节，再分片抽取；同一要求如果同时出现在投标文件组成和具体格式章节，应在 source 或 source_ref 中同时体现。
+18. 每个评分项、资格项、响应性条款、废标项、格式/签章/材料要求都要带可核验原文证据，source 不得只写“招标文件”这类泛称，至少包含章节名、条款号、表格名、页码或短原文之一。
+19. 参考以下文件解析视角进行归纳，但输出仍必须符合 AnalysisReport JSON schema：
+   - 基础信息固定子项：招标人/代理信息、项目信息、关键时间/内容、保证金相关、其他信息。缺失字段用空字符串，不得臆测。
+   - 资格审查固定子项：资格评审、形式评审标准、响应性评审标准；其中资格评审内部必须尽量覆盖资质条件、业绩要求、财务要求、信誉要求、人员资格要求、联合体投标要求、安全生产许可证要求、投标资格评审否决项、营业执照要求、认证体系要求、企业荣誉要求、企业信用要求、人员业绩要求、其他资料要求。
+   - 技术评分/商务评分/其他评分：必须输出三列表格所需字段，即评分项、分值、得分要求；每个评分项的得分要求要包含子项、材料、满分/扣分/最低分规则。技术评分放 technical_scoring_items；商务评分放 business_scoring_items；失信扣分、报价公式、价格分、其他扣分规则等放 price_scoring_items。
+   - 无效标与废标项：专项提取所有“无效、否决、废标、不予受理、不得分、扣分、不接受、必须、须、不得、未响应、实质性偏离”等条款，并写触发条件和后果。
+   - 投标文件要求固定子项：投标文件组成、投标报价要求、投标文件递交方式、方案要求；签章盖章、附件模板、固定格式、格式不得修改要求要归入对应子项或 fixed_format/signature/material 字段。
+   - 开评定标流程固定子项：开标、评标、定标、后续要求，按流程顺序提取；涉及澄清、修正、异议、公示、合同签订、履约等放入对应流程。
+   - 补充信息归纳固定子项：技术规格、合同时间、项目背景、方案与格式要求、其他特殊要求、样品要求、付款方式、中标份额分配规则、中标数量规则。没有扫描到的内容保持空值，不要编造。
 
 {rulebook}
 
@@ -508,9 +556,10 @@ def generate_response_matrix_prompt(analysis_report: Dict[str, Any], reference_b
 
 目标：
 1. 确保每个评分项、资格项、形式项、响应性条款、实质性条款、废标风险、固定格式、签章要求、报价规则、证明材料都有对应响应策略。
-2. 必须把 AnalysisReport.bid_document_requirements.composition 与 scheme_or_technical_outline_requirements 纳入矩阵；这些条目是目录和正文生成的硬约束。
-3. 识别哪些内容可以生成正文，哪些必须填表，哪些必须附材料，哪些必须人工确认，哪些只允许出现在报价卷。
-4. 为后续目录、正文、图表块和审校提供强映射关系。
+2. 必须把 AnalysisReport.bid_document_requirements.composition、scheme_or_technical_outline_requirements、selected_generation_target 纳入矩阵；这些条目是目录和正文生成的硬约束。
+3. 如果 selected_generation_target.generation_scope="scheme_section_only"，矩阵必须把选中的方案类组成项和 base_outline_items 作为正文生成主线；其他投标函、保证金、报价、资格资料等完整标书组成项只能作为 excluded 或 material/human_confirm，不得映射成技术目录正文。
+4. 识别哪些内容可以生成正文，哪些必须填表，哪些必须附材料，哪些必须人工确认，哪些只允许出现在报价卷。
+5. 为后续目录、正文、图表块和审校提供强映射关系。
 
 硬性要求：
 1. 只输出合法 JSON。
@@ -519,7 +568,7 @@ def generate_response_matrix_prompt(analysis_report: Dict[str, Any], reference_b
 4. 评分项 source_item_id 引用 T/B/P；评审/资格/形式/实质性条款引用 E/Q/F/C；风险引用 R；固定格式/签章/证据链/材料引用 FF/SIG/EV/M/X。
 5. 报价、金额、税率缺失时不得生成具体数值。
 6. 可根据 ReferenceBidStyleProfile 增加 profile_expansion 类型条目，但必须说明它是样例扩展，不得伪装为招标文件强制要求。
-7. 如果用户目标为 full_bid，composition 中 required=true 且 applicability != not_applicable 的项目必须有矩阵条目；如果用户目标为技术/服务分册，scheme_or_technical_outline_requirements 中 required=true 的项目必须有矩阵条目。
+7. 如果用户目标为 full_bid，composition 中 required=true 且 applicability != not_applicable 的项目必须有矩阵条目；如果用户目标为技术/服务/方案分册，selected_generation_target.base_outline_items 和 scheme_or_technical_outline_requirements 中 required=true 的项目必须有矩阵条目。
 8. 固定格式表单、签章、盖章、日期、附件、偏差表、报价表等格式项必须标记 response_method 为 fill_form/material_attachment/human_confirm 或在 response_strategy 中明确不得自由改写。
 
 {rulebook}
@@ -559,15 +608,26 @@ def generate_level1_outline_prompt(
 硬性要求：
 1. 只输出合法 JSON，不输出 markdown。
 2. 不得重新解析招标文件；只能使用传入的 AnalysisReport 和 ResponseMatrix。
-3. 目录必须服从 bid_document_requirements、volume_rules、bid_structure、报价隔离、暗标/匿名和固定格式要求；其中 bid_document_requirements 的优先级最高。
-4. 如果输出范围是 technical_only、technical_service_plan 或 service_plan，不得生成完整投标文件中的投标函、报价、保证金、资格审查资料等正文卷册；但必须严格覆盖 bid_document_requirements.scheme_or_technical_outline_requirements 中列明的技术/服务/实施方案子项，并把排除的完整投标文件章节写入描述或 coverage_summary。
-5. 如果输出范围是 full_bid，必须按 bid_document_requirements.composition 的顺序覆盖投标函、授权/身份证明、联合体协议、保证金、报价、资格审查资料、技术/服务/实施方案、其他资料、偏差表等必要卷册；不适用项不得删除风险说明，应按招标文件写“不适用”或设置为 not_applicable。
-6. 如果有 ReferenceBidStyleProfile，应优先吸收其目录层级、标题风格、表格/承诺/图片位置；但不得机械照抄行业特定内容、历史项目残留，也不得覆盖 bid_document_requirements。
-7. 每个一级节点必须包含：id、volume_id、title、chapter_type、description、fixed_format_sensitive、price_sensitive、anonymity_sensitive、expected_word_count、scoring_item_ids、requirement_ids、risk_ids、material_ids、response_matrix_ids、children。
-8. scoring_item_ids 只能放 T/B/P；requirement_ids 放 E/Q/F/C；risk_ids 放 R；material_ids 放 M/X/EV/FF/SIG。
-9. 分值高、阻塞风险高、证据链复杂的章节应有更高 expected_word_count 和更细 children。
-10. 目录标题应优先采用招标文件“投标文件/投标文件格式”中的章节名称；只有在招标文件允许自拟或仅给出参考纲要时，才可按样例风格优化标题。
-11. 不生成正文。
+3. 目录必须服从 bid_document_requirements、selected_generation_target、volume_rules、bid_structure、报价隔离、暗标/匿名和固定格式要求；其中 selected_generation_target 和 bid_document_requirements 的优先级最高。
+4. 目录生成前必须先判断本次输出范围：
+   - full_bid：按 bid_document_requirements.composition 的顺序生成整本投标文件目录；
+   - technical_only/technical_service_plan/service_plan 或未明确但 selected_generation_target.use_as_outline_basis=true：只生成 selected_generation_target 对应的方案分册/方案章节目录；
+   - price_volume/qualification_volume/business_volume：只生成对应卷册。
+5. 当只生成方案分册时，不得生成完整投标文件中的投标函、报价、保证金、资格审查资料、偏差表等正文卷册；这些应进入 selected_generation_target.excluded_composition_titles、描述或 coverage_summary。
+6. 方案分册目录的标题依据优先级：
+   A. selected_generation_target.base_outline_items 中 must_preserve_title=true 的标题；
+   B. bid_document_requirements.scheme_or_technical_outline_requirements；
+   C. 技术/服务详细评分项 technical_scoring_items；
+   D. ReferenceBidStyleProfile 的同类目录风格；
+   E. 通用服务/技术方案保底目录。
+7. 如果招标文件只在“3.1.1（7）设计方案”列出生成对象，又在第六章“六、设计方案”列出“应包括”的十项内容，应以这十项内容作为目录一级或主要二级标题。
+8. 如果第六章没有列出方案子项，则用第三章详细技术评分项作为目录主线，例如“进度管理及保证措施、质量管理及保证措施、内部审查程序、文档管理计划与控制措施”等。
+9. 如果有 ReferenceBidStyleProfile，只能吸收其目录层级、标题风格、表格/承诺/图片位置；不得机械照抄行业特定内容、历史项目残留，也不得覆盖招标文件确定的 selected_generation_target。
+10. 每个一级节点必须包含：id、volume_id、title、chapter_type、description、fixed_format_sensitive、price_sensitive、anonymity_sensitive、expected_word_count、scoring_item_ids、requirement_ids、risk_ids、material_ids、response_matrix_ids、children。
+11. scoring_item_ids 只能放 T/B/P；requirement_ids 放 E/Q/F/C；risk_ids 放 R；material_ids 放 M/X/EV/FF/SIG。
+12. 分值高、阻塞风险高、证据链复杂的章节应有更高 expected_word_count 和更细 children。
+13. 目录标题应优先采用招标文件“投标文件/投标文件格式”中的章节名称；只有在招标文件允许自拟或仅给出参考纲要时，才可按样例风格优化标题。
+14. 不生成正文。
 
 通用服务/技术方案保底目录参考，仅在招标文件适合服务/技术方案分册且无更明确格式时参考：
 {service_template}
@@ -609,13 +669,13 @@ def generate_level23_outline_prompt(
 硬性要求：
 1. 禁止修改当前一级章节 id、title、volume_id、chapter_type。
 2. 不得新增 AnalysisReport 和 ResponseMatrix 中不存在的强制条款 ID。
-3. 如果当前一级章节在 bid_document_requirements.composition 或 scheme_or_technical_outline_requirements 中有对应要求，二三级目录必须覆盖这些要求；不得因为样例目录不同而漏项。
+3. 如果当前一级章节在 selected_generation_target.base_outline_items、bid_document_requirements.composition 或 scheme_or_technical_outline_requirements 中有对应要求，二三级目录必须覆盖这些要求；不得因为样例目录不同而漏项。
 4. 如果当前一级章节已有成熟样例 children，应优先保留其合理结构；但必须修正行业错配、历史项目残留和与招标文件冲突的内容。
 5. 价格敏感内容只能出现在允许价格的卷册；暗标章节不得设计暴露投标人身份的标题或素材位。
 6. 证明材料类章节应设计“材料清单、证明用途、核验要点、页码索引”。
 7. 技术/服务/实施方案类章节应按评分标准拆成“理解、方法、流程、组织、进度、质量、安全、风险、成果、保障”中最合适的结构。
 8. 固定格式表单类章节只能设计填报项和核验项，不得改动表头、列名和固定文字。
-9. 对招标文件写明“应包括但不限于”的方案纲要，必须逐项拆出二级或三级节点，或在 description 中说明由哪个节点覆盖。
+9. 对招标文件写明“应包括但不限于”的方案纲要，必须逐项拆出二级或三级节点，或在 description 中说明由哪个节点覆盖；如果 selected_generation_target.base_outline_items 已经提供标题，必须保留标题语义和顺序。
 10. description 要写清本节点要写什么、响应哪些评分项、需要哪些表格/承诺/图片/企业资料。
 
 {rulebook}
@@ -712,11 +772,12 @@ def generate_chapter_content_prompt(
 12. 涉及组织机构时，输出组织架构图占位或结构化职责说明；人员姓名、证书、履历缺失时占位。
 13. 涉及设备、软件、产品、备品备件、仪器、车辆、平台时，必须依据企业资料或资源库；缺失时用表格占位，不得虚构品牌、数量、型号。
 14. 涉及图片、证书、截图、效果图、系统截图、案例展示时，先写展示目的和插入位置，再输出图片占位；不得假装已有图片。
-15. 当前章节如对应 bid_document_requirements.composition 或 fixed_forms，必须严格按该要求写作；固定格式表单、承诺函、偏离表、报价表等章节不得改表头、列名、固定文字和行列结构。
-16. 当前章节如属于技术/服务/实施方案，应逐项覆盖 bid_document_requirements.scheme_or_technical_outline_requirements 中映射到本章节的要点；不得只按历史样例自由扩写。
-17. 当前章节如未被招标文件“投标文件/投标文件格式”要求，但来自样例 profile_expansion，必须确保不与招标文件目录、评分项、卷册隔离和固定格式冲突。
-18. 正文中不得写死页码。
-17. 与同级章节不得重复；同级已覆盖的内容，本节只深化、引用或建立索引。
+15. 当前章节如对应 selected_generation_target.base_outline_items、bid_document_requirements.composition 或 fixed_forms，必须严格按该要求写作；固定格式表单、承诺函、偏离表、报价表等章节不得改表头、列名、固定文字和行列结构。
+16. 当前章节如属于技术/服务/设计/实施方案，应逐项覆盖 selected_generation_target.base_outline_items 和 bid_document_requirements.scheme_or_technical_outline_requirements 中映射到本章节的要点；不得只按历史样例自由扩写。
+17. 如果本次输出范围是方案分册，正文不得出现投标函、报价、投标保证金、资格审查资料等非 selected_generation_target 的完整标书正文内容；必要时只可写“该内容按招标文件对应格式另行提供”。
+18. 当前章节如未被招标文件“投标文件/投标文件格式”要求，但来自样例 profile_expansion，必须确保不与招标文件目录、评分项、卷册隔离和固定格式冲突。
+19. 正文中不得写死页码。
+20. 与同级章节不得重复；同级已覆盖的内容，本节只深化、引用或建立索引。
 
 写作风格：
 1. 使用“目标—措施—流程—保障—承诺”的结构。
@@ -772,9 +833,9 @@ def generate_compliance_review_prompt(
 必须检查：
 1. 项目名称、招标人、投标人、日期、服务期限/工期/交付期是否统一；不得出现历史项目名称、历史招标人或历史日期。
 2. 输出范围是否正确：technical_only/service_plan 不得混入报价、保证金、投标函、资格审查资料正文；full_bid 则不得遗漏招标文件要求的完整卷册。
-3. 是否严格遵守 AnalysisReport.bid_document_requirements：full_bid 要检查 composition 顺序与必备章节，技术/服务分册要检查 scheme_or_technical_outline_requirements 全覆盖，固定格式要检查表头、固定文字、签章栏和附件要求。
+3. 是否严格遵守 AnalysisReport.bid_document_requirements 和 selected_generation_target：full_bid 要检查 composition 顺序与必备章节；技术/服务/设计方案分册要检查 selected_generation_target.base_outline_items 和 scheme_or_technical_outline_requirements 全覆盖；固定格式要检查表头、固定文字、签章栏和附件要求。
 4. ResponseMatrix 和 AnalysisReport 中的评分项、审查项、实质性条款、材料项、风险项是否覆盖.
-4. 招标文件要求的方案目录、承诺书、表格、证明材料、固定格式、签章、报价隔离、暗标规则是否满足。
+4. 招标文件要求的方案目录、承诺书、表格、证明材料、固定格式、签章、报价隔离、暗标规则是否满足；如果输出范围是方案分册，是否误把被排除的投标函、保证金、报价、资格资料写入正文。
 5. 企业资料缺失是否保留明确占位；是否把缺失资料写成已具备。
 6. 图表与素材规划中的必需表格、组织图、流程图、承诺书、图片/证书/截图占位是否存在。
 7. 页码、附件索引、响应页码是否使用 〖页码待编排〗 或等待 Word 自动更新。

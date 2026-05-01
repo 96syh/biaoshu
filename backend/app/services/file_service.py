@@ -1,11 +1,17 @@
 """文件处理服务"""
 import aiofiles
+import json
 import os
+import platform
+import shutil
+import subprocess
 import time
 import gc
 import io
+import tempfile
 from datetime import datetime
-from typing import Optional, List, Dict, Tuple
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple, Any
 import PyPDF2
 import docx
 from fastapi import UploadFile
@@ -28,10 +34,63 @@ class FileService:
     """文件处理服务"""
 
     SUPPORTED_UPLOAD_MESSAGE = "仅支持 PDF 和 DOCX 文件，暂不支持 DOC，请先另存为 DOCX 后再上传"
+    MINERU_DEFAULT_TIMEOUT = 900
 
     # 图片上传配置
     IMAGE_UPLOAD_URL = "https://mt.agnet.top/image/upload"
     IMAGE_UPLOAD_TIMEOUT = 30  # 超时时间（秒）
+
+    @staticmethod
+    def get_parser_mode() -> str:
+        """文档解析器选择：auto / mineru / mineru_strict / legacy。"""
+        mode = os.getenv("YIBIAO_DOCUMENT_PARSER", "auto").strip().lower()
+        if mode not in {"auto", "mineru", "mineru_strict", "legacy"}:
+            return "auto"
+        return mode
+
+    @staticmethod
+    def _mineru_command() -> Optional[str]:
+        """返回本机可用 MinerU CLI 路径。"""
+        configured = os.getenv("YIBIAO_MINERU_BIN", "mineru").strip() or "mineru"
+        if os.path.isabs(configured) and os.access(configured, os.X_OK):
+            return configured
+        resolved = shutil.which(configured)
+        if resolved:
+            return resolved
+
+        mineru_home = os.getenv("YIBIAO_MINERU_HOME", "").strip()
+        candidate_roots = [Path(mineru_home)] if mineru_home else []
+        current_path = Path(__file__).resolve()
+        candidate_roots.extend([
+            current_path.parents[6] / "MinerU",
+            current_path.parents[5] / "MinerU",
+            Path("/Users/songyuheng/Documents/01work/python_code_locate/MinerU"),
+        ])
+        for root in candidate_roots:
+            for relative in (".venv-mps/bin/mineru", ".venv/bin/mineru"):
+                candidate = root / relative
+                if candidate.exists() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+        return None
+
+    @staticmethod
+    def _detect_mineru_device() -> str:
+        """选择 MinerU 本地推理设备：CUDA -> MPS -> CPU。"""
+        configured = os.getenv("YIBIAO_MINERU_DEVICE", "auto").strip().lower()
+        if configured in {"cuda", "mps", "cpu"}:
+            return configured
+
+        if shutil.which("nvidia-smi"):
+            try:
+                proc = subprocess.run(["nvidia-smi", "-L"], timeout=2, capture_output=True, text=True)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return "cuda"
+            except Exception:
+                pass
+
+        if platform.system().lower() == "darwin":
+            return "mps"
+        return "cpu"
 
     @staticmethod
     def detect_upload_file_kind(file: UploadFile) -> Optional[str]:
@@ -376,6 +435,152 @@ class FileService:
         else:
             # 降级到原来的python-docx方法，但增强表格处理
             return await FileService._extract_docx_with_python_docx(file_path)
+
+    @staticmethod
+    def _build_mineru_env(device: str) -> Dict[str, str]:
+        """构造 MinerU 本地运行环境，不调用云端 API。"""
+        env = dict(os.environ)
+        env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        if device == "cuda":
+            env.setdefault("CUDA_VISIBLE_DEVICES", os.getenv("YIBIAO_CUDA_VISIBLE_DEVICES", "0"))
+        elif device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        return env
+
+    @staticmethod
+    def _find_mineru_output_files(output_dir: str) -> Tuple[Optional[Path], Optional[Path]]:
+        """在 MinerU 输出目录中找到主 Markdown 和 content_list JSON。"""
+        root = Path(output_dir)
+        markdown_files = [path for path in root.rglob("*.md") if path.is_file()]
+        content_files = [
+            path for path in root.rglob("*.json")
+            if path.is_file() and "content_list" in path.name
+        ]
+
+        markdown = max(markdown_files, key=lambda path: path.stat().st_size, default=None)
+        content_json = max(content_files, key=lambda path: path.stat().st_size, default=None)
+        return markdown, content_json
+
+    @staticmethod
+    def _load_mineru_block_count(content_json: Optional[Path]) -> int:
+        if not content_json:
+            return 0
+        try:
+            data = json.loads(content_json.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return len(data)
+            if isinstance(data, dict):
+                return len(data.get("content") or data.get("blocks") or [])
+        except Exception:
+            return 0
+        return 0
+
+    @staticmethod
+    async def _extract_with_mineru(file_path: str, file_kind: str) -> Tuple[str, Dict[str, Any]]:
+        """用本机 MinerU CLI 把文件解析成 Markdown。"""
+        mineru_bin = FileService._mineru_command()
+        if not mineru_bin:
+            raise RuntimeError("未找到 mineru 命令，请先安装 MinerU 或设置 YIBIAO_MINERU_BIN")
+
+        device = FileService._detect_mineru_device()
+        backend = os.getenv("YIBIAO_MINERU_BACKEND", "pipeline").strip() or "pipeline"
+        lang = os.getenv("YIBIAO_MINERU_LANG", "ch").strip() or "ch"
+        timeout = int(os.getenv("YIBIAO_MINERU_TIMEOUT", str(FileService.MINERU_DEFAULT_TIMEOUT)))
+
+        with tempfile.TemporaryDirectory(prefix="yibiao-mineru-") as output_dir:
+            command = [
+                mineru_bin,
+                "-p",
+                file_path,
+                "-o",
+                output_dir,
+                "-b",
+                backend,
+                "-l",
+                lang,
+            ]
+            api_url = os.getenv("YIBIAO_MINERU_API_URL", "").strip()
+            if api_url:
+                command.extend(["--api-url", api_url])
+
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=FileService._build_mineru_env(device),
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                proc.kill()
+                await proc.communicate()
+                raise TimeoutError(f"MinerU 解析超过 {timeout} 秒") from exc
+
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            if proc.returncode != 0:
+                error_tail = (stderr or stdout)[-1200:]
+                raise RuntimeError(f"MinerU 解析失败，退出码 {proc.returncode}: {error_tail}")
+
+            markdown_file, content_json = FileService._find_mineru_output_files(output_dir)
+            if not markdown_file:
+                raise RuntimeError("MinerU 未生成 Markdown 输出")
+
+            markdown = markdown_file.read_text(encoding="utf-8").strip()
+            if not markdown:
+                raise RuntimeError("MinerU Markdown 输出为空")
+
+            return markdown, {
+                "parser": "mineru",
+                "format": "markdown",
+                "file_kind": file_kind,
+                "device": device,
+                "backend": backend,
+                "language": lang,
+                "api_url": api_url,
+                "markdown_file": markdown_file.name,
+                "content_list_file": content_json.name if content_json else "",
+                "content_block_count": FileService._load_mineru_block_count(content_json),
+                "fallback_used": False,
+            }
+
+    @staticmethod
+    async def _extract_with_legacy_parser(file_path: str, file_kind: str) -> Tuple[str, Dict[str, Any]]:
+        """现有 pdfplumber / docx2python 解析路径。"""
+        if file_kind == "pdf":
+            text = await FileService.extract_text_from_pdf(file_path)
+            parser = "pdfplumber" if HAS_ADVANCED_LIBS else "pypdf2"
+        elif file_kind == "docx":
+            text = await FileService.extract_text_from_docx(file_path)
+            parser = "docx2python" if HAS_ADVANCED_LIBS else "python-docx"
+        else:
+            raise Exception("不支持的文件类型")
+        return text, {
+            "parser": parser,
+            "format": "plain_text",
+            "file_kind": file_kind,
+            "fallback_used": False,
+        }
+
+    @staticmethod
+    async def _extract_with_configured_parser(file_path: str, file_kind: str) -> Tuple[str, Dict[str, Any]]:
+        """按配置优先使用 MinerU，本机不可用时保留现有解析器。"""
+        mode = FileService.get_parser_mode()
+        if mode == "legacy":
+            return await FileService._extract_with_legacy_parser(file_path, file_kind)
+
+        try:
+            return await FileService._extract_with_mineru(file_path, file_kind)
+        except Exception as exc:
+            if mode == "mineru_strict":
+                raise
+            text, info = await FileService._extract_with_legacy_parser(file_path, file_kind)
+            info.update({
+                "fallback_used": True,
+                "preferred_parser": "mineru",
+                "fallback_reason": str(exc),
+            })
+            return text, info
     
     @staticmethod
     async def _extract_docx_with_docx2python(file_path: str) -> str:
@@ -538,8 +743,8 @@ class FileService:
             raise Exception(f"Word文档读取失败: {str(e)}")
     
     @staticmethod
-    async def process_uploaded_file(file: UploadFile) -> str:
-        """处理上传的文件并提取文本内容"""
+    async def process_uploaded_file_with_metadata(file: UploadFile) -> Dict[str, Any]:
+        """处理上传的文件并提取文本内容，返回解析器元信息。"""
         file_kind = FileService.detect_upload_file_kind(file)
         if file_kind in (None, "doc"):
             raise Exception(FileService.get_upload_validation_message(file))
@@ -556,20 +761,27 @@ class FileService:
         file_path = await FileService.save_uploaded_file(file)
         
         try:
-            # 根据文件类型提取文本和图片
-            if file_kind == "pdf":
-                text = await FileService.extract_text_from_pdf(file_path)
-            elif file_kind == "docx":
-                text = await FileService.extract_text_from_docx(file_path)
-            else:
-                raise Exception(FileService.get_upload_validation_message(file))
+            text, parser_info = await FileService._extract_with_configured_parser(file_path, file_kind)
+            if not text.strip():
+                raise Exception("无法从文件中提取文本内容")
+            parser_info.setdefault("saved_file", os.path.basename(file_path))
+            parser_info.setdefault("file_size", os.path.getsize(file_path))
 
             # 成功提取后，使用安全的文件清理方法
             FileService._safe_file_cleanup(file_path)
 
-            return text
+            return {
+                "file_content": text,
+                "parser_info": parser_info,
+            }
 
         except Exception as e:
             # 异常情况下也使用安全的文件清理方法
             FileService._safe_file_cleanup(file_path)
             raise e
+
+    @staticmethod
+    async def process_uploaded_file(file: UploadFile) -> str:
+        """处理上传的文件并提取文本内容。"""
+        result = await FileService.process_uploaded_file_with_metadata(file)
+        return str(result.get("file_content") or "")

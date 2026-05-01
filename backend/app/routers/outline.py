@@ -30,6 +30,7 @@ async def generate_outline(request: OutlineRequest):
                 compute_task = asyncio.create_task(openai_service.generate_outline_v2(
                     overview=request.overview,
                     requirements=request.requirements,
+                    file_content=request.file_content,
                     analysis_report=(
                         request.analysis_report.model_dump(mode="json")
                         if request.analysis_report else None
@@ -112,6 +113,7 @@ async def generate_outline_stream(request: OutlineRequest):
                     openai_service.generate_outline_v2(
                         overview=request.overview,
                         requirements=merged_requirements,
+                        file_content=request.file_content,
                         analysis_report=(
                             request.analysis_report.model_dump(mode="json")
                             if request.analysis_report else None

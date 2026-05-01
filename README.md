@@ -81,6 +81,24 @@ screenshots/             截图资源
 
 ## 本地开发
 
+### 一键启动
+
+macOS/Linux 可在项目根目录执行：
+
+```bash
+./start-dev.sh
+```
+
+脚本会固定启动：
+
+```text
+后端：http://127.0.0.1:8000
+前端：http://127.0.0.1:3001
+前端 API：REACT_APP_API_URL=http://127.0.0.1:8000
+```
+
+在 macOS 中也可以双击 `start-dev.command` 启动。关闭脚本窗口或按 `Ctrl+C` 会停止本脚本启动的前后端进程。
+
 ### 1. 启动后端
 
 ```bash
@@ -136,6 +154,39 @@ backend/app/config.py
 - CORS：默认允许本地 3000-3004 和 8000 端口
 
 模型配置由应用界面写入本地配置文件，不建议把真实 API Key 写入源码。
+
+### 本地 MinerU 文档解析
+
+上传解析默认会自动探测本机是否有 `mineru` CLI：
+
+- 有 MinerU：优先用本地 MinerU 将 PDF/DOCX 解析为 Markdown，再进入标准解析、目录和正文流程。
+- 没有 MinerU 或解析失败：自动回退到内置 `pdfplumber` / `docx2python` 解析器。
+- 不调用 MinerU 云端 API；模型理解仍通过 LiteLLM 配置的模型服务完成。
+
+可选环境变量：
+
+```bash
+# auto：自动用 MinerU，失败回退；legacy：只用内置解析器；
+# mineru_strict：MinerU 失败则直接报错
+export YIBIAO_DOCUMENT_PARSER=auto
+
+# MinerU CLI 路径，默认从 PATH 查找 mineru
+export YIBIAO_MINERU_BIN=mineru
+
+# auto：CUDA -> MPS -> CPU；也可手动指定 cuda / mps / cpu
+export YIBIAO_MINERU_DEVICE=auto
+
+# MinerU 后端，默认 pipeline；如需 VLM 可按 MinerU 文档调整
+export YIBIAO_MINERU_BACKEND=pipeline
+
+# 中文文档默认 ch
+export YIBIAO_MINERU_LANG=ch
+
+# 单文件解析超时，默认 900 秒
+export YIBIAO_MINERU_TIMEOUT=900
+```
+
+macOS 上若安装了支持 MPS 的 MinerU/PyTorch，`YIBIAO_MINERU_DEVICE=auto` 会优先选择 MPS；Linux 上检测到 `nvidia-smi` 时会优先选择 CUDA。
 
 ## Docker 运行
 
