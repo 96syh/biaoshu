@@ -1064,6 +1064,16 @@
     background: #fff7f6;
   }
 
+  .task-progress--paused {
+    border-color: #efcf8f;
+    background: #fffaf0;
+  }
+
+  .task-progress--stopped {
+    border-color: #efb5af;
+    background: #fff7f6;
+  }
+
   .task-progress__head {
     display: flex;
     justify-content: space-between;
@@ -1109,7 +1119,23 @@
     background: var(--ops-red);
   }
 
+  .task-progress--paused .task-progress__bar span {
+    background: var(--ops-amber);
+  }
+
+  .task-progress--stopped .task-progress__bar span {
+    background: var(--ops-red);
+  }
+
   .task-progress--error .task-progress__head span {
+    color: var(--ops-red);
+  }
+
+  .task-progress--paused .task-progress__head span {
+    color: var(--ops-amber);
+  }
+
+  .task-progress--stopped .task-progress__head span {
     color: var(--ops-red);
   }
 
@@ -1170,6 +1196,41 @@
     font-weight: 800;
   }
 
+  .analysis-control-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin: 8px 0 12px;
+    padding: 8px;
+    border: 1px solid var(--ops-border);
+    border-radius: 7px;
+    background: #fbfdfc;
+  }
+
+  .analysis-control-row button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--ops-border);
+    border-radius: 6px;
+    background: #fff;
+    color: #34413b;
+    font-size: 12px;
+    font-weight: 800;
+    cursor: pointer;
+  }
+
+  .analysis-control-row button:disabled {
+    cursor: not-allowed;
+    opacity: 0.52;
+  }
+
+  .analysis-control-row svg {
+    flex: 0 0 auto;
+  }
+
   .info-row {
     align-items: flex-start;
     padding: 6px 0;
@@ -1184,6 +1245,52 @@
     max-width: 145px;
     text-align: right;
     font-weight: 700;
+  }
+
+  .reference-profile-panel .info-row strong {
+    max-width: 190px;
+  }
+
+  .reference-profile-summary {
+    display: grid;
+    gap: 5px;
+    margin-bottom: 8px;
+    padding: 10px;
+    border: 1px dashed #cfe1d8;
+    border-radius: 7px;
+    background: #fbfdfc;
+  }
+
+  .reference-profile-summary strong {
+    color: #21352c;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .reference-profile-summary span {
+    color: var(--ops-muted);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
+  .reference-style-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .reference-style-grid span {
+    overflow: hidden;
+    padding: 7px 8px;
+    border-radius: 6px;
+    background: #eef7f2;
+    color: #315244;
+    font-size: 11px;
+    font-weight: 750;
+    line-height: 1.45;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .field-hint {

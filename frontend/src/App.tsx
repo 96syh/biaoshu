@@ -50,7 +50,8 @@ type ProgressState = {
   percent: number;
   stepIndex: number;
   steps: string[];
-  status: 'running' | 'success' | 'error';
+  status: 'running' | 'success' | 'error' | 'paused' | 'stopped';
+  taskId?: string;
   error?: string;
 };
 type GenerationControlState = 'idle' | 'running' | 'paused' | 'stopped';
@@ -100,9 +101,19 @@ const DEFAULT_WORD_STYLE_PROFILE: Record<string, string> = {
   heading_3_size: '12pt',
   table_font_size: '9pt',
 };
+const EMPTY_REFERENCE_PROFILE: Record<string, unknown> = {};
 
 const profileRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+
+const listCount = (value: unknown): number => (Array.isArray(value) ? value.length : 0);
+
+const isUsableReferenceProfile = (value: unknown): value is Record<string, unknown> => {
+  const profile = profileRecord(value);
+  const profileName = String(profile.profile_name || '');
+  if (!Object.keys(profile).length || /兜底|失败|fallback/i.test(profileName)) return false;
+  return listCount(profile.outline_template) > 0 && listCount(profile.chapter_blueprints) > 0;
+};
 
 const normalizeCssValue = (value: unknown, fallback: string) => {
   const text = String(value || '').trim();
@@ -174,7 +185,6 @@ const NAV_ITEMS: Array<{ key: NavKey; label: string; description: string; icon: 
 
 const FLOW_STEPS = ['上传', '标准解析', '目录映射', '正文生成', '合规审校', '导出'];
 const ANALYSIS_STEPS = ['文件解析', '条款识别', '评分项提取', '合规要求提取', '结果校验'];
-const ANALYSIS_REPORT_TIMEOUT_MS = 30 * 60 * 1000;
 const BLOCKING_REPORT_WARNING_PATTERN = /兜底|未完整返回|模型输出未完整|解析失败|超时/;
 const toLiteLLMConfig = (config?: Partial<ConfigData>): ConfigData => ({
   provider: DEFAULT_PROVIDER_ID,
@@ -1309,6 +1319,7 @@ const App = () => {
   const [configOpen, setConfigOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState(state.uploadedFileName || '');
   const [referenceFileName, setReferenceFileName] = useState('');
+  const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [busy, setBusy] = useState('');
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -1331,6 +1342,8 @@ const App = () => {
   const [editingOutlineId, setEditingOutlineId] = useState('');
   const [outlineEditorForm, setOutlineEditorForm] = useState<OutlineEditorForm>({ id: '', title: '', description: '' });
   const [streamingChapterId, setStreamingChapterId] = useState('');
+  const [analysisTaskId, setAnalysisTaskId] = useState('');
+  const [analysisControl, setAnalysisControl] = useState<GenerationControlState>('idle');
   const [generationControl, setGenerationControl] = useState<GenerationControlState>('idle');
   const [generationProgress, setGenerationProgress] = useState<ProgressState | null>(null);
   const [exportDirectory, setExportDirectory] = useState('~/Downloads');
@@ -1343,11 +1356,28 @@ const App = () => {
   const generationAbortRef = useRef<AbortController | null>(null);
   const generationPausedRef = useRef(false);
   const generationStoppedRef = useRef(false);
+  const analysisStoppedRef = useRef(false);
   const batchOutlineRef = useRef<OutlineData | null>(null);
 
   const activeReport = state.analysisReport || state.outlineData?.analysis_report || null;
   const effectiveOutline = state.outlineData;
-  const activeReferenceProfile = effectiveOutline?.reference_bid_style_profile || activeReport?.reference_bid_style_profile || referenceProfile;
+  const outlineReferenceProfile = profileRecord(effectiveOutline?.reference_bid_style_profile);
+  const reportReferenceProfile = profileRecord(activeReport?.reference_bid_style_profile);
+  const rawReferenceProfile = Object.keys(outlineReferenceProfile).length
+    ? outlineReferenceProfile
+    : Object.keys(reportReferenceProfile).length
+      ? reportReferenceProfile
+      : referenceProfile;
+  const activeReferenceProfile = isUsableReferenceProfile(rawReferenceProfile) ? rawReferenceProfile : EMPTY_REFERENCE_PROFILE;
+  const activeReferenceRecord = profileRecord(activeReferenceProfile);
+  const referenceWordStyle = profileRecord(activeReferenceRecord.word_style_profile);
+  const hasReferenceProfile = Object.keys(activeReferenceRecord).length > 0;
+  const referenceProfileStats = [
+    ['目录模板', `${listCount(activeReferenceRecord.outline_template)} 项`],
+    ['章节骨架', `${listCount(activeReferenceRecord.chapter_blueprints)} 组`],
+    ['表格模型', `${listCount(activeReferenceRecord.table_models)} 个`],
+    ['图片/素材位', `${listCount(activeReferenceRecord.image_slots)} 个`],
+  ];
   const wordPreviewStyle = useMemo(
     () => buildWordPreviewStyle(activeReferenceProfile as Record<string, unknown>),
     [activeReferenceProfile],
@@ -1589,6 +1619,36 @@ const App = () => {
       : { label: '处理中', detail, percent: clampProgress(percent), stepIndex: stepIndex ?? 0, steps: [], status: 'running' });
   };
 
+  const updateAnalysisStage = (
+    detail: string,
+    percent: number,
+    stepIndex?: number,
+    status: ProgressState['status'] = 'running',
+    taskId?: string,
+    taskVersion = progressVersionRef.current,
+  ) => {
+    if (taskVersion !== progressVersionRef.current) return;
+    setProgress(prev => prev
+      ? {
+        ...prev,
+        detail,
+        percent: clampProgress(percent),
+        stepIndex: stepIndex ?? prev.stepIndex,
+        status,
+        taskId: taskId || prev.taskId,
+        error: status === 'error' ? prev.error : undefined,
+      }
+      : {
+        label: '标准解析',
+        detail,
+        percent: clampProgress(percent),
+        stepIndex: stepIndex ?? 0,
+        steps: ANALYSIS_STEPS,
+        status,
+        taskId,
+      });
+  };
+
   const completeProgress = (detail: string, taskVersion = progressVersionRef.current) => {
     if (taskVersion !== progressVersionRef.current) return;
     setProgress(prev => {
@@ -1621,20 +1681,15 @@ const App = () => {
     }));
   };
 
-  const withTaskTimeout = async <T,>(promise: Promise<T>, message: string, taskVersion: number, timeoutMs = 300000): Promise<T> => {
-    let timeoutId: number | undefined;
-    try {
-      return await Promise.race([
-        promise,
-        new Promise<T>((_, reject) => {
-          timeoutId = window.setTimeout(() => {
-            if (taskVersion === progressVersionRef.current) reject(new Error(message));
-          }, timeoutMs);
-        }),
-      ]);
-    } finally {
-      if (timeoutId) window.clearTimeout(timeoutId);
-    }
+  const stopProgress = (detail: string, taskVersion = progressVersionRef.current) => {
+    if (taskVersion !== progressVersionRef.current) return;
+    progressVersionRef.current += 1;
+    setProgress(prev => prev ? {
+      ...prev,
+      detail,
+      status: 'stopped',
+      error: undefined,
+    } : prev);
   };
 
   const syncGenerationProgress = (detail: string, percent: number, stepIndex = 0, label = '正文生成') => {
@@ -1751,11 +1806,9 @@ const App = () => {
       const response = await documentApi.uploadFile(file);
       if (!response.data.success || !response.data.file_content) throw new Error(response.data.message || '上传失败');
       setUploadedFileName(file.name);
-      setReferenceFileName('');
       setReviewReport(null);
       setManualReviewConfirmed(false);
       setConsistencyReport(null);
-      setReferenceProfile({});
       setDocumentBlocksPlan({});
       setActiveDocId('');
       setOutlineDraftRows([]);
@@ -1774,26 +1827,57 @@ const App = () => {
     }
   };
 
-  const handleReferenceUpload = async (file: File) => {
+  const clearReferenceProfileFromDraft = () => {
+    setReferenceProfile({});
+    if (state.analysisReport) {
+      updateAnalysisResults(state.projectOverview, state.techRequirements, {
+        ...state.analysisReport,
+        reference_bid_style_profile: {},
+      });
+    }
+    if (effectiveOutline) {
+      updateOutline({ ...effectiveOutline, reference_bid_style_profile: {} });
+    }
+  };
+
+  const handleReferenceSelect = (file: File) => {
     if (!file.name.toLowerCase().match(/\.(pdf|docx)$/)) {
       setError('样例文件仅支持 PDF 和 DOCX');
+      return;
+    }
+    if (file.size > 500 * 1024 * 1024) {
+      setError('样例文件大小不能超过 500MB');
+      return;
+    }
+    setReferenceFile(file);
+    setReferenceFileName(file.name);
+    clearReferenceProfileFromDraft();
+    setSuccess('成熟样例已选择，点击“去解析”后才会调用 MinerU 和模型解析');
+  };
+
+  const runReferenceAnalysis = async () => {
+    if (!referenceFile) {
+      setError('请先选择成熟样例文件');
       return;
     }
     setBusy('reference');
     const taskVersion = startProgress('样例解析', ['MinerU 转 Markdown', '提取写作模板'], '正在解析成熟投标文件样例', 10);
     try {
-      const response = await documentApi.uploadReferenceStyleFile(file);
+      const response = await documentApi.uploadReferenceStyleFile(referenceFile);
       if (!response.data.success || !response.data.reference_bid_style_profile) {
         throw new Error(response.data.message || '样例解析失败');
       }
       const profile = response.data.reference_bid_style_profile;
-      setReferenceFileName(file.name);
+      setReferenceFileName(referenceFile.name);
       setReferenceProfile(profile);
       if (state.analysisReport) {
         updateAnalysisResults(state.projectOverview, state.techRequirements, {
           ...state.analysisReport,
           reference_bid_style_profile: profile,
         });
+      }
+      if (effectiveOutline) {
+        updateOutline({ ...effectiveOutline, reference_bid_style_profile: profile });
       }
       completeProgress('样例写作模板已生成', taskVersion);
       setSuccess('成熟样例已通过 MinerU Markdown 接入，后续响应矩阵、目录、正文和审校会复用其模板结构');
@@ -1802,6 +1886,35 @@ const App = () => {
       setError(error.response?.data?.detail || error.message || '样例解析失败');
     } finally {
       setBusy('');
+    }
+  };
+
+  const controlAnalysisTask = async (action: 'pause' | 'resume' | 'stop') => {
+    if (!analysisTaskId) {
+      setError('解析任务尚未建立，请等待后端返回任务编号');
+      return;
+    }
+    try {
+      await documentApi.controlAnalysisTask(analysisTaskId, action);
+      if (action === 'pause') {
+        setAnalysisControl('paused');
+        setProgress(prev => prev ? { ...prev, status: 'paused', detail: `已暂停：${prev.detail}` } : prev);
+        setInfo('标准解析已暂停');
+        return;
+      }
+      if (action === 'resume') {
+        setAnalysisControl('running');
+        setProgress(prev => prev ? { ...prev, status: 'running', detail: prev.detail.replace(/^已暂停：/, '') } : prev);
+        setInfo('标准解析已继续');
+        return;
+      }
+      analysisStoppedRef.current = true;
+      setAnalysisControl('stopped');
+      stopProgress('标准解析已停止，可重新开始解析');
+      setBusy('');
+      setInfo('标准解析已停止');
+    } catch (error: any) {
+      setError(apiErrorMessage(error, '解析任务控制失败'));
     }
   };
 
@@ -1816,30 +1929,50 @@ const App = () => {
     }
     setBusy('analysis');
     const taskVersion = startProgress('标准解析', ANALYSIS_STEPS, '准备调用模型解析招标文件', 6);
+    analysisStoppedRef.current = false;
+    setAnalysisTaskId('');
+    setAnalysisControl('running');
     setStreamText('');
     setReviewReport(null);
     setConsistencyReport(null);
     setManualReviewConfirmed(false);
     try {
       let reportRaw = '';
-      advanceProgress('正在用通用提示词结构化招标文件', 20, 1, taskVersion);
       const reportResponse = await documentApi.analyzeReportStream({
         file_content: state.fileContent,
         config: toLiteLLMConfig(localConfig),
       });
-      await withTaskTimeout(consumeSseStream(reportResponse, (payload) => {
-        if (payload.error) throw new Error(payload.message || '结构化解析失败');
-        if (typeof payload.chunk === 'string') {
-          reportRaw += payload.chunk;
-          const nextStep = reportRaw.length > 1600 ? 3 : reportRaw.length > 700 ? 2 : 1;
-          const detail = nextStep === 3
-            ? '合规要求提取中：正在汇总风险、材料和响应矩阵'
-            : nextStep === 2
-              ? '评分项提取中：正在识别分值、标准和易失分点'
-              : '条款识别中：正在抽取项目基础信息和投标文件组成';
-          advanceProgress(detail, Math.min(92, 20 + Math.floor(reportRaw.length / 220)), nextStep, taskVersion);
+      await consumeSseStream(reportResponse, (payload) => {
+        if (payload.task_id) {
+          setAnalysisTaskId(String(payload.task_id));
         }
-      }), '模型解析超时：标准解析长时间未完成，系统已停止后续目录生成，未使用兜底报告。', taskVersion, ANALYSIS_REPORT_TIMEOUT_MS);
+        if (payload.stopped) {
+          analysisStoppedRef.current = true;
+          setAnalysisControl('stopped');
+          stopProgress(payload.detail || payload.message || '标准解析已停止', taskVersion);
+          return;
+        }
+        if (payload.error) throw new Error(payload.message || '结构化解析失败');
+        if (typeof payload.step_index === 'number' && payload.detail) {
+          const status = ['running', 'success', 'error', 'paused', 'stopped'].includes(payload.status) ? payload.status : 'running';
+          updateAnalysisStage(
+            String(payload.detail),
+            Number(payload.percent ?? 0),
+            Number(payload.step_index),
+            status as ProgressState['status'],
+            payload.task_id ? String(payload.task_id) : undefined,
+            taskVersion,
+          );
+        }
+        if (typeof payload.chunk === 'string' && payload.chunk) {
+          reportRaw += payload.chunk;
+          setStreamText(reportRaw);
+        }
+      });
+      if (analysisStoppedRef.current) {
+        setStreamText('');
+        return;
+      }
       advanceProgress('正在校验并写入结构化解析结果', 96, 4, taskVersion);
       if (!reportRaw.trim()) {
         throw new Error('后端只返回了心跳，没有返回标准解析 JSON。通常表示模型调用长时间未完成、连接提前结束，或后端任务被中断；系统不会使用兜底报告。');
@@ -1860,10 +1993,17 @@ const App = () => {
       completeProgress('标准解析完成', taskVersion);
       setSuccess('标准解析完成，已生成项目、评分、风险和材料结构');
     } catch (error: any) {
+      if (analysisStoppedRef.current || error?.name === 'AbortError') {
+        stopProgress('标准解析已停止，可重新开始解析', taskVersion);
+        setInfo('标准解析已停止');
+        return;
+      }
       failProgress(error.message || '标准解析失败', undefined, taskVersion);
       setError(error.message || '标准解析失败');
     } finally {
       setBusy('');
+      setAnalysisTaskId('');
+      if (!analysisStoppedRef.current) setAnalysisControl('idle');
     }
   };
 
@@ -2413,6 +2553,16 @@ const App = () => {
     : -1;
 
   const analysisStepStatus = (index: number) => {
+    if (progress?.label === '标准解析' && progress.status === 'stopped') {
+      if (index < progress.stepIndex) return '已完成';
+      if (index === progress.stepIndex) return '已停止';
+      return '待执行';
+    }
+    if (progress?.label === '标准解析' && progress.status === 'paused') {
+      if (index < progress.stepIndex) return '已完成';
+      if (index === progress.stepIndex) return '已暂停';
+      return '待执行';
+    }
     if (state.analysisReport && busy !== 'analysis') return '已完成';
     if (progress?.label === '标准解析' && progress.status === 'error') {
       if (index < progress.stepIndex) return '已完成';
@@ -2620,7 +2770,7 @@ const App = () => {
                   <button type="button" className="upload-zone" onClick={() => referenceInputRef.current?.click()}>
                     <DocumentArrowUpIcon className="h-8 w-8" />
                     <strong>选择 PDF 或 DOCX 样例标书</strong>
-                    <span>先用 MinerU 转 Markdown，再抽取目录、段落骨架、表格、承诺书和素材位，不作为项目事实来源。</span>
+                    <span>先选择文件，点击“去解析”后再用 MinerU 转 Markdown，并抽取目录、段落骨架、表格、承诺书和素材位。</span>
                   </button>
                   <input
                     ref={referenceInputRef}
@@ -2629,45 +2779,62 @@ const App = () => {
                     accept=".pdf,.docx"
                     onChange={(event) => {
                       const file = event.target.files?.[0];
-                      if (file) handleReferenceUpload(file);
+                      if (file) handleReferenceSelect(file);
+                      event.target.value = '';
                     }}
                   />
                   <div className="file-pill">
                     <DocumentTextIcon className="h-5 w-5 text-sky-600" />
                     <div>
                       <strong>{referenceFileName || '未接入写作模板'}</strong>
-                      <span>{Object.keys(activeReferenceProfile || {}).length ? '样例写作模板已生成' : '可选，建议上传成熟目标文件'}</span>
+                      <span>
+                        {busy === 'reference'
+                          ? '样例解析中'
+                          : hasReferenceProfile
+                            ? '样例写作模板已生成'
+                            : referenceFile
+                              ? '已选择，待解析'
+                              : '可选，建议上传成熟目标文件'}
+                      </span>
                     </div>
-                    {Object.keys(activeReferenceProfile || {}).length ? <CheckCircleIcon className="h-5 w-5 text-emerald-600" /> : null}
+                    {hasReferenceProfile ? <CheckCircleIcon className="h-5 w-5 text-emerald-600" /> : null}
                   </div>
                   <div className="page-action-row">
-                    <button type="button" onClick={() => referenceInputRef.current?.click()} disabled={busy === 'reference'}>
-                      {busy === 'reference' ? '解析中' : referenceFileName ? '重新上传样例' : '上传样例'}
+                    <button type="button" className="solid-button" onClick={runReferenceAnalysis} disabled={!referenceFile || busy === 'reference'}>
+                      {busy === 'reference' ? '解析中' : hasReferenceProfile ? '重新解析' : '去解析'}
                     </button>
+                    <button type="button" onClick={() => referenceInputRef.current?.click()} disabled={busy === 'reference'}>重新选择</button>
                   </div>
                 </div>
 
-                <div className="ops-panel project-info">
+                <div className="ops-panel reference-profile-panel">
                   <div className="ops-panel__head">
-                    <h2>项目基础信息</h2>
-                    <span className="text-link">{activeReport ? '模型解析结果' : '待解析'}</span>
+                    <h2>成熟样例模板</h2>
+                    <span className="text-link">{busy === 'reference' ? '解析中' : hasReferenceProfile ? '已生成' : '未接入'}</span>
                   </div>
-                  {!activeReport && (
+                  {!hasReferenceProfile ? (
                     <div className="empty-state empty-state--compact">
-                      <strong>上传并解析招标文件后生成</strong>
-                      <span>项目编号、采购人、预算、截止时间等字段不会使用前端示例占位。</span>
+                      <strong>{busy === 'reference' ? '正在解析成熟样例' : referenceFile ? '已选择样例，待解析' : '上传成熟样例后生成'}</strong>
+                      <span>{referenceFile ? '点击左侧“去解析”后，这里会填充样例的目录层级、章节骨架、Word 字号字体、表格和素材位。' : '这里会展示样例的目录层级、章节骨架、Word 字号字体、表格和素材位，不再显示招标项目占位字段。'}</span>
                     </div>
+                  ) : (
+                    <>
+                      <div className="reference-profile-summary">
+                        <strong>{String(activeReferenceRecord.profile_name || referenceFileName || '成熟样例写作模板')}</strong>
+                        <span>{String(activeReferenceRecord.recommended_use_case || '用于后续目录、正文、表格和审校模板复用。')}</span>
+                      </div>
+                      <div className="info-row"><span>样例范围</span><strong>{String(activeReferenceRecord.document_scope || 'unknown')}</strong></div>
+                      {referenceProfileStats.map(([label, value]) => (
+                        <div key={label} className="info-row"><span>{label}</span><strong>{value}</strong></div>
+                      ))}
+                      <div className="reference-style-grid">
+                        <span>正文 {String(referenceWordStyle.body_font_family || DEFAULT_WORD_STYLE_PROFILE.body_font_family)} / {String(referenceWordStyle.body_font_size || DEFAULT_WORD_STYLE_PROFILE.body_font_size)}</span>
+                        <span>标题 {String(referenceWordStyle.heading_font_family || DEFAULT_WORD_STYLE_PROFILE.heading_font_family)} / {String(referenceWordStyle.heading_1_size || DEFAULT_WORD_STYLE_PROFILE.heading_1_size)}</span>
+                        <span>页边距 {String(referenceWordStyle.margin_top || DEFAULT_WORD_STYLE_PROFILE.margin_top)} · {String(referenceWordStyle.margin_left || DEFAULT_WORD_STYLE_PROFILE.margin_left)}</span>
+                        <span>表格 {String(referenceWordStyle.table_font_size || DEFAULT_WORD_STYLE_PROFILE.table_font_size)}</span>
+                      </div>
+                    </>
                   )}
-                  {[
-                    ['项目编号', project?.number],
-                    ['采购人', project?.purchaser],
-                    ['服务期限', project?.service_period],
-                    ['报价要求', activeReport?.price_rules?.quote_method],
-                    ['预算金额', project?.budget],
-                    ['提交截止时间', project?.bid_deadline],
-                  ].map(([label, value]) => (
-                    <div key={label} className="info-row"><span>{label}</span><strong>{value || '待模型解析'}</strong></div>
-                  ))}
                 </div>
 
                 <div className="ops-panel">
@@ -2713,6 +2880,32 @@ const App = () => {
                     </button>
                   </div>
                   {(busy === 'analysis' || progress?.label === '标准解析') && <TaskProgress progress={progress} onRetry={runAnalysis} />}
+                  {(busy === 'analysis' || analysisControl === 'paused') && (
+                    <div className="analysis-control-row">
+                      <button
+                        type="button"
+                        onClick={() => controlAnalysisTask('pause')}
+                        disabled={!analysisTaskId || analysisControl === 'paused'}
+                      >
+                        <PauseIcon className="h-4 w-4" /> 暂停
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => controlAnalysisTask('resume')}
+                        disabled={!analysisTaskId || analysisControl !== 'paused'}
+                      >
+                        <PlayIcon className="h-4 w-4" /> 继续
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-button"
+                        onClick={() => controlAnalysisTask('stop')}
+                        disabled={!analysisTaskId || analysisControl === 'stopped'}
+                      >
+                        <StopIcon className="h-4 w-4" /> 停止
+                      </button>
+                    </div>
+                  )}
                   <div className={`parser-status parser-status--${currentParserStatus.tone}`}>
                     <strong>{currentParserStatus.label}</strong>
                     <span>{currentParserStatus.detail}</span>
@@ -2720,11 +2913,11 @@ const App = () => {
                   {ANALYSIS_STEPS.map((item, index) => {
                     const status = analysisStepStatus(index);
                     return (
-                      <div key={item} className={`check-row check-row--${status === '失败' ? 'error' : status === '进行中' ? 'active' : status === '已完成' ? 'done' : 'idle'}`}>
-                        <CheckCircleIcon className={`h-4 w-4 ${status === '已完成' ? 'text-emerald-600' : status === '失败' ? 'text-rose-600' : status === '进行中' ? 'text-amber-500' : 'text-slate-300'}`} />
+                      <div key={item} className={`check-row check-row--${status === '失败' || status === '已停止' ? 'error' : status === '进行中' || status === '已暂停' ? 'active' : status === '已完成' ? 'done' : 'idle'}`}>
+                        <CheckCircleIcon className={`h-4 w-4 ${status === '已完成' ? 'text-emerald-600' : status === '失败' || status === '已停止' ? 'text-rose-600' : status === '进行中' || status === '已暂停' ? 'text-amber-500' : 'text-slate-300'}`} />
                         <span>{item}</span>
                         <strong>
-                          {status === '进行中' && <i className="status-pulse" />}
+                          {(status === '进行中' || status === '已暂停') && <i className="status-pulse" />}
                           {status}
                         </strong>
                       </div>
@@ -3602,6 +3795,12 @@ const TaskProgress = ({ progress, onRetry }: { progress: ProgressState | null; o
         <div className="task-progress__error">
           <strong>{progress.error || '模型调用失败，请检查端点、模型名或 API Key 后重试。'}</strong>
           {onRetry && <button type="button" onClick={onRetry}>重试解析</button>}
+        </div>
+      )}
+      {progress.status === 'stopped' && (
+        <div className="task-progress__error">
+          <strong>标准解析已停止，当前结果不会写入项目。</strong>
+          {onRetry && <button type="button" onClick={onRetry}>重新解析</button>}
         </div>
       )}
       {progress.steps.length > 0 && (

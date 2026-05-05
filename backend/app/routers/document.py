@@ -3,6 +3,8 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from ..models.schemas import (
     AnalysisReportRequest,
+    AnalysisTaskControlRequest,
+    AnalysisTaskControlResponse,
     AnalysisRequest,
     AnalysisType,
     ComplianceReviewRequest,
@@ -31,6 +33,47 @@ from urllib.parse import quote
 from pathlib import Path
 
 router = APIRouter(prefix="/api/document", tags=["文档处理"])
+
+
+class AnalysisTaskState:
+    """Keep server-side control state for one standard-analysis SSE task."""
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.pause_event = asyncio.Event()
+        self.pause_event.set()
+        self.cancelled = False
+        self.status = "running"
+        self.current_step = 0
+
+
+ANALYSIS_TASKS: dict[str, AnalysisTaskState] = {}
+
+
+def _analysis_metric_count(report: dict, keys: tuple[str, ...]) -> int:
+    return sum(len(report.get(key) or []) for key in keys)
+
+
+def _analysis_stream_payload(
+    task_state: AnalysisTaskState,
+    step_index: int,
+    detail: str,
+    percent: int,
+    status: str = "running",
+    **extra,
+) -> str:
+    task_state.current_step = step_index
+    task_state.status = status
+    payload = {
+        "chunk": "",
+        "task_id": task_state.task_id,
+        "step_index": step_index,
+        "detail": detail,
+        "percent": max(0, min(100, int(percent))),
+        "status": status,
+        **extra,
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def sanitize_docx_filename(filename: str) -> str:
@@ -308,6 +351,8 @@ async def analyze_report_stream(request: AnalysisReportRequest):
     try:
         request_id = uuid.uuid4().hex[:8]
         started_at = time.monotonic()
+        task_state = AnalysisTaskState(request_id)
+        ANALYSIS_TASKS[request_id] = task_state
         config = (
             request.config.model_dump(mode="json", exclude_none=True)
             if request.config
@@ -327,14 +372,45 @@ async def analyze_report_stream(request: AnalysisReportRequest):
 
         async def generate():
             compute_task = None
+            final_report = None
+
+            async def wait_if_paused() -> None:
+                while not task_state.pause_event.is_set():
+                    task_state.status = "paused"
+                    if task_state.cancelled:
+                        raise asyncio.CancelledError()
+                    await asyncio.sleep(0.25)
+                if task_state.cancelled:
+                    raise asyncio.CancelledError()
+                task_state.status = "running"
+
             try:
+                yield _analysis_stream_payload(
+                    task_state,
+                    0,
+                    "文件解析完成：MinerU Markdown 已进入标准解析队列",
+                    12,
+                )
+                await wait_if_paused()
+                yield _analysis_stream_payload(
+                    task_state,
+                    1,
+                    "条款识别中：正在抽取项目基础信息和投标文件组成",
+                    20,
+                )
                 compute_task = asyncio.create_task(
                     openai_service.generate_analysis_report(request.file_content)
                 )
                 heartbeat_count = 0
 
                 while not compute_task.done():
-                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
+                    await wait_if_paused()
+                    yield _analysis_stream_payload(
+                        task_state,
+                        1,
+                        "条款识别中：正在抽取项目基础信息和投标文件组成",
+                        20,
+                    )
                     heartbeat_count += 1
                     if heartbeat_count % 30 == 0:
                         print(
@@ -344,7 +420,55 @@ async def analyze_report_stream(request: AnalysisReportRequest):
                         )
                     await asyncio.sleep(1)
 
-                report_json = json.dumps(await compute_task, ensure_ascii=False)
+                await wait_if_paused()
+                final_report = await compute_task
+                yield _analysis_stream_payload(
+                    task_state,
+                    1,
+                    "条款识别完成：项目基础信息、投标文件组成和关键出处已抽取",
+                    38,
+                )
+                await wait_if_paused()
+
+                scoring_count = _analysis_metric_count(
+                    final_report,
+                    ("technical_scoring_items", "business_scoring_items", "price_scoring_items"),
+                )
+                yield _analysis_stream_payload(
+                    task_state,
+                    2,
+                    f"评分项提取完成：识别 {scoring_count} 项技术、商务或报价评分规则",
+                    58,
+                )
+                await wait_if_paused()
+
+                compliance_count = _analysis_metric_count(
+                    final_report,
+                    (
+                        "qualification_requirements",
+                        "formal_response_requirements",
+                        "mandatory_clauses",
+                        "rejection_risks",
+                        "required_materials",
+                        "fixed_format_forms",
+                        "signature_requirements",
+                    ),
+                )
+                yield _analysis_stream_payload(
+                    task_state,
+                    3,
+                    f"合规要求提取完成：识别 {compliance_count} 项资格、格式、签章、材料或废标风险",
+                    78,
+                )
+                await wait_if_paused()
+
+                yield _analysis_stream_payload(
+                    task_state,
+                    4,
+                    "结果校验中：正在校验 JSON、响应矩阵和企业资料画像",
+                    92,
+                )
+                report_json = json.dumps(final_report, ensure_ascii=False)
                 print(
                     f"标准解析报告[{request_id}] 完成："
                     f"{int(time.monotonic() - started_at)} 秒，输出 {len(report_json)} 字符",
@@ -352,21 +476,46 @@ async def analyze_report_stream(request: AnalysisReportRequest):
                 )
                 chunk_size = 256
                 for index in range(0, len(report_json), chunk_size):
+                    await wait_if_paused()
                     piece = report_json[index:index + chunk_size]
-                    yield f"data: {json.dumps({'chunk': piece}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'chunk': piece, 'task_id': request_id, 'step_index': 4, 'percent': 96, 'status': 'running'}, ensure_ascii=False)}\n\n"
+                yield _analysis_stream_payload(
+                    task_state,
+                    4,
+                    "标准解析完成：已写入项目、评分、风险和材料结构",
+                    100,
+                    "success",
+                )
             except asyncio.CancelledError:
                 if compute_task and not compute_task.done():
                     compute_task.cancel()
-                print(f"标准解析报告[{request_id}] SSE 连接被取消", flush=True)
-                raise
+                if task_state.cancelled:
+                    print(f"标准解析报告[{request_id}] 已停止", flush=True)
+                    yield _analysis_stream_payload(
+                        task_state,
+                        task_state.current_step,
+                        "标准解析已停止，可重新开始解析",
+                        max(0, min(100, 0)),
+                        "stopped",
+                        stopped=True,
+                    )
+                else:
+                    print(f"标准解析报告[{request_id}] SSE 连接被取消", flush=True)
+                    raise
             except Exception as e:
                 print(f"标准解析报告[{request_id}] 失败：{str(e)}", flush=True)
                 payload = {
                     "chunk": "",
+                    "task_id": request_id,
+                    "step_index": task_state.current_step,
+                    "percent": 100,
+                    "status": "error",
                     "error": True,
                     "message": f"结构化解析报告生成失败: {str(e)}",
                 }
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            finally:
+                ANALYSIS_TASKS.pop(request_id, None)
 
             yield "data: [DONE]\n\n"
 
@@ -375,6 +524,31 @@ async def analyze_report_stream(request: AnalysisReportRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"结构化解析报告生成失败: {str(e)}")
+
+
+@router.post("/analysis-task/{task_id}/control", response_model=AnalysisTaskControlResponse)
+async def control_analysis_task(task_id: str, request: AnalysisTaskControlRequest):
+    """Pause, resume, or stop a running standard-analysis task."""
+    task_state = ANALYSIS_TASKS.get(task_id)
+    if not task_state:
+        raise HTTPException(status_code=404, detail="解析任务不存在或已结束")
+
+    action = (request.action or "").strip().lower()
+    if action == "pause":
+        task_state.pause_event.clear()
+        task_state.status = "paused"
+        return AnalysisTaskControlResponse(success=True, message="标准解析已暂停", task_id=task_id, status=task_state.status)
+    if action in {"resume", "continue"}:
+        task_state.pause_event.set()
+        task_state.status = "running"
+        return AnalysisTaskControlResponse(success=True, message="标准解析已继续", task_id=task_id, status=task_state.status)
+    if action == "stop":
+        task_state.cancelled = True
+        task_state.pause_event.set()
+        task_state.status = "stopped"
+        return AnalysisTaskControlResponse(success=True, message="标准解析已停止", task_id=task_id, status=task_state.status)
+
+    raise HTTPException(status_code=400, detail="不支持的解析任务控制动作")
 
 
 @router.post("/reference-style-upload")

@@ -559,7 +559,7 @@ def generate_reference_bid_style_profile_prompt(reference_bid_text: str) -> Tupl
     schema_json = _json(get_reference_bid_style_profile_schema(), indent=2)
     system_prompt = f"""你是投标文件样例模板工程师。你的任务不是总结样例内容，而是把成熟投标文件反向建模为“可执行写作模板”，让后续招标文件解析结果可以套用它来生成目录、正文、表格、承诺书和素材占位。
 
-输入通常来自 MinerU Markdown。你必须把 Markdown 标题、表格、图片标记、列表层级、页眉页脚残留和正文顺序当作结构证据；表格列名、图片标题、承诺书签章区、封面/目录位置都要转成模板规则。
+输入来自 MinerU Markdown，可能已经被系统压缩为“模板证据包”。你必须把 Markdown 标题、表格、图片标记、列表层级、页眉页脚残留和正文顺序当作结构证据；表格列名、图片标题、承诺书签章区、封面/目录位置都要转成模板规则。
 
 输出目标：
 1. 生成 ReferenceBidStyleProfile JSON，作为后续写标书的 template memory。
@@ -583,7 +583,9 @@ def generate_reference_bid_style_profile_prompt(reference_bid_text: str) -> Tupl
 10. 每个 chapter_blueprints.recommended_structure 应像写作提纲，不是目录标题堆砌；每个 paragraph_blueprint 要说明“这一段写什么、从哪里取数、缺失时怎么占位”。
 11. writing_style.sentence_blueprints 只能输出句式模板，不得复刻样例原句；必须包含变量，例如 {{项目名称}}、{{服务范围}}、{{质量标准}}、{{响应时限}}。
 12. word_style_profile 不得空泛写“按原文”，必须给出可用于前端预览和 Word 导出的具体 CSS/Word 值，例如 2.7cm、10.5pt、1.5、宋体、黑体。
-13. 数组保持高信号：outline_template、chapter_blueprints、table_models、image_slots、enterprise_data_requirements、quality_risks 优先保留对后续写作最有用的 8-15 项。
+13. 数组保持高信号但要克制：outline_template 保留 6-12 项；chapter_blueprints 保留 4-8 项；table_models、image_slots、enterprise_data_requirements 可为空，但如果证据中有表格/图片/企业资料必须提取。
+14. 不要输出长段正文。每个字符串尽量 80 字以内，paragraph_blueprint 每章 1-2 条即可，避免超时和截断。
+15. 失败是不允许的：如果证据不足，也必须基于标题、表格列名和段落样本生成可执行模板；不得输出“无法判断”“空模板”“仅按通用规则”。
 
 JSON schema：
 {schema_json}

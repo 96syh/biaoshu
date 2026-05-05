@@ -131,6 +131,15 @@ export interface AnalysisReportRequest {
   config?: ConfigData;
 }
 
+export type AnalysisTaskAction = 'pause' | 'resume' | 'stop';
+
+export interface AnalysisTaskControlResponse {
+  success: boolean;
+  message: string;
+  task_id: string;
+  status: 'running' | 'paused' | 'stopped' | string;
+}
+
 export interface OutlineRequest {
   overview: string;
   requirements: string;
@@ -255,6 +264,10 @@ export const documentApi = {
       },
       body: JSON.stringify(data),
     }),
+
+  // 控制结构化标准解析任务
+  controlAnalysisTask: (taskId: string, action: AnalysisTaskAction) =>
+    api.post<AnalysisTaskControlResponse>(`/api/document/analysis-task/${taskId}/control`, { action }),
 
   // 流式执行导出前合规审校
   reviewComplianceStream: (data: ComplianceReviewRequest) =>

@@ -669,6 +669,19 @@ class AnalysisReportRequest(BaseModel):
     config: Optional[ConfigRequest] = Field(None, description="可选：本次解析使用的运行时模型配置")
 
 
+class AnalysisTaskControlRequest(BaseModel):
+    """标准解析任务控制请求"""
+    action: str = Field(..., description="pause/resume/stop")
+
+
+class AnalysisTaskControlResponse(BaseModel):
+    """标准解析任务控制响应"""
+    success: bool
+    message: str
+    task_id: str = ""
+    status: str = ""
+
+
 class ReviewCoverageItem(BaseModel):
     """评分项覆盖检查结果"""
     item_id: str = Field("", description="评分项或要求ID")
