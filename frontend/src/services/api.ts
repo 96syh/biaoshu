@@ -8,6 +8,7 @@ import type {
   ComplianceReviewRequest,
   ConsistencyRevisionRequest,
   DocumentBlocksPlanRequest,
+  EnterpriseMaterialProfile,
   GeneratedSummary,
   MissingCompanyMaterial,
   OutlineData,
@@ -102,6 +103,24 @@ export interface ProviderVerifyResponse {
   checks: ProviderCheckItem[];
 }
 
+export interface ProjectRecordResponse {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  completed: number;
+  total: number;
+  wordCount: number;
+  draft: Record<string, unknown>;
+}
+
+export interface ProjectResponse {
+  success: boolean;
+  message: string;
+  project?: ProjectRecordResponse | null;
+  projects?: ProjectRecordResponse[];
+}
+
 export interface AnalysisRequest {
   file_content: string;
   analysis_type: 'overview' | 'requirements';
@@ -109,6 +128,7 @@ export interface AnalysisRequest {
 
 export interface AnalysisReportRequest {
   file_content: string;
+  config?: ConfigData;
 }
 
 export interface OutlineRequest {
@@ -142,6 +162,7 @@ export interface ChapterContentRequest {
   asset_library?: Record<string, unknown>;
   generated_summaries?: GeneratedSummary[];
   enterprise_materials?: RequiredMaterial[];
+  enterprise_material_profile?: EnterpriseMaterialProfile;
   missing_materials?: MissingCompanyMaterial[];
 }
 
@@ -162,6 +183,31 @@ export const configApi = {
   // 验证当前模型端点
   verifyProvider: (config: ConfigData) =>
     api.post<ProviderVerifyResponse>('/api/config/verify', config),
+};
+
+// 项目数据库 API
+export const projectApi = {
+  listProjects: () =>
+    api.get<ProjectResponse>('/api/projects'),
+
+  getActiveProject: () =>
+    api.get<ProjectResponse>('/api/projects/active'),
+
+  createProject: (draft: Record<string, unknown> = {}) =>
+    api.post<ProjectResponse>('/api/projects', { draft }),
+
+  saveActiveProject: (draft: Record<string, unknown>, projectId?: string, activate = true) =>
+    api.put<ProjectResponse>('/api/projects/active', {
+      project_id: projectId,
+      draft,
+      activate,
+    }),
+
+  activateProject: (projectId: string) =>
+    api.post<ProjectResponse>(`/api/projects/${projectId}/activate`),
+
+  deleteProject: (projectId: string) =>
+    api.delete<ProjectResponse>(`/api/projects/${projectId}`),
 };
 
 // 文档相关API

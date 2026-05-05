@@ -173,6 +173,13 @@ def get_reference_bid_style_profile_schema() -> Dict[str, Any]:
         "profile_name": "",
         "document_scope": "full_bid | technical_only | technical_service_plan | service_plan | business_volume | qualification_volume | price_volume | unknown",
         "recommended_use_case": "",
+        "template_intent": {
+            "how_to_use": "",
+            "reuse_boundaries": [],
+            "must_map_from_tender": [],
+            "must_map_from_enterprise": [],
+            "must_keep_as_placeholder": [],
+        },
         "cover_profile": {
             "has_cover": True,
             "title_pattern": "",
@@ -186,6 +193,24 @@ def get_reference_bid_style_profile_schema() -> Dict[str, Any]:
             "toc_depth": 2,
             "page_number_required": True,
             "toc_should_be_generated_by_word": True,
+        },
+        "word_style_profile": {
+            "page_size": "A4",
+            "orientation": "portrait",
+            "margin_top": "2.2cm",
+            "margin_bottom": "2.2cm",
+            "margin_left": "2.7cm",
+            "margin_right": "2.2cm",
+            "body_font_family": "宋体",
+            "body_font_size": "10.5pt",
+            "body_line_height": "1.5",
+            "body_first_line_indent": "2em",
+            "heading_font_family": "黑体",
+            "heading_1_size": "16pt",
+            "heading_2_size": "14pt",
+            "heading_3_size": "12pt",
+            "table_font_size": "9pt",
+            "table_border_style": "single",
         },
         "outline_template": [
             {
@@ -202,12 +227,41 @@ def get_reference_bid_style_profile_schema() -> Dict[str, Any]:
                 "asset_required": False,
             }
         ],
+        "chapter_blueprints": [
+            {
+                "chapter_title": "",
+                "applies_when": [],
+                "writing_function": "响应招标要求 | 回应评分项 | 展示企业能力 | 承诺履约结果 | 固定格式填报 | 素材展示",
+                "recommended_structure": [],
+                "paragraph_blueprint": [
+                    {
+                        "purpose": "",
+                        "opening_pattern": "",
+                        "content_slots": [],
+                        "closing_rule": "",
+                    }
+                ],
+                "tender_fact_slots": [],
+                "enterprise_fact_slots": [],
+                "tables_to_insert": [],
+                "assets_to_insert": [],
+                "do_not_copy": [],
+            }
+        ],
         "writing_style": {
             "voice": "第一人称公司主体，如“我公司”",
             "tone": "正式、承诺式、专业投标文件语气",
             "paragraph_style": "条理化分点",
             "common_patterns": [],
             "forbidden_patterns": ["AI自述", "泛泛宣传", "历史项目残留"],
+            "sentence_blueprints": [
+                {
+                    "scene": "",
+                    "pattern": "",
+                    "required_variables": [],
+                    "avoid": "",
+                }
+            ],
         },
         "section_generation_rules": [
             {
@@ -375,6 +429,43 @@ def get_analysis_report_schema() -> Dict[str, Any]:
         "evidence_chain_requirements": [{"id": "EV-01", "target": "企业业绩/人员/资质/信用/发票/产品参数/检测报告/其他", "required_evidence": [], "validation_rule": "", "source": "", "risk": ""}],
         "required_materials": [{"id": "M-01", "name": "", "purpose": "", "source": "", "status": "missing", "used_by": [], "volume_id": ""}],
         "missing_company_materials": [{"id": "X-01", "name": "", "used_by": [], "placeholder": "〖待补充：具体资料名称〗", "blocking": False}],
+        "enterprise_material_profile": {
+            "requirements": [{
+                "id": "EM-R-01",
+                "name": "",
+                "material_type": "资质/业绩/人员/设备/证书/图片/承诺/报价/其他",
+                "required_by": [],
+                "source": "",
+                "required": True,
+                "blocking": False,
+                "placeholder": "〖待补充：具体资料名称〗",
+                "status": "missing",
+                "validation_rule": "人工核对原件、有效期、主体名称、页码和招标文件要求是否一致",
+            }],
+            "provided_materials": [{
+                "id": "EM-P-01",
+                "name": "",
+                "material_type": "",
+                "source": "",
+                "used_by": [],
+                "confidence": "unknown",
+                "verification_status": "unverified",
+            }],
+            "missing_materials": [{
+                "id": "EM-R-01",
+                "name": "",
+                "material_type": "",
+                "required_by": [],
+                "source": "",
+                "required": True,
+                "blocking": False,
+                "placeholder": "〖待补充：具体资料名称〗",
+                "status": "missing",
+                "validation_rule": "",
+            }],
+            "verification_tasks": [],
+            "summary": "",
+        },
         "generation_warnings": [{"id": "W-01", "warning": "", "severity": "warning", "related_ids": []}],
         "response_matrix": get_response_matrix_schema(),
         "reference_bid_style_profile": {},
@@ -466,23 +557,38 @@ def get_consistency_revision_schema() -> Dict[str, Any]:
 
 def generate_reference_bid_style_profile_prompt(reference_bid_text: str) -> Tuple[str, str]:
     schema_json = _json(get_reference_bid_style_profile_schema(), indent=2)
-    system_prompt = f"""你是投标文件样例反向建模专家。你的任务不是总结内容，而是从成熟投标文件样例中提取可复用的生成规则。
+    system_prompt = f"""你是投标文件样例模板工程师。你的任务不是总结样例内容，而是把成熟投标文件反向建模为“可执行写作模板”，让后续招标文件解析结果可以套用它来生成目录、正文、表格、承诺书和素材占位。
 
-必须识别：文件范围、封面规则、目录层级、章节结构、正文风格、表格样式、承诺书样式、图文素材位置、企业资料依赖、图片素材依赖、质量风险。
+输入通常来自 MinerU Markdown。你必须把 Markdown 标题、表格、图片标记、列表层级、页眉页脚残留和正文顺序当作结构证据；表格列名、图片标题、承诺书签章区、封面/目录位置都要转成模板规则。
+
+输出目标：
+1. 生成 ReferenceBidStyleProfile JSON，作为后续写标书的 template memory。
+2. 每个重要章节不仅要有标题，还要有 chapter_blueprints：适用场景、写作功能、推荐段落骨架、应从招标文件映射的事实槽、应从企业资料填充的事实槽、表格/图片/承诺书插入规则、禁止照抄项。
+3. 提取 word_style_profile：页面尺寸、方向、页边距、正文/标题/表格字体、字号、行距、首行缩进、表格边框；如果 Markdown 未携带精确字号，按样例版式密度和中文技术标常用 Word 规范推断，并在 quality_risks 标记“需人工复核字号”。
+4. 把样例拆成三层：
+   - reusable_template：可复用结构、标题习惯、段落组织、表格模型、素材位置；
+   - project_facts：样例中的项目名称、招标人、日期、服务期限、地点、金额、时限、行业对象，只能变成 tender_fact_slots 或 quality_risks；
+   - enterprise_facts：投标人名称、人员、证书、软件设备、体系文件、业绩图片，只能变成 enterprise_fact_slots、enterprise_data_requirements 或 image_slots。
 
 硬性要求：
 1. 只输出合法 JSON，不输出 markdown。
 2. 不要照抄样例正文，不要改写样例正文。
-3. 必须保留原始目录层级和特殊块类型。
-4. 对“应由企业资料提供”的内容标记 enterprise_required=true。
-5. 对“应由图片/附件素材库提供”的内容标记 asset_required=true。
-6. 如果样例中存在历史项目残留、日期不一致、投标人名称不一致、错别字、行业错配内容，写入 quality_risks，后续生成时应修正而不是照抄。
-7. 不得把样例所在行业固化为所有项目的默认行业；只提取风格与结构。
+3. 不要输出空泛标签，例如“正式、专业、条理清晰”必须落到可执行规则：怎么开头、怎么分点、哪些变量要填、哪些表格要插。
+4. 必须保留原始目录层级和特殊块类型，但要把标题转成可迁移模板；明显依赖样例项目事实的标题要标记 tender_fact_slots 或 do_not_copy。
+5. 对“应由招标文件决定”的内容写入 tender_fact_slots 或 template_intent.must_map_from_tender，不得用样例值填充。
+6. 对“应由企业资料提供”的内容标记 enterprise_required=true，并写入 enterprise_fact_slots 或 enterprise_data_requirements。
+7. 对“应由图片/附件素材库提供”的内容标记 asset_required=true，并写入 image_slots 或 assets_to_insert。
+8. 如果样例中存在历史项目残留、日期不一致、投标人名称不一致、错别字、行业错配、承诺时限不可泛化、人员/证书/业绩敏感内容，写入 quality_risks，后续生成时应替换、占位或人工确认。
+9. 不得把样例所在行业固化为所有项目的默认行业；只提取适用条件和可迁移写作方法。
+10. 每个 chapter_blueprints.recommended_structure 应像写作提纲，不是目录标题堆砌；每个 paragraph_blueprint 要说明“这一段写什么、从哪里取数、缺失时怎么占位”。
+11. writing_style.sentence_blueprints 只能输出句式模板，不得复刻样例原句；必须包含变量，例如 {{项目名称}}、{{服务范围}}、{{质量标准}}、{{响应时限}}。
+12. word_style_profile 不得空泛写“按原文”，必须给出可用于前端预览和 Word 导出的具体 CSS/Word 值，例如 2.7cm、10.5pt、1.5、宋体、黑体。
+13. 数组保持高信号：outline_template、chapter_blueprints、table_models、image_slots、enterprise_data_requirements、quality_risks 优先保留对后续写作最有用的 8-15 项。
 
 JSON schema：
 {schema_json}
 """
-    user_prompt = f"""请解析以下目标投标文件样例，生成 ReferenceBidStyleProfile JSON。
+    user_prompt = f"""请解析以下成熟投标文件样例，生成可作为写作模板使用的 ReferenceBidStyleProfile JSON。
 
 <reference_bid_text>
 {reference_bid_text}
@@ -520,12 +626,14 @@ def generate_analysis_report_prompt(file_content: str) -> Tuple[str, str]:
    - 不允许只写“按招标文件执行”“详见评分办法”；必须摘录该评分行的实际得分要求。
    - 其他评分、信用扣分、失信行为扣分、报价公式、价格分、经营场所、管理制度等不属于技术/商务主观评分的条目，统一放入 price_scoring_items，用 name 标明原评分项名称。
 13. 报价规则、报价隔离、暗标、证据链、签章、固定格式、投标文件格式章节是高风险项，不得合并丢失。
-14. 为避免 JSON 截断，普通数组最多输出最关键 10 项；但 technical_scoring_items、business_scoring_items、price_scoring_items 和 bid_document_requirements.composition 不受 10 项限制，应尽量完整保留原表行，最多 40 项。
-15. 必须同步生成 response_matrix 初稿；如果条目很多，可覆盖高分值、高风险、阻塞项和投标文件格式硬约束。
-16. 解析粒度要支撑前端按“基础信息、资格审查、技术评分、商务评分、其他评分、无效标与废标项、投标文件要求、开评定标流程、补充信息归纳”九类页签展示；不要把这些内容合并成一段概述。
-17. 必须优先定位“服务纲要/技术规格/评分办法/合同服务范围/资格要求/响应性条款”等关键章节，再分片抽取；同一要求如果同时出现在投标文件组成和具体格式章节，应在 source 或 source_ref 中同时体现。
-18. 每个评分项、资格项、响应性条款、废标项、格式/签章/材料要求都要带可核验原文证据，source 不得只写“招标文件”这类泛称，至少包含章节名、条款号、表格名、页码或短原文之一。
-19. 参考以下文件解析视角进行归纳，但输出仍必须符合 AnalysisReport JSON schema：
+14. 必须把企业资料需求独立写入 enterprise_material_profile：requirements 表示本项目需要的企业资料，provided_materials 只放用户或资料库明确提供的资料，missing_materials 放待补/待确认资料，verification_tasks 写人工复核任务。required_materials 和 missing_company_materials 仅作为兼容字段，不得成为唯一传递载体。
+15. enterprise_material_profile 中不得把招标文件“要求提供”误写成“企业已提供”；除非输入材料明确出现具体企业资料，否则 status=missing 或 unknown，verification_status=unverified。
+16. 为避免 JSON 截断，普通数组最多输出最关键 10 项；但 technical_scoring_items、business_scoring_items、price_scoring_items 和 bid_document_requirements.composition 不受 10 项限制，应尽量完整保留原表行，最多 40 项。
+17. 必须同步生成 response_matrix 初稿；如果条目很多，可覆盖高分值、高风险、阻塞项和投标文件格式硬约束。
+18. 解析粒度要支撑前端按“基础信息、资格审查、技术评分、商务评分、其他评分、无效标与废标项、投标文件要求、开评定标流程、补充信息归纳”九类页签展示；不要把这些内容合并成一段概述。
+19. 必须优先定位“服务纲要/技术规格/评分办法/合同服务范围/资格要求/响应性条款”等关键章节，再分片抽取；同一要求如果同时出现在投标文件组成和具体格式章节，应在 source 或 source_ref 中同时体现。
+20. 每个评分项、资格项、响应性条款、废标项、格式/签章/材料要求都要带可核验原文证据，source 不得只写“招标文件”这类泛称，至少包含章节名、条款号、表格名、页码或短原文之一。
+21. 参考以下文件解析视角进行归纳，但输出仍必须符合 AnalysisReport JSON schema：
    - 基础信息固定子项：招标人/代理信息、项目信息、关键时间/内容、保证金相关、其他信息。缺失字段用空字符串，不得臆测。
    - 资格审查固定子项：资格评审、形式评审标准、响应性评审标准；其中资格评审内部必须尽量覆盖资质条件、业绩要求、财务要求、信誉要求、人员资格要求、联合体投标要求、安全生产许可证要求、投标资格评审否决项、营业执照要求、认证体系要求、企业荣誉要求、企业信用要求、人员业绩要求、其他资料要求。
    - 技术评分/商务评分/其他评分：必须输出三列表格所需字段，即评分项、分值、得分要求；每个评分项的得分要求要包含子项、材料、满分/扣分/最低分规则。技术评分放 technical_scoring_items；商务评分放 business_scoring_items；失信扣分、报价公式、价格分、其他扣分规则等放 price_scoring_items。
@@ -622,7 +730,7 @@ def generate_level1_outline_prompt(
    E. 通用服务/技术方案保底目录。
 7. 如果招标文件只在“3.1.1（7）设计方案”列出生成对象，又在第六章“六、设计方案”列出“应包括”的十项内容，应以这十项内容作为目录一级或主要二级标题。
 8. 如果第六章没有列出方案子项，则用第三章详细技术评分项作为目录主线，例如“进度管理及保证措施、质量管理及保证措施、内部审查程序、文档管理计划与控制措施”等。
-9. 如果有 ReferenceBidStyleProfile，只能吸收其目录层级、标题风格、表格/承诺/图片位置；不得机械照抄行业特定内容、历史项目残留，也不得覆盖招标文件确定的 selected_generation_target。
+9. 如果有 ReferenceBidStyleProfile，应优先使用其中的 template_intent、outline_template、chapter_blueprints、table_models 和 image_slots 作为“写作模板参考”；只能吸收目录层级、章节功能、标题风格、段落骨架、表格/承诺/图片位置，不得机械照抄行业特定内容、历史项目残留，也不得覆盖招标文件确定的 selected_generation_target。
 10. 每个一级节点必须包含：id、volume_id、title、chapter_type、description、fixed_format_sensitive、price_sensitive、anonymity_sensitive、expected_word_count、scoring_item_ids、requirement_ids、risk_ids、material_ids、response_matrix_ids、children。
 11. scoring_item_ids 只能放 T/B/P；requirement_ids 放 E/Q/F/C；risk_ids 放 R；material_ids 放 M/X/EV/FF/SIG。
 12. 分值高、阻塞风险高、证据链复杂的章节应有更高 expected_word_count 和更细 children。
@@ -670,13 +778,23 @@ def generate_level23_outline_prompt(
 1. 禁止修改当前一级章节 id、title、volume_id、chapter_type。
 2. 不得新增 AnalysisReport 和 ResponseMatrix 中不存在的强制条款 ID。
 3. 如果当前一级章节在 selected_generation_target.base_outline_items、bid_document_requirements.composition 或 scheme_or_technical_outline_requirements 中有对应要求，二三级目录必须覆盖这些要求；不得因为样例目录不同而漏项。
-4. 如果当前一级章节已有成熟样例 children，应优先保留其合理结构；但必须修正行业错配、历史项目残留和与招标文件冲突的内容。
+4. 如果当前一级章节能匹配成熟样例的 chapter_blueprints，应优先吸收其 applies_when、writing_function、recommended_structure、tables_to_insert 和 assets_to_insert；但必须修正行业错配、历史项目残留和与招标文件冲突的内容。
 5. 价格敏感内容只能出现在允许价格的卷册；暗标章节不得设计暴露投标人身份的标题或素材位。
 6. 证明材料类章节应设计“材料清单、证明用途、核验要点、页码索引”。
 7. 技术/服务/实施方案类章节应按评分标准拆成“理解、方法、流程、组织、进度、质量、安全、风险、成果、保障”中最合适的结构。
 8. 固定格式表单类章节只能设计填报项和核验项，不得改动表头、列名和固定文字。
 9. 对招标文件写明“应包括但不限于”的方案纲要，必须逐项拆出二级或三级节点，或在 description 中说明由哪个节点覆盖；如果 selected_generation_target.base_outline_items 已经提供标题，必须保留标题语义和顺序。
-10. description 要写清本节点要写什么、响应哪些评分项、需要哪些表格/承诺/图片/企业资料。
+10. 三级目录生成必须先做“语义拆解”，再生成标题，不能使用预设固定模板，也不能根据少量关键词机械套用固定组合。
+11. 对每一个二级标题，先判断真实写作对象：服务范围、工作内容、工作目标、组织机构、岗位职责、服务方案、人员投入、沟通方法、质量承诺、进度保障、风险控制、成果交付、售后服务、资料管理、固定格式、证明材料或其他对象。
+12. 再判断该二级标题在投标文件中的功能：说明范围边界、回应评分标准、证明企业能力、承诺服务结果、说明流程方法、控制质量/进度/风险、对应固定格式或签章材料、支撑验收交付或后续服务。
+13. 再从以下内容维度中选择最符合当前二级标题的 2-4 个维度生成三级标题：工作内容/任务清单、工作流程/阶段安排、责任主体/岗位分工、资源投入/人员设备、标准规范/质量要求、成果文件/交付物、响应时限/服务方式、检查复核/过程控制、风险预防/应急处置、支撑材料/原文证据。
+14. 三级标题必须带有当前二级标题的具体语义，不得跨二级复用同一套标题；禁止多个二级标题下出现完全相同或高度相似的三级标题组合。
+15. 禁止使用这些通用套话作为三级标题：“依据/措施/佐证”“目标/措施/保障”“响应要点/实施措施/支撑材料”“工作内容/工作流程/保障措施”。
+16. 如果当前二级标题缺少足够依据，宁可只生成 1-2 个准确三级标题，也不要为了凑数量复制模板。
+17. 每个三级标题必须能回答“这一节具体写什么”，不能只表达抽象维度。
+18. 每个三级节点 description 必须说明写作内容、对应评分项或招标要求、需要的表格/流程图/承诺/证明材料/占位，以及不能编造的内容。
+19. 可参考真实服务类标书常见拆解方式，但不得直接照抄：服务范围类关注工作内容、服务边界、成果文件、标准要求、管理配合；服务目标类关注目标分解、责任分工、达成路径、考核/验收口径；组织机构类关注组织架构、岗位职责、接口关系、汇报机制；人员投入类关注人员配置、资格能力、到岗安排、培训考核、替换机制；服务方案类关注阶段流程、关键环节、技术方法、资源投入、异常处理；沟通协调类关注沟通对象、沟通频次、会议/报告机制、问题闭环；质量承诺类关注质量标准、过程复核、成果审查、整改改进、承诺边界；后续服务类关注服务时限、服务方式、责任主体、技术支持、成果修改。
+20. 如果 ReferenceBidStyleProfile.chapter_blueprints 提供了 paragraph_blueprint，不要把段落骨架直接写进目录标题；应转化为 description、expected_depth、tables_required、image_slots、material_ids 或 blocks，供正文阶段使用。
 
 {rulebook}
 
@@ -714,10 +832,11 @@ def generate_document_blocks_prompt(
 1. 只输出合法 JSON。
 2. 不得编造图片、证书、截图、人员、设备、软件或案例；没有素材时输出 placeholder。
 3. 如素材库有匹配图片或附件，输出 asset_id；没有则输出 fallback placeholder。
-4. 表格必须给出表名、列名、行生成规则和数据来源。
-5. 承诺书必须给出致函对象、承诺事项、署名变量、日期变量。
-6. 组织机构图、流程图可以输出结构化 nodes/edges，由后端渲染或人工替换。
-7. Word 目录页码不得由模型生成，应由 Word 自动更新。
+4. 如果 ReferenceBidStyleProfile.table_models 或 chapter_blueprints.tables_to_insert 与当前目录章节匹配，应优先采用其表格模型，但列名和行内容必须映射到当前招标文件和企业资料。
+5. 表格必须给出表名、列名、行生成规则和数据来源。
+6. 承诺书必须给出致函对象、承诺事项、署名变量、日期变量；如果样例有承诺书结构，只继承版式和事项类别，不继承样例项目事实、日期和承诺时限。
+7. 组织机构图、流程图可以输出结构化 nodes/edges，由后端渲染或人工替换。
+8. Word 目录页码不得由模型生成，应由 Word 自动更新。
 
 JSON schema：
 {schema_json}
@@ -760,9 +879,9 @@ def generate_chapter_content_prompt(
 硬性规则：
 1. 只输出当前章节正文，不输出章节标题。
 2. 不输出 markdown 代码块，不输出 AI 自述，不解释生成过程。
-3. 不得重新解析招标文件；只能使用传入的 AnalysisReport、ResponseMatrix、目录节点、样例风格、图表规划和企业资料。
+3. 不得重新解析招标文件；只能使用传入的 AnalysisReport、ResponseMatrix、目录节点、样例风格、图表规划和 enterprise_material_profile 企业资料画像。
 4. 不得编造企业资质、人员姓名、证书编号、电话号码、软件清单、设备数量、项目业绩、图片、日期、金额、报价或税率。
-5. 凡企业资料缺失，必须使用：〖待补充：资料名称〗、〖待确认：事项〗、〖待提供扫描件：资料名称〗、〖插入图片：图片名称〗。
+5. 凡 enterprise_material_profile 标记 missing/unknown/unverified 的企业资料，必须使用：〖待补充：资料名称〗、〖待确认：事项〗、〖待提供扫描件：资料名称〗、〖插入图片：图片名称〗，不得写成已具备或已提供。
 6. 正式投标文件语气，主体称谓默认使用“我公司”；如暗标要求禁止身份识别，则不得出现投标人名称、人员姓名、联系方式、Logo、商标、可识别案例名。
 7. 当前项目必须围绕 AnalysisReport.project.name 展开，不得写成其他项目；历史项目名称、历史日期不得残留。
 8. 涉及服务范围、供货范围、施工范围、交付内容、服务期限、工期、质量要求、响应时限时，必须准确引用 AnalysisReport 中的招标要求；没有明确要求时写 〖以招标文件要求为准〗。
@@ -778,6 +897,8 @@ def generate_chapter_content_prompt(
 18. 当前章节如未被招标文件“投标文件/投标文件格式”要求，但来自样例 profile_expansion，必须确保不与招标文件目录、评分项、卷册隔离和固定格式冲突。
 19. 正文中不得写死页码。
 20. 与同级章节不得重复；同级已覆盖的内容，本节只深化、引用或建立索引。
+21. 如果 ReferenceBidStyleProfile.chapter_blueprints 中有与当前章节匹配的模板，应把 paragraph_blueprint 转化为正文段落顺序，把 tender_fact_slots 映射到 AnalysisReport，把 enterprise_fact_slots 映射到 enterprise_material_profile 或占位；不得直接复刻样例正文。
+22. 如果 ReferenceBidStyleProfile.writing_style.sentence_blueprints 适用，只可使用其句式骨架并替换变量，不得照抄样例原句。
 
 写作风格：
 1. 使用“目标—措施—流程—保障—承诺”的结构。
@@ -811,6 +932,7 @@ def generate_chapter_content_prompt(
 <response_matrix>{_json(response_matrix, indent=2)}</response_matrix>
 <reference_bid_style_profile>{_json(reference_bid_style_profile or report.get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile>
 <document_blocks_plan>{_json(document_blocks_plan or report.get('document_blocks_plan') or {}, indent=2)}</document_blocks_plan>
+<enterprise_material_profile>{_json(report.get('enterprise_material_profile') or {}, indent=2)}</enterprise_material_profile>
 <enterprise_materials>{_json(enterprise_materials or [], indent=2)}</enterprise_materials>
 <missing_materials>{_json(missing_materials or report.get('missing_company_materials') or [], indent=2)}</missing_materials>
 

@@ -8,7 +8,7 @@ import fastapi.middleware.cors
 import starlette.middleware.cors
 
 from .config import settings
-from .routers import config, document, outline, content, expand
+from .routers import config, document, outline, content, expand, projects
 
 HTML_NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -45,6 +45,7 @@ app.include_router(document.router)
 app.include_router(outline.router)
 app.include_router(content.router)
 app.include_router(expand.router)
+app.include_router(projects.router)
 
 if search is not None:
     app.include_router(search.router)

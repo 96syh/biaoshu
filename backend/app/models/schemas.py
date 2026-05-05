@@ -64,6 +64,38 @@ class FileUploadResponse(BaseModel):
     document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
 
 
+class ProjectDraftRequest(BaseModel):
+    """项目草稿保存请求"""
+    project_id: Optional[str] = Field(None, description="项目 ID；为空时使用当前激活项目或新建")
+    draft: Dict[str, Any] = Field(default_factory=dict, description="完整项目草稿 JSON")
+    activate: bool = Field(True, description="保存后是否设为当前项目")
+
+
+class ProjectCreateRequest(BaseModel):
+    """新建项目请求"""
+    draft: Dict[str, Any] = Field(default_factory=dict, description="可选初始草稿")
+
+
+class ProjectRecord(BaseModel):
+    """项目数据库记录"""
+    id: str
+    title: str
+    createdAt: str
+    updatedAt: str
+    completed: int = 0
+    total: int = 0
+    wordCount: int = 0
+    draft: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectResponse(BaseModel):
+    """项目 API 响应"""
+    success: bool
+    message: str = ""
+    project: Optional[ProjectRecord] = None
+    projects: List[ProjectRecord] = Field(default_factory=list)
+
+
 class AnalysisType(str, Enum):
     """分析类型"""
     OVERVIEW = "overview"
@@ -460,6 +492,40 @@ class MissingCompanyMaterial(BaseModel):
     blocking: bool = Field(False, description="是否阻塞导出")
 
 
+class EnterpriseProvidedMaterial(BaseModel):
+    """已识别的企业资料。"""
+    id: str = Field(..., description="企业资料ID，如 EM-P-01")
+    name: str = Field("", description="资料名称")
+    material_type: str = Field("", description="资质/业绩/人员/设备/证书/图片/承诺/报价/其他")
+    source: str = Field("", description="资料来源，如用户上传、企业资料库、历史样例或招标文件要求")
+    used_by: List[str] = Field(default_factory=list, description="被哪些评分项/审查项/章节引用")
+    confidence: str = Field("unknown", description="high/medium/low/unknown")
+    verification_status: str = Field("unverified", description="unverified/verified/rejected/expired")
+
+
+class EnterpriseMaterialRequirement(BaseModel):
+    """企业资料需求项，独立于正文材料占位。"""
+    id: str = Field(..., description="需求ID，如 EM-R-01")
+    name: str = Field("", description="所需资料名称")
+    material_type: str = Field("", description="资质/业绩/人员/设备/证书/图片/承诺/报价/其他")
+    required_by: List[str] = Field(default_factory=list, description="来源评分项/评审项/章节ID")
+    source: str = Field("", description="招标文件出处")
+    required: bool = Field(True, description="是否必需")
+    blocking: bool = Field(False, description="缺失是否阻塞导出或需人工确认")
+    placeholder: str = Field("", description="正文或附件索引中的占位文本")
+    status: str = Field("missing", description="missing/provided/unknown/not_applicable")
+    validation_rule: str = Field("", description="人工复核口径")
+
+
+class EnterpriseMaterialProfile(BaseModel):
+    """企业资料独立解析画像。"""
+    requirements: List[EnterpriseMaterialRequirement] = Field(default_factory=list, description="企业资料需求")
+    provided_materials: List[EnterpriseProvidedMaterial] = Field(default_factory=list, description="已识别企业资料")
+    missing_materials: List[EnterpriseMaterialRequirement] = Field(default_factory=list, description="仍需补齐资料")
+    verification_tasks: List[str] = Field(default_factory=list, description="人工复核任务")
+    summary: str = Field("", description="企业资料准备状态摘要")
+
+
 class ResponseMatrixItem(BaseModel):
     """响应矩阵条目"""
     id: str = Field(..., description="矩阵ID，如 RM-01")
@@ -509,6 +575,7 @@ class AnalysisReport(BaseModel):
     evidence_chain_requirements: List[EvidenceChainRequirement] = Field(default_factory=list, description="证据链要求")
     required_materials: List[RequiredMaterial] = Field(default_factory=list, description="所需证明材料")
     missing_company_materials: List[MissingCompanyMaterial] = Field(default_factory=list, description="待补企业资料")
+    enterprise_material_profile: EnterpriseMaterialProfile = Field(default_factory=EnterpriseMaterialProfile, description="独立企业资料解析画像")
     generation_warnings: List[GenerationWarning] = Field(default_factory=list, description="生成链路警告")
     response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
     reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟投标文件样例反向建模结果")
@@ -591,6 +658,7 @@ class ChapterContentRequest(BaseModel):
     document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="可选：图表与素材规划")
     generated_summaries: List[GeneratedSummary] = Field(default_factory=list, description="已生成章节摘要")
     enterprise_materials: List[RequiredMaterial] = Field(default_factory=list, description="已提供企业材料")
+    enterprise_material_profile: EnterpriseMaterialProfile = Field(default_factory=EnterpriseMaterialProfile, description="独立企业资料解析画像")
     missing_materials: List[MissingCompanyMaterial] = Field(default_factory=list, description="待补企业资料")
     asset_library: Dict[str, Any] = Field(default_factory=dict, description="可选：图片、证书、截图、效果图等素材库")
 
@@ -598,6 +666,7 @@ class ChapterContentRequest(BaseModel):
 class AnalysisReportRequest(BaseModel):
     """结构化解析报告生成请求"""
     file_content: str = Field(..., description="招标文件内容")
+    config: Optional[ConfigRequest] = Field(None, description="可选：本次解析使用的运行时模型配置")
 
 
 class ReviewCoverageItem(BaseModel):
@@ -720,6 +789,7 @@ class DocumentBlocksPlanRequest(BaseModel):
     response_matrix: Optional[ResponseMatrix] = Field(None, description="响应矩阵")
     reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟投标文件样例反向建模结果")
     enterprise_materials: List[RequiredMaterial] = Field(default_factory=list, description="企业资料")
+    enterprise_material_profile: EnterpriseMaterialProfile = Field(default_factory=EnterpriseMaterialProfile, description="独立企业资料解析画像")
     asset_library: Dict[str, Any] = Field(default_factory=dict, description="素材库")
 
 
@@ -743,5 +813,9 @@ class WordExportRequest(BaseModel):
     project_name: Optional[str] = Field(None, description="项目名称")
     project_overview: Optional[str] = Field(None, description="项目概述")
     outline: List[OutlineItem] = Field(..., description="目录结构，包含内容")
+    analysis_report: Optional[AnalysisReport] = Field(None, description="结构化标准解析报告")
+    review_report: Optional[ReviewReport] = Field(None, description="导出前审校报告")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟样例写作模板和 Word 样式")
     document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
+    manual_review_confirmed: bool = Field(False, description="是否已完成人工复核确认")
     export_dir: Optional[str] = Field(None, description="可选：由本地后端直接保存 Word 的目录")

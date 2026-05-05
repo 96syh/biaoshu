@@ -1,83 +1,133 @@
-# 华正ai标书系统
+# 华正 ai 标书系统
 
-华正ai标书系统是一个面向招投标文件编制的本地 Web 应用。系统以招标文件为事实源，围绕“上传解析、标准解析报告、响应矩阵、目录生成、正文生成、合规审校、Word 导出”的流程，帮助用户把招标要求转成可检查、可追踪、可继续编辑的投标文件草稿。
+华正 ai 标书系统是一个面向招投标文件编制的本地 Web 工作台。系统以招标文件为事实源，把“上传解析、标准解析报告、响应矩阵、目录生成、正文生成、合规审校、Word 导出”串成一条可追踪流程，帮助用户把招标要求转成可检查、可继续编辑、可人工复核的投标文件草稿。
 
-当前版本统一通过 LiteLLM Proxy 接入模型，由 LiteLLM 负责适配不同模型服务，本应用始终按 OpenAI Chat Completions 格式调用。
+当前实现已经统一收敛到 **LiteLLM Proxy + OpenAI Chat Completions 兼容接口**。本应用只保存和调用 LiteLLM 的 Base URL、模型名和可选 API Key；不同模型供应商、内网模型、本地模型和云端模型由 LiteLLM 负责适配。
+
+## 当前定位
+
+- 面向对象：投标技术人员、方案编制人员、标书审核人员。
+- 核心目标：降低招标文件阅读遗漏、目录与评分项不对齐、正文重复撰写、导出前合规检查不足等问题。
+- 使用方式：本地启动前后端，浏览器中上传招标文件，配置 LiteLLM 后生成解析报告、目录、正文和审校报告。
+- 输出边界：系统生成的是投标文件草稿和审校建议，最终实质性条款、签章、报价、暗标、证明材料和 Word 排版仍必须人工复核。
 
 ## 核心能力
 
-- 招标文件上传：支持 PDF、DOCX，文件大小限制在 500MB 以下。
-- 标准解析报告：提取项目基础信息、评分项、审查项、实质性条款、废标风险、材料清单、固定格式、签章要求、报价规则、证据链、卷册规则和暗标规则。
-- 响应矩阵：把评分项、资格项、形式项、响应性条款、废标风险、固定格式、签章、报价规则和证明材料映射到后续目录、正文和审校流程。
-- 目录生成：根据解析报告和响应矩阵生成正式投标文件目录，支持完整标书和技术标两种生成模式。
-- 正文生成：左侧目录类似 Word 导航，点击章节后右侧跳转到对应正文位置；生成过程支持流式写入，能看到文字逐步出现。
-- 生成控制：正文生成支持暂停、继续和停止，切换页面后仍保留当前生成进度。
-- 合规审校：导出前检查覆盖率、阻塞项、警告项、固定格式、签章、报价隔离、暗标泄露、证据链、页码占位和疑似虚构风险，并给出修订计划。
-- Word 导出：生成的正文可导出为 DOCX，并在支持的浏览器中选择本地保存位置。
-- 历史记录：本地保存生成历史和草稿，避免做一半中断后丢失进度。
-- 模型配置：在界面中配置 LiteLLM Base URL、模型名和 API Key，支持验证端点、同步模型列表和保存配置。
+- 招标文件上传：支持 PDF、DOCX，单文件大小限制 500MB；暂不支持 `.doc`，需另存为 `.docx` 后上传。
+- 文档解析：优先探测本机 MinerU，将 PDF/DOCX 解析为 Markdown；没有 MinerU 或解析失败时回退到内置 `pdfplumber` / `docx2python` / `PyPDF2` 路径。
+- 标准解析报告：提取项目基础信息、投标文件组成、评分项、资格审查、形式评审、响应性要求、实质性条款、废标风险、材料清单、固定格式、签章要求、报价规则、卷册规则和暗标规则。
+- 响应矩阵：把评分项、资格项、形式项、响应性条款、废标风险、固定格式、签章、报价规则和证明材料映射到目录、正文和审校流程。
+- 目录生成：基于标准解析报告、响应矩阵和招标文件编制要求生成正式目录，支持技术标和完整标两种模式。
+- 正文生成：按目录叶子节点逐章生成正文，支持 SSE 流式写入、暂停、继续、停止和章节重生成。
+- 样例风格剖面：可上传成熟投标文件样例，提取结构、表达风格和常见内容块，作为后续目录和正文生成参考。
+- 图表与素材规划：根据目录、解析报告和企业材料，规划表格、图片、承诺书、附件、证据链等内容块。
+- 合规审校：导出前检查覆盖率、阻塞项、警告项、固定格式、签章、报价隔离、暗标泄露、证据链、页码占位、疑似虚构和重复内容，并生成修订计划。
+- Word 导出：将正文和目录导出为 DOCX，后端使用 `python-docx` 生成基础 Word 文档。
+- 草稿与历史：前端使用浏览器 `localStorage` 保存当前草稿、章节正文和最近历史记录，减少长流程中断后的损失。
 
 ## 工作流程
 
-1. 上传文件：上传 PDF 或 DOCX 招标文件。
-2. 开始解析：生成项目基础信息、标准解析报告和响应矩阵。
-3. 生成目录：把评分项、审查项、风险项、材料项映射到目录章节。
-4. 生成正文：选择章节生成，或批量生成正文内容。
-5. 执行审校：检查正文是否覆盖招标要求，并输出阻塞项、警告项和修订计划。
-6. 导出 Word：导出 DOCX 到本地文件夹，继续在 Word 中排版和人工复核。
+1. 配置模型：在“模型配置”中填写 LiteLLM Base URL、模型名和可选 API Key，验证端点并同步模型列表。
+2. 上传文件：上传 PDF 或 DOCX 招标文件，后端解析出全文文本和解析器元信息。
+3. 标准解析：调用模型生成结构化 `AnalysisReport`，并在需要时生成 `ResponseMatrix`。
+4. 选择模式：选择“技术标”或“完整标”，决定目录、正文和审校的范围。
+5. 生成目录：根据解析报告、响应矩阵、投标文件组成和可选样例风格生成 `OutlineItem` 树。
+6. 生成正文：选择单章或批量生成正文，章节生成时会传入父章节、同级章节、已生成摘要、材料清单和风险映射。
+7. 执行审校：对完整草稿执行覆盖性、缺料、废标风险、固定格式、报价、暗标和证据链检查。
+8. 导出 Word：导出 DOCX 后继续在 Word 中处理最终页码、目录、格式、签章和人工复核。
 
 ## 页面说明
 
 系统左侧导航包含以下页面：
 
-- 上传文件：选择招标文件，查看项目基础信息和材料缺失提示。
-- 开始解析：抽取项目概况、评分办法、资格审查、实质性要求和材料清单。
-- 生成目录：查看目录结构、评分项映射、风险等级和材料关联。
+- 上传文件：选择招标文件，查看项目基础信息、材料缺失提示和解析入口。
+- 开始解析：抽取项目概况、评分办法、资格审查、实质性要求、投标文件组成和材料清单。
+- 生成目录：查看目录结构、评分项映射、风险等级、材料关联和章节编辑入口。
 - 生成正文：以 Word 类文档视图生成和预览正文，左侧目录可跳转到对应章节。
 - 执行审校：查看覆盖率、阻塞问题、警告问题、提示信息和修订计划。
-- 模型配置：配置 LiteLLM Proxy 接入信息。
+- 模型配置：配置 LiteLLM Proxy 接入信息、验证端点、同步模型列表。
 
 ## 模型接入
 
-本项目的模型调用链路固定为：
+模型调用链路固定为：
 
 ```text
-用户配置的模型服务 -> LiteLLM Proxy -> 本应用 -> OpenAI Chat Completions 格式调用
+用户配置的模型服务 / 本地模型 / 云端模型
+        ↓
+LiteLLM Proxy
+        ↓
+华正 ai 标书系统后端
+        ↓
+OpenAI Chat Completions 兼容调用
 ```
 
-配置项说明：
+配置项：
 
-- LiteLLM Base URL：LiteLLM Proxy 的 OpenAI 兼容地址，例如 `https://example.com/v1`。
+- LiteLLM Base URL：LiteLLM Proxy 的 OpenAI 兼容地址，例如 `http://localhost:4000/v1` 或 `https://example.com/v1`。
 - 模型名：从 `/models` 同步后选择，或手动输入模型 ID。
 - API Key：LiteLLM master key 或 virtual key，可为空，取决于 LiteLLM 端配置。
 
-如果端点验证失败，优先确认：
+端点验证失败时优先检查：
 
 - 后端服务是否已启动。
-- LiteLLM Base URL 是否是完整服务地址。
-- API Key 是否可用于该 LiteLLM 服务。
+- LiteLLM Proxy 是否已启动并能访问。
+- Base URL 是否包含正确的 `/v1` 路径。
+- API Key 是否能被 LiteLLM 接受。
 - 模型名是否存在于 LiteLLM 返回的模型列表中。
 
 ## 技术架构
 
 ```text
-frontend/                React + TypeScript 前端
-backend/                 FastAPI 后端
-backend/app/routers/     API 路由
-backend/app/services/    文件处理、模型调用、生成逻辑
-backend/app/models/      Pydantic 数据结构
-backend/app/utils/       Prompt、配置、SSE、目录工具
-docs/                    补充文档
-screenshots/             截图资源
+yibiao-simple/
+  frontend/                 React + TypeScript 前端工作台
+  backend/                  FastAPI 后端
+  backend/app/main.py       FastAPI 应用入口、路由注册、静态前端托管
+  backend/app/routers/      配置、文档、目录、正文、扩写 API
+  backend/app/services/     文件解析、模型调用、搜索服务
+  backend/app/models/       Pydantic 请求/响应/业务数据结构
+  backend/app/utils/        Prompt、配置、SSE、JSON 校验、目录工具
+  docs/                     模型接入和 Prompt 工作流补充文档
+  screenshots/              截图资源
+  cloudflare-demo/          Cloudflare 静态演示样例
+  cloudflare-fullstack/     Cloudflare 全栈部署实验样例
 ```
 
 主要技术栈：
 
-- 前端：React、TypeScript、React Markdown、Heroicons、File Saver。
+- 前端：React、TypeScript、React Markdown、Heroicons、File Saver、Tailwind CSS。
 - 后端：FastAPI、Pydantic、OpenAI SDK、python-docx、pdfplumber、PyMuPDF、docx2python。
 - 模型网关：LiteLLM Proxy。
-- 文档导出：python-docx 生成 DOCX。
+- 文档解析：MinerU 优先，内置解析器兜底。
+- 文档导出：`python-docx` 生成 DOCX。
 - 实时输出：SSE 流式返回。
+
+## 后端 API 分层
+
+- `/api/config/*`：保存配置、加载配置、同步模型、验证 LiteLLM 端点。
+- `/api/document/upload`：上传招标文件并提取文本。
+- `/api/document/analyze-stream`：早期项目概述/技术评分流式分析接口，仍保留兼容。
+- `/api/document/analyze-report-stream`：生成结构化标准解析报告。
+- `/api/document/reference-style-upload`：上传成熟投标样例并生成风格剖面。
+- `/api/document/document-blocks-plan-stream`：生成图表、表格、图片、承诺书和附件规划。
+- `/api/outline/generate-stream`：生成目录和目录预览进度。
+- `/api/content/generate-chapter-stream`：生成单章节正文。
+- `/api/document/review-compliance-stream`：执行导出前合规审校。
+- `/api/document/consistency-revision-stream`：生成全文一致性修订报告。
+- `/api/document/export-word`：导出 Word 文档。
+- `/api/expand/upload`：上传已有方案/目录文档并抽取旧目录参考。
+
+## 重要数据结构
+
+当前标书生成链路围绕以下结构运行：
+
+- `AnalysisReport`：标准解析报告，是目录、正文和审校阶段的主要事实源。
+- `ResponseMatrix`：响应矩阵，用于追踪评分项、审查项、材料项、风险项与目录章节的映射。
+- `OutlineItem`：目录节点，保存章节层级、章节类型、风险/材料/评分项映射、预期内容块和正文内容。
+- `ChapterContentRequest`：章节正文生成请求，包含当前章节、父章节、同级章节、解析报告、响应矩阵、已生成摘要和企业材料上下文。
+- `ReviewReport`：导出前审校报告。
+- `RevisionPlan`：审校后的修订动作清单。
+
+正文和审校阶段不重新解析招标文件，而是复用 `AnalysisReport`、`ResponseMatrix`、目录映射、样例风格剖面、图表素材规划和企业材料上下文。
 
 ## 本地开发
 
@@ -89,7 +139,7 @@ macOS/Linux 可在项目根目录执行：
 ./start-dev.sh
 ```
 
-脚本会固定启动：
+脚本默认启动：
 
 ```text
 后端：http://127.0.0.1:8000
@@ -99,7 +149,7 @@ macOS/Linux 可在项目根目录执行：
 
 在 macOS 中也可以双击 `start-dev.command` 启动。关闭脚本窗口或按 `Ctrl+C` 会停止本脚本启动的前后端进程。
 
-### 1. 启动后端
+### 手动启动后端
 
 ```bash
 cd backend
@@ -118,7 +168,7 @@ API 文档：
 http://127.0.0.1:8000/docs
 ```
 
-### 2. 启动前端
+### 手动启动前端
 
 ```bash
 cd frontend
@@ -131,7 +181,7 @@ PORT=3001 npm run start
 http://localhost:3001
 ```
 
-### 3. 构建前端
+### 构建前端
 
 ```bash
 cd frontend
@@ -151,9 +201,15 @@ backend/app/config.py
 - 默认端口：`8000`
 - 上传目录：`backend/uploads`
 - 最大上传文件：`500MB`
-- CORS：默认允许本地 3000-3004 和 8000 端口
+- CORS：默认允许本地 3000-3004、3010、8000、8010 端口
 
-模型配置由应用界面写入本地配置文件，不建议把真实 API Key 写入源码。
+模型配置由应用界面写入用户目录：
+
+```text
+~/.ai_write_helper/user_config.json
+```
+
+不要把真实 API Key 写入源码、文档或日志。
 
 ### 本地 MinerU 文档解析
 
@@ -161,7 +217,7 @@ backend/app/config.py
 
 - 有 MinerU：优先用本地 MinerU 将 PDF/DOCX 解析为 Markdown，再进入标准解析、目录和正文流程。
 - 没有 MinerU 或解析失败：自动回退到内置 `pdfplumber` / `docx2python` 解析器。
-- 不调用 MinerU 云端 API；模型理解仍通过 LiteLLM 配置的模型服务完成。
+- `mineru_strict` 模式下 MinerU 失败会直接报错，不再回退。
 
 可选环境变量：
 
@@ -188,6 +244,16 @@ export YIBIAO_MINERU_TIMEOUT=900
 
 macOS 上若安装了支持 MPS 的 MinerU/PyTorch，`YIBIAO_MINERU_DEVICE=auto` 会优先选择 MPS；Linux 上检测到 `nvidia-smi` 时会优先选择 CUDA。
 
+### 本地安全验证模式
+
+如果只想验证端到端流程而不把招标文件发给模型，可设置：
+
+```bash
+export YIBIAO_FORCE_LOCAL_FALLBACK=1
+```
+
+该模式会启用本地兜底解析、兜底目录、兜底正文和兜底审校，仅适合 smoke test，不代表真实生成质量。
+
 ## Docker 运行
 
 项目保留 Dockerfile，可按 amd64 构建：
@@ -211,28 +277,29 @@ docker run --rm -p 8000:8000 \
 http://localhost:8000
 ```
 
-## 重要数据结构
+## 部署与数据边界
 
-当前标书生成链路围绕以下结构运行：
-
-- `AnalysisReport`：标准解析报告，是后续阶段的事实源。
-- `ResponseMatrix`：响应矩阵，用于确保评分项、审查项、材料项和风险项可追踪。
-- `OutlineItem`：目录节点，保存章节层级、映射 ID 和正文内容。
-- `ReviewReport`：导出前审校报告。
-- `RevisionPlan`：审校后的修订计划。
-
-正文和审校阶段不重新解析招标文件，只复用 `AnalysisReport`、`ResponseMatrix`、目录映射和企业材料上下文。
+- 应用默认是本地工作台，不自带用户体系、权限体系、团队协作和数据库持久化。
+- 模型配置保存到本机用户目录，草稿历史保存在浏览器 `localStorage`。
+- 招标文件上传后会被后端临时保存，解析完成后会清理临时文件。
+- 模型理解阶段会把招标文本发送到用户配置的 LiteLLM 后端；是否外传取决于 LiteLLM 后端接入的是本地模型、内网模型还是云端模型。
+- 文件解析的 MinerU 默认走本地 CLI；如果配置了 MinerU 远端 API，需要自行确认数据边界。
+- 生成结果必须人工复核，不应直接作为最终投标文件提交。
 
 ## 当前限制
 
 - 企业资料解析还不是独立模块，目前通过 `enterprise_materials` 和 `missing_materials` 传递已提供材料和待补资料。
-- 生成内容仍依赖模型质量，导出前必须人工复核实质性条款、签章、报价、暗标和证明材料。
-- Word 导出提供基础 DOCX 结构，最终页码、目录、版式和盖章位置仍建议在 Word 中人工确认。
+- 草稿和历史记录使用浏览器 `localStorage`，超大项目或多历史记录可能受到浏览器容量限制。
+- 生成内容依赖模型质量，导出前必须人工复核实质性条款、签章、报价、暗标和证明材料。
+- Word 导出提供基础 DOCX 结构，最终页码、目录、版式、图表细节和盖章位置仍建议在 Word 中人工确认。
+- 前端主工作台逻辑目前集中在 `frontend/src/App.tsx`，后续大规模扩展时建议拆分组件和业务 hooks。
 
 ## 相关文档
 
 - [LiteLLM Proxy 统一模型网关接入说明](./docs/litellm-proxy.md)
 - [本地大模型调用 API 文档](./docs/local-model-api.md)
+- [Prompt 工作流说明](./docs/prompt-workflow.md)
+- [标书 Prompt 规则替换目标](./docs/biaoshu_prompt_replacement_target_section.md)
 
 ## 许可证
 

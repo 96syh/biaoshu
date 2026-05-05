@@ -1,8 +1,8 @@
 /**
  * 应用状态管理Hook
  */
-import { useState, useCallback } from 'react';
-import { AnalysisReport, AppState, ConfigData, OutlineData } from '../types';
+import { useState, useCallback, useEffect } from 'react';
+import { AnalysisReport, AppState, ConfigData, OutlineData, ParserInfo } from '../types';
 import { draftStorage } from '../utils/draftStorage';
 import { DEFAULT_PROVIDER_ID } from '../constants/providers';
 
@@ -17,6 +17,7 @@ const initialState: AppState = {
   },
   fileContent: '',
   uploadedFileName: '',
+  parserInfo: undefined,
   projectOverview: '',
   techRequirements: '',
   analysisReport: undefined,
@@ -30,6 +31,17 @@ export const useAppState = () => {
     return { ...initialState, ...draft };
   });
 
+  useEffect(() => {
+    let cancelled = false;
+    draftStorage.loadDraftAsync().then((draft) => {
+      if (cancelled || !draft) return;
+      setState(prev => ({ ...prev, ...draft }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const updateConfig = useCallback((config: ConfigData) => {
     setState(prev => ({ ...prev, config }));
   }, []);
@@ -42,7 +54,7 @@ export const useAppState = () => {
     });
   }, []);
 
-  const updateFileContent = useCallback((fileContent: string, uploadedFileName = '') => {
+  const updateFileContent = useCallback((fileContent: string, uploadedFileName = '', parserInfo?: ParserInfo) => {
     setState(prev => {
       draftStorage.startNewHistory();
       const next = {
@@ -50,6 +62,7 @@ export const useAppState = () => {
         currentStep: 0,
         fileContent,
         uploadedFileName,
+        parserInfo,
         projectOverview: '',
         techRequirements: '',
         analysisReport: undefined,
@@ -60,6 +73,7 @@ export const useAppState = () => {
         currentStep: 0,
         fileContent,
         uploadedFileName,
+        parserInfo,
         projectOverview: '',
         techRequirements: '',
         analysisReport: undefined,
@@ -112,6 +126,7 @@ export const useAppState = () => {
     | 'currentStep'
     | 'fileContent'
     | 'uploadedFileName'
+    | 'parserInfo'
     | 'projectOverview'
     | 'techRequirements'
     | 'analysisReport'

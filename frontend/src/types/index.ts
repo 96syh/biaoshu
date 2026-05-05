@@ -12,6 +12,20 @@ export interface ConfigData {
 
 export type BidMode = 'technical_only' | 'full_bid';
 
+export interface ParserInfo {
+  parser?: string;
+  preferred_parser?: string;
+  fallback_used?: boolean;
+  fallback_reason?: string;
+  format?: string;
+  file_kind?: string;
+  device?: string;
+  backend?: string;
+  content_block_count?: number;
+  file_size?: number;
+  [key: string]: unknown;
+}
+
 export interface AnalysisProjectInfo {
   name: string;
   number: string;
@@ -236,6 +250,37 @@ export interface MissingCompanyMaterial {
   blocking?: boolean;
 }
 
+export interface EnterpriseProvidedMaterial {
+  id: string;
+  name: string;
+  material_type: string;
+  source: string;
+  used_by: string[];
+  confidence: string;
+  verification_status: string;
+}
+
+export interface EnterpriseMaterialRequirement {
+  id: string;
+  name: string;
+  material_type: string;
+  required_by: string[];
+  source: string;
+  required: boolean;
+  blocking?: boolean;
+  placeholder: string;
+  status: 'missing' | 'provided' | 'unknown' | 'not_applicable' | string;
+  validation_rule?: string;
+}
+
+export interface EnterpriseMaterialProfile {
+  requirements: EnterpriseMaterialRequirement[];
+  provided_materials: EnterpriseProvidedMaterial[];
+  missing_materials: EnterpriseMaterialRequirement[];
+  verification_tasks: string[];
+  summary: string;
+}
+
 export interface ResponseMatrixItem {
   id: string;
   source_item_id: string;
@@ -281,6 +326,7 @@ export interface AnalysisReport {
   evidence_chain_requirements: EvidenceChainRequirement[];
   required_materials: RequiredMaterial[];
   missing_company_materials: MissingCompanyMaterial[];
+  enterprise_material_profile?: EnterpriseMaterialProfile;
   generation_warnings?: GenerationWarning[];
   response_matrix?: ResponseMatrix;
   reference_bid_style_profile?: Record<string, unknown>;
@@ -436,6 +482,7 @@ export interface DocumentBlocksPlanRequest {
   response_matrix?: ResponseMatrix;
   reference_bid_style_profile?: Record<string, unknown>;
   enterprise_materials?: RequiredMaterial[];
+  enterprise_material_profile?: EnterpriseMaterialProfile;
   asset_library?: Record<string, unknown>;
 }
 
@@ -473,6 +520,7 @@ export interface AppState {
   config: ConfigData;
   fileContent: string;
   uploadedFileName?: string;
+  parserInfo?: ParserInfo;
   projectOverview: string;
   techRequirements: string;
   analysisReport?: AnalysisReport;

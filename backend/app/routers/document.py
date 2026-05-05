@@ -21,8 +21,11 @@ import io
 import re
 import docx
 import asyncio
-from docx.shared import Pt
+import time
+import uuid
+from docx.shared import Cm, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from urllib.parse import quote
 from pathlib import Path
@@ -52,6 +55,101 @@ def set_paragraph_font_simsun(paragraph: docx.text.paragraph.Paragraph) -> None:
         set_run_font_simsun(run)
 
 
+def add_field(paragraph: docx.text.paragraph.Paragraph, instruction: str) -> None:
+    """Add a Word field that can be updated inside Word/WPS."""
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = instruction
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    placeholder = OxmlElement("w:t")
+    placeholder.text = "请在 Word 中更新域"
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+
+    run = paragraph.add_run()
+    run._r.append(begin)
+    run._r.append(instr)
+    run._r.append(separate)
+    run._r.append(placeholder)
+    run._r.append(end)
+    set_run_font_simsun(run)
+
+
+def enable_update_fields_on_open(doc: docx.Document) -> None:
+    """Ask Word to update TOC/page-number fields when opening the document."""
+    settings = doc.settings.element
+    update_fields = settings.find(qn("w:updateFields"))
+    if update_fields is None:
+        update_fields = OxmlElement("w:updateFields")
+    settings.append(update_fields)
+    update_fields.set(qn("w:val"), "true")
+
+
+def _style_value(style_profile: dict, key: str, default: str) -> str:
+    value = style_profile.get(key)
+    return str(value).strip() if value else default
+
+
+def _cm_value(value: str, default: float) -> float:
+    text = str(value or "").strip().lower().replace("厘米", "cm")
+    try:
+        if text.endswith("cm"):
+            return float(text[:-2])
+        if text.endswith("mm"):
+            return float(text[:-2]) / 10
+        return float(text)
+    except Exception:
+        return default
+
+
+def _pt_value(value: str, default: float) -> float:
+    text = str(value or "").strip().lower().replace("小四", "12pt").replace("五号", "10.5pt")
+    try:
+        if text.endswith("pt"):
+            return float(text[:-2])
+        return float(text)
+    except Exception:
+        return default
+
+
+def configure_word_style(doc: docx.Document, reference_profile: dict | None = None) -> None:
+    """Apply mature-sample-like Word page and font settings."""
+    profile = reference_profile or {}
+    style_profile = profile.get("word_style_profile") if isinstance(profile, dict) else {}
+    if not isinstance(style_profile, dict):
+        style_profile = {}
+
+    for section in doc.sections:
+        section.page_width = Cm(21)
+        section.page_height = Cm(29.7)
+        section.top_margin = Cm(_cm_value(_style_value(style_profile, "margin_top", "2.2cm"), 2.2))
+        section.bottom_margin = Cm(_cm_value(_style_value(style_profile, "margin_bottom", "2.2cm"), 2.2))
+        section.left_margin = Cm(_cm_value(_style_value(style_profile, "margin_left", "2.7cm"), 2.7))
+        section.right_margin = Cm(_cm_value(_style_value(style_profile, "margin_right", "2.2cm"), 2.2))
+        section.header_distance = Cm(1.5)
+        section.footer_distance = Cm(1.75)
+
+    body_font = _style_value(style_profile, "body_font_family", "宋体").split(",")[0].strip().strip('"')
+    heading_font = _style_value(style_profile, "heading_font_family", "黑体").split(",")[0].strip().strip('"')
+    body_size = _pt_value(_style_value(style_profile, "body_font_size", "10.5pt"), 10.5)
+
+    def set_style_font(style_name: str, font_name: str, size_pt: float, bold: bool | None = None) -> None:
+        style = doc.styles[style_name]
+        style.font.name = font_name
+        style.font.size = Pt(size_pt)
+        if bold is not None:
+            style.font.bold = bold
+        style._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
+
+    set_style_font("Normal", body_font, body_size, False)
+    set_style_font("Heading 1", heading_font, _pt_value(_style_value(style_profile, "heading_1_size", "16pt"), 16), True)
+    set_style_font("Heading 2", heading_font, _pt_value(_style_value(style_profile, "heading_2_size", "14pt"), 14), True)
+    set_style_font("Heading 3", heading_font, _pt_value(_style_value(style_profile, "heading_3_size", "12pt"), 12), True)
+
+
 @router.post("/upload", response_model=FileUploadResponse)
 async def upload_file(file: UploadFile = File(...)):
     """上传文档文件并提取文本内容"""
@@ -72,11 +170,13 @@ async def upload_file(file: UploadFile = File(...)):
         
         return FileUploadResponse(
             success=True,
-            message=f"文件 {file.filename} 上传成功，解析器：{parser_name}{fallback_note}",
+            message=f"文件 {file.filename} 上传成功，解析器：{parser_name}{fallback_note}，已在上传阶段转换为 {parser_info.get('format') or '文本'}",
             file_content=file_content,
             parser_info=parser_info,
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         return FileUploadResponse(
             success=False,
@@ -206,29 +306,61 @@ async def analyze_document_stream(request: AnalysisRequest):
 async def analyze_report_stream(request: AnalysisReportRequest):
     """流式生成结构化标准解析报告"""
     try:
-        config = config_manager.load_config()
+        request_id = uuid.uuid4().hex[:8]
+        started_at = time.monotonic()
+        config = (
+            request.config.model_dump(mode="json", exclude_none=True)
+            if request.config
+            else config_manager.load_config()
+        )
         auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
         if auth_error:
             raise HTTPException(status_code=400, detail=auth_error)
 
-        openai_service = OpenAIService()
+        openai_service = OpenAIService(config=config)
+        print(
+            f"标准解析报告[{request_id}] 开始："
+            f"model={config.get('model_name')} base_url={config.get('base_url')} "
+            f"file_chars={len(request.file_content or '')}",
+            flush=True,
+        )
 
         async def generate():
+            compute_task = None
             try:
                 compute_task = asyncio.create_task(
                     openai_service.generate_analysis_report(request.file_content)
                 )
+                heartbeat_count = 0
 
                 while not compute_task.done():
                     yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
+                    heartbeat_count += 1
+                    if heartbeat_count % 30 == 0:
+                        print(
+                            f"标准解析报告[{request_id}] 仍在生成："
+                            f"{int(time.monotonic() - started_at)} 秒，心跳 {heartbeat_count} 次",
+                            flush=True,
+                        )
                     await asyncio.sleep(1)
 
                 report_json = json.dumps(await compute_task, ensure_ascii=False)
+                print(
+                    f"标准解析报告[{request_id}] 完成："
+                    f"{int(time.monotonic() - started_at)} 秒，输出 {len(report_json)} 字符",
+                    flush=True,
+                )
                 chunk_size = 256
                 for index in range(0, len(report_json), chunk_size):
                     piece = report_json[index:index + chunk_size]
                     yield f"data: {json.dumps({'chunk': piece}, ensure_ascii=False)}\n\n"
+            except asyncio.CancelledError:
+                if compute_task and not compute_task.done():
+                    compute_task.cancel()
+                print(f"标准解析报告[{request_id}] SSE 连接被取消", flush=True)
+                raise
             except Exception as e:
+                print(f"标准解析报告[{request_id}] 失败：{str(e)}", flush=True)
                 payload = {
                     "chunk": "",
                     "error": True,
@@ -253,7 +385,19 @@ async def reference_style_upload(file: UploadFile = File(...)):
         if file_kind in (None, "doc"):
             return FileUploadResponse(success=False, message=FileService.get_upload_validation_message(file))
 
-        file_content = await FileService.process_uploaded_file(file)
+        parse_result = await FileService.process_uploaded_file_with_metadata(file)
+        file_content = parse_result.get("file_content", "")
+        parser_info = parse_result.get("parser_info", {})
+        if (
+            str(parser_info.get("parser") or "").lower() != "mineru"
+            or str(parser_info.get("format") or "").lower() != "markdown"
+        ):
+            return FileUploadResponse(
+                success=False,
+                message="成熟样例必须先通过 MinerU 转换为 Markdown 后再生成模板剖面；请检查 MinerU 配置或将 YIBIAO_DOCUMENT_PARSER 设置为 mineru_strict。",
+                parser_info=parser_info,
+            )
+
         config = config_manager.load_config()
         auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
         if auth_error:
@@ -262,8 +406,9 @@ async def reference_style_upload(file: UploadFile = File(...)):
         profile = await OpenAIService().generate_reference_bid_style_profile(file_content)
         return FileUploadResponse(
             success=True,
-            message=f"样例文件 {file.filename} 已解析为风格剖面",
+            message=f"样例文件 {file.filename} 已通过 MinerU Markdown 解析，并生成写作模板剖面",
             file_content=file_content,
+            parser_info=parser_info,
             reference_bid_style_profile=profile,
         )
     except HTTPException as e:
@@ -405,12 +550,17 @@ async def review_compliance_stream(request: ComplianceReviewRequest):
 async def export_word(request: WordExportRequest):
     """根据目录数据导出Word文档"""
     try:
-        doc = docx.Document()
+        if not request.manual_review_confirmed:
+            raise HTTPException(status_code=400, detail="导出前必须完成人工复核确认，不能直接跳过模型结果复核。")
 
-        # 统一设置文档的基础字体为宋体，取消普通段落默认加粗
+        doc = docx.Document()
+        enable_update_fields_on_open(doc)
+        configure_word_style(doc, request.reference_bid_style_profile)
+
+        # 统一设置普通正文基础字体，标题样式已由成熟样例模板配置。
         try:
             styles = doc.styles
-            base_styles = ["Normal", "Heading 1", "Heading 2", "Heading 3", "Title"]
+            base_styles = ["Normal"]
             for style_name in base_styles:
                 if style_name in styles:
                     style = styles[style_name]
@@ -429,11 +579,20 @@ async def export_word(request: WordExportRequest):
 
         # AI 生成声明
         p = doc.add_paragraph()
-        run = p.add_run("内容由AI生成")
+        run = p.add_run("内容由 AI 生成，导出前已要求人工复核确认；最终页码、目录、签章、版式和图表需在 Word 中复核。")
         run.italic = True
         run.font.size = Pt(9)
         set_run_font_simsun(run)
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        footer_p = doc.sections[0].footer.paragraphs[0]
+        footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        footer_p.add_run("第 ")
+        add_field(footer_p, "PAGE")
+        footer_p.add_run(" 页 / 共 ")
+        add_field(footer_p, "NUMPAGES")
+        footer_p.add_run(" 页")
+        set_paragraph_font_simsun(footer_p)
 
         # 文档标题
         title = request.project_name or "投标技术文件"
@@ -443,6 +602,61 @@ async def export_word(request: WordExportRequest):
         title_run.font.size = Pt(16)
         set_run_font_simsun(title_run)
         title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # 可更新目录。python-docx 不能计算最终页码，但可以生成 Word 域。
+        toc_heading = doc.add_heading("目录", level=1)
+        set_paragraph_font_simsun(toc_heading)
+        toc_p = doc.add_paragraph()
+        add_field(toc_p, r'TOC \o "1-3" \h \z \u')
+        doc.add_page_break()
+
+        def add_export_checklist() -> None:
+            """Add a visible finalization checklist for manual Word work."""
+            report = request.analysis_report.model_dump(mode="json") if request.analysis_report else {}
+            review = request.review_report.model_dump(mode="json") if request.review_report else {}
+            bid_rules = report.get("bid_document_requirements") or {}
+            formatting = bid_rules.get("formatting_and_submission_rules") or {}
+            signature_items = report.get("signature_requirements") or []
+            fixed_forms = report.get("fixed_format_forms") or []
+            enterprise_profile = report.get("enterprise_material_profile") or {}
+            missing_enterprise = enterprise_profile.get("missing_materials") or report.get("missing_company_materials") or []
+            plan = request.document_blocks_plan or {}
+            missing_assets = []
+            if isinstance(plan, dict):
+                missing_assets = (plan.get("missing_assets") or []) + (plan.get("missing_enterprise_data") or [])
+            blocking_count = ((review.get("summary") or {}).get("blocking_issues_count")
+                              or (review.get("summary") or {}).get("blocking_issues") or 0)
+
+            heading = doc.add_heading("导出后 Word 处理清单", level=1)
+            set_paragraph_font_simsun(heading)
+            lines = [
+                "更新目录域和页码域：打开 Word 后全选并更新域，确认目录层级和页码正确。",
+                "复核版式：按招标文件检查页边距、字体、行距、标题层级、表格跨页和页眉页脚。",
+                "复核签章位置：按签章要求在投标函、授权委托书、报价表、承诺函、固定格式表单等位置签字盖章。",
+                "复核固定格式：不得破坏招标文件固定表头、固定文字、行列结构和附件说明。",
+                "复核图表与附件：将图表、组织架构图、流程图、证书、截图、扫描件替换到对应占位。",
+                "复核模型风险：逐项核对误读、漏项、虚构、历史项目残留和格式偏差；不能仅凭模型审校结论提交。",
+            ]
+            if formatting.get("toc_required") or formatting.get("page_number_required"):
+                lines.append("招标文件要求目录/页码，请在最终版中更新目录和所有响应页码。")
+            if signature_items:
+                lines.append(f"已解析签章要求 {len(signature_items)} 项，需逐项核验签署主体、盖章、日期和电子签章。")
+            if fixed_forms:
+                lines.append(f"已解析固定格式 {len(fixed_forms)} 项，需人工确认表头、固定文字和签章栏。")
+            if missing_enterprise:
+                lines.append(f"企业资料仍有 {len(missing_enterprise)} 项待补或待确认，正文中的待补占位不得直接提交。")
+            if missing_assets:
+                lines.append(f"图表/素材/企业数据仍有 {len(missing_assets)} 项待替换。")
+            if blocking_count:
+                lines.append(f"审校报告仍有 {blocking_count} 项阻塞问题，处理后再提交最终版。")
+
+            for line in lines:
+                item_p = doc.add_paragraph()
+                run = item_p.add_run(f"□ {line}")
+                set_run_font_simsun(run)
+            doc.add_page_break()
+
+        add_export_checklist()
 
         # 项目概述
         if request.project_overview:
@@ -484,6 +698,8 @@ async def export_word(request: WordExportRequest):
             para = doc.add_paragraph()
             add_markdown_runs(para, text)
             para.paragraph_format.space_after = Pt(6)
+            para.paragraph_format.first_line_indent = Pt(21)
+            para.paragraph_format.line_spacing = 1.5
 
         def parse_markdown_blocks(content: str):
             """
@@ -604,6 +820,8 @@ async def export_word(request: WordExportRequest):
                             set_run_font_simsun(run)
                         # 紧跟在同一段落中追加列表文本
                         add_markdown_runs(p, text)
+                        p.paragraph_format.space_after = Pt(6)
+                        p.paragraph_format.line_spacing = 1.5
                 elif kind == "table":
                     rows = block[1]
                     for row in rows:
@@ -743,6 +961,8 @@ async def export_word(request: WordExportRequest):
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers=headers
         )
+    except HTTPException:
+        raise
     except Exception as e:
         # 打印详细错误信息到控制台，方便排查
         import traceback

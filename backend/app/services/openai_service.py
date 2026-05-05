@@ -12,6 +12,7 @@ from ..utils import prompt_manager
 from ..utils.json_util import check_json
 from ..utils.config_manager import config_manager
 from ..models.schemas import AnalysisReport, ResponseMatrix, ReviewReport
+from .enterprise_material_service import EnterpriseMaterialService
 from ..utils.provider_registry import (
     DEFAULT_PROVIDER,
     get_base_url_candidates,
@@ -173,6 +174,58 @@ class OpenAIService:
         return normalized[:limit]
 
     @staticmethod
+    def _prepare_analysis_input(file_content: str, max_chars: int = 70000) -> str:
+        """长招标文件先抽取关键窗口，避免模型网关长时间无内容后断流。"""
+        content = str(file_content or "").strip()
+        if len(content) <= max_chars:
+            return content
+
+        keyword_pattern = re.compile(
+            r"项目名称|采购人|招标人|预算|最高限价|服务期限|工期|交付|投标截止|开标|递交|"
+            r"评分|评审|评标办法|分值|得分|资格|资质|业绩|人员|证书|信誉|财务|"
+            r"投标文件|文件组成|格式|技术方案|服务方案|设计方案|施工组织设计|服务纲要|"
+            r"报价|投标报价|签章|盖章|签字|授权委托|承诺函|偏离|附件|表格|"
+            r"废标|否决|无效|不予受理|实质性|必须|不得|应当|不允许|暗标|保密|"
+            r"合同|付款|验收|质量|风险|材料|证明|响应",
+            re.IGNORECASE,
+        )
+        lines = content.splitlines()
+        selected_indexes: set[int] = set()
+
+        for index, line in enumerate(lines):
+            if keyword_pattern.search(line):
+                for offset in range(-2, 3):
+                    target = index + offset
+                    if 0 <= target < len(lines):
+                        selected_indexes.add(target)
+
+        head = content[:12000]
+        tail = content[-8000:]
+        budget = max(0, max_chars - len(head) - len(tail) - 1200)
+        excerpt_parts: list[str] = []
+        used = 0
+        last_index = -10
+        for index in sorted(selected_indexes):
+            line = lines[index].strip()
+            if not line:
+                continue
+            separator = "\n...\n" if index > last_index + 1 else "\n"
+            piece = f"{separator}{line}"
+            if used + len(piece) > budget:
+                break
+            excerpt_parts.append(piece)
+            used += len(piece)
+            last_index = index
+
+        return (
+            "【系统说明】原始招标文件过长，以下为系统按页首、页尾和关键词窗口提取的关键原文片段。"
+            "请只依据这些片段解析；未出现的信息保持空值，不得编造。\n\n"
+            f"【文档开头】\n{head}\n\n"
+            f"【关键条款摘录】\n{''.join(excerpt_parts).strip()}\n\n"
+            f"【文档结尾】\n{tail}"
+        )[:max_chars]
+
+    @staticmethod
     def _clean_extracted_value(value: str, limit: int = 80) -> str:
         """清洗从段落或表格中抽出的字段值。"""
         cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" |:：\t")
@@ -257,7 +310,7 @@ class OpenAIService:
         return OpenAIService._compact_text(chapter_match[-1] if chapter_match else "招标文件相关条款", 60)
 
     @staticmethod
-    def _extract_bid_document_requirements(text: str) -> Dict[str, Any]:
+    def _extract_bid_document_requirements(text: str, allow_generic_defaults: bool = True) -> Dict[str, Any]:
         """从招标文件中粗抽“投标文件/投标文件格式/组成/编制要求”。
 
         这是模型失败时的兜底抽取；模型正常时由 prompt 产出更完整的结构。
@@ -265,7 +318,7 @@ class OpenAIService:
         raw = str(text or "")
         compact = re.sub(r"[ \t]+", " ", raw)
         source_chapters: list[dict[str, Any]] = []
-        for kw in ("投标文件格式", "投标文件的组成", "投标文件的编制", "投标文件"):
+        for kw in ("投标文件格式", "投标文件的组成", "投标文件的编制", "投标文件", "服务纲要", "服务方案", "技术方案", "设计方案"):
             idx = compact.find(kw)
             if idx >= 0:
                 source_chapters.append({
@@ -286,6 +339,11 @@ class OpenAIService:
                 title = OpenAIService._compact_text(m.group(1), 60).strip("；;，,。 ")
                 if title and title not in comp_titles:
                     comp_titles.append(title)
+            if not comp_titles:
+                for m in re.finditer(r"(?:^|[\n\r])\s*(?:[一二三四五六七八九十]+|\d{1,2})[、.．]\s*([^；;\n\r]{2,80})", segment):
+                    title = OpenAIService._compact_text(m.group(1), 60).strip("；;，,。 ")
+                    if title and title not in comp_titles:
+                        comp_titles.append(title)
         # 2) 再抽“投标文件格式/目录”附近的一、二、三列表。
         if not comp_titles:
             idx = max(raw.find("投标文件格式"), raw.find("投标文件"))
@@ -297,7 +355,13 @@ class OpenAIService:
                         comp_titles.append(title)
                     if len(comp_titles) >= 12:
                         break
+        # 3) 有些文件没有列完整“投标文件组成”，只列“服务纲要/服务方案应包括”。
+        # 这种情况下把方案标题作为真实可追溯的组成项，不能显示内部 BD 编号。
         if not comp_titles:
+            scheme_heading = re.search(r"(服务纲要|服务方案|技术方案|设计方案|实施方案|施工组织设计|供货方案)\s*(?:应|须)\s*包\s*括", raw)
+            if scheme_heading:
+                comp_titles.append(scheme_heading.group(1))
+        if not comp_titles and allow_generic_defaults:
             for title in ["投标函及投标函附录", "法定代表人身份证明或授权委托书", "投标保证金", "投标报价", "资格审查资料", "技术/服务/实施方案", "其他资料"]:
                 if title not in comp_titles:
                     comp_titles.append(title)
@@ -470,6 +534,63 @@ class OpenAIService:
         }
 
     @staticmethod
+    def _is_internal_bid_document_id(value: Any) -> bool:
+        return bool(re.fullmatch(r"BD(?:-[A-Z0-9]+)+", str(value or "").strip(), flags=re.I))
+
+    @staticmethod
+    def _bid_composition_readable_title(item: Any) -> str:
+        if not isinstance(item, dict):
+            return ""
+        for key in ("title", "name", "form_name", "chapter_title", "requirement_summary"):
+            value = str(item.get(key) or "").strip()
+            if value and not OpenAIService._is_internal_bid_document_id(value):
+                return value
+        return ""
+
+    @staticmethod
+    def _bid_composition_has_readable_titles(items: Any) -> bool:
+        if not isinstance(items, list) or not items:
+            return False
+        readable = sum(1 for item in items if OpenAIService._bid_composition_readable_title(item))
+        return readable >= max(1, len(items) // 2)
+
+    @staticmethod
+    def _repair_bid_document_requirements(report: Dict[str, Any], file_content: str) -> Dict[str, Any]:
+        """修复模型返回的投标文件组成只有内部 ID、缺少可读标题的情况。
+
+        只使用招标文件原文可追溯抽取结果；不在标准解析成功路径写入通用假组成项。
+        """
+        bid_doc = dict(report.get("bid_document_requirements") or {})
+        composition = bid_doc.get("composition") or []
+        if OpenAIService._bid_composition_has_readable_titles(composition):
+            return report
+
+        parsed_bid_doc = OpenAIService._extract_bid_document_requirements(file_content, allow_generic_defaults=False)
+        parsed_composition = parsed_bid_doc.get("composition") or []
+        if not OpenAIService._bid_composition_has_readable_titles(parsed_composition):
+            bid_doc["composition"] = []
+            report["bid_document_requirements"] = bid_doc
+            return report
+
+        repaired = dict(bid_doc)
+        for key in (
+            "source_chapters",
+            "document_scope_required",
+            "composition",
+            "scheme_or_technical_outline_requirements",
+            "selected_generation_target",
+            "fixed_forms",
+            "formatting_and_submission_rules",
+            "excluded_when_generating_technical_only",
+            "priority_rule",
+        ):
+            value = parsed_bid_doc.get(key)
+            if value:
+                repaired[key] = value
+        report["bid_document_requirements"] = repaired
+        return report
+
+    @staticmethod
     def _fallback_analysis_report(file_content: str, reason: str = "") -> Dict[str, Any]:
         """模型结构化输出失败时的保底 AnalysisReport。
 
@@ -631,6 +752,12 @@ class OpenAIService:
                 "placeholder": "〖待补充：企业资质、业绩、人员、承诺等证明材料〗",
             })
 
+        enterprise_profile = EnterpriseMaterialService.build_profile(
+            required_materials=required_materials,
+            missing_company_materials=missing_materials,
+            evidence_chain_requirements=evidence_requirements,
+        )
+
         report = {
             "project": {
                 "name": project_name,
@@ -786,6 +913,7 @@ class OpenAIService:
             "evidence_chain_requirements": evidence_requirements[:8],
             "required_materials": required_materials[:8],
             "missing_company_materials": missing_materials[:8],
+            "enterprise_material_profile": enterprise_profile,
             "generation_warnings": [],
         }
         if reason:
@@ -1070,18 +1198,46 @@ class OpenAIService:
         """把服务/技术方案的“应包括”条目确定性转换为一级目录。"""
         report = report or {}
         response_matrix = response_matrix or report.get("response_matrix") or {}
-        technical_ids = [item.get("id") for item in report.get("technical_scoring_items", []) if item.get("id")]
+        def tokens(value: str) -> list[str]:
+            parts = re.split(r"[、，,；;。.\s（）()]+", str(value or ""))
+            return [part for part in parts if len(part) >= 2 and part not in {"服务", "方案", "内容", "措施", "要求", "响应", "章节"}]
+
+        def related(title: str, *values: Any) -> bool:
+            text = " ".join(str(value or "") for value in values)
+            if title and (title in text or text in title):
+                return True
+            return any(token in text for token in tokens(title))
+
+        technical_items = [item for item in report.get("technical_scoring_items", []) if item.get("id")]
         requirement_ids: list[str] = []
         for key in ("formal_review_items", "qualification_review_items", "responsiveness_review_items", "qualification_requirements", "formal_response_requirements", "mandatory_clauses"):
             requirement_ids.extend([item.get("id") for item in report.get(key, []) if item.get("id")])
         material_ids = [item.get("id") for item in report.get("required_materials", []) if item.get("id")]
         material_ids.extend([item.get("id") for item in report.get("missing_company_materials", []) if item.get("id")])
         risk_ids = [item.get("id") for item in report.get("rejection_risks", []) if item.get("id")]
-        matrix_ids = [item.get("id") for item in (response_matrix.get("items") or []) if item.get("id")]
+        matrix_items = [item for item in (response_matrix.get("items") or []) if item.get("id")]
 
         nodes: list[dict[str, Any]] = []
         for index, item in enumerate(OpenAIService._collect_scheme_outline_items(report)[:20], start=1):
             title = item.get("title") or f"方案要求{index}"
+            matched_scores = [
+                score.get("id") for score in technical_items
+                if related(title, score.get("name"), score.get("standard"), score.get("writing_focus"), score.get("source"))
+            ]
+            matched_matrix = [
+                matrix.get("id") for matrix in matrix_items
+                if related(title, matrix.get("requirement_summary"), matrix.get("response_strategy"), " ".join(matrix.get("source_refs") or []))
+            ]
+            matched_risks = [
+                risk_id for matrix in matrix_items
+                if matrix.get("id") in matched_matrix
+                for risk_id in (matrix.get("risk_ids") or [])
+            ]
+            matched_materials = [
+                material_id for matrix in matrix_items
+                if matrix.get("id") in matched_matrix
+                for material_id in (matrix.get("required_material_ids") or [])
+            ]
             blocks = ["paragraph"]
             if re.search(r"机构|组织|框图|岗位|职责", title):
                 blocks = ["org_chart", "table"]
@@ -1106,11 +1262,11 @@ class OpenAIService:
                 "expected_depth": "medium",
                 "expected_word_count": 1200,
                 "expected_blocks": blocks,
-                "scoring_item_ids": technical_ids[:8],
-                "requirement_ids": requirement_ids[:8],
-                "risk_ids": risk_ids[:4],
-                "material_ids": material_ids[:8] if re.search(r"人员|机构|岗位|职责|资质|业绩|证明", title) else [],
-                "response_matrix_ids": matrix_ids[:8],
+                "scoring_item_ids": list(dict.fromkeys(matched_scores))[:4],
+                "requirement_ids": requirement_ids[:4] if re.search(r"签章|盖章|格式|承诺|递交|响应", title) else [],
+                "risk_ids": list(dict.fromkeys(matched_risks))[:4],
+                "material_ids": list(dict.fromkeys(matched_materials or (material_ids[:8] if re.search(r"人员|机构|岗位|职责|资质|业绩|证明", title) else []))),
+                "response_matrix_ids": list(dict.fromkeys(matched_matrix))[:6],
                 "children": [],
             })
         return nodes
@@ -2082,7 +2238,15 @@ class OpenAIService:
 
         timeout_seconds = self._int_env("YIBIAO_ANALYSIS_REPORT_TIMEOUT_SECONDS", 1800)
         max_tokens = self._int_env("YIBIAO_ANALYSIS_REPORT_MAX_TOKENS", 12000)
-        system_prompt, user_prompt = prompt_manager.generate_analysis_report_prompt(file_content)
+        max_input_chars = self._int_env("YIBIAO_ANALYSIS_INPUT_MAX_CHARS", 70000)
+        analysis_input = self._prepare_analysis_input(file_content, max_input_chars)
+        if len(analysis_input) < len(str(file_content or "")):
+            print(
+                "标准解析报告 输入过长，已按关键词窗口压缩："
+                f"{len(str(file_content or ''))} -> {len(analysis_input)} 字符",
+                flush=True,
+            )
+        system_prompt, user_prompt = prompt_manager.generate_analysis_report_prompt(analysis_input)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -2101,8 +2265,16 @@ class OpenAIService:
                 report = await asyncio.wait_for(generation_task, timeout=timeout_seconds)
             else:
                 report = await generation_task
+            report = self._repair_bid_document_requirements(report, file_content)
             if not report.get("response_matrix"):
                 report["response_matrix"] = await self.generate_response_matrix(report)
+            enterprise_profile = report.get("enterprise_material_profile") or {}
+            if not enterprise_profile.get("requirements"):
+                report["enterprise_material_profile"] = EnterpriseMaterialService.build_profile(
+                    required_materials=report.get("required_materials") or [],
+                    missing_company_materials=report.get("missing_company_materials") or [],
+                    evidence_chain_requirements=report.get("evidence_chain_requirements") or [],
+                )
             return AnalysisReport.model_validate(report).model_dump(mode="json")
         except asyncio.TimeoutError as e:
             raise Exception(
@@ -2123,7 +2295,33 @@ class OpenAIService:
                 "profile_name": "本地兜底样例风格",
                 "document_scope": "unknown",
                 "recommended_use_case": "用于目录层级、表格、承诺书和素材位置参考，不绑定具体行业。",
+                "template_intent": {
+                    "how_to_use": "作为低优先级写作模板参考；招标文件和企业资料优先。",
+                    "reuse_boundaries": ["只复用结构、句式骨架、表格模型和素材位置"],
+                    "must_map_from_tender": [],
+                    "must_map_from_enterprise": [],
+                    "must_keep_as_placeholder": [],
+                },
                 "outline_template": [],
+                "chapter_blueprints": [],
+                "word_style_profile": {
+                    "page_size": "A4",
+                    "orientation": "portrait",
+                    "margin_top": "2.2cm",
+                    "margin_bottom": "2.2cm",
+                    "margin_left": "2.7cm",
+                    "margin_right": "2.2cm",
+                    "body_font_family": "宋体",
+                    "body_font_size": "10.5pt",
+                    "body_line_height": "1.5",
+                    "body_first_line_indent": "2em",
+                    "heading_font_family": "黑体",
+                    "heading_1_size": "16pt",
+                    "heading_2_size": "14pt",
+                    "heading_3_size": "12pt",
+                    "table_font_size": "9pt",
+                    "table_border_style": "single",
+                },
                 "writing_style": {"voice": "我公司", "tone": "正式投标文件语气", "paragraph_style": "条理化分点"},
                 "quality_risks": [],
             }
@@ -2150,7 +2348,33 @@ class OpenAIService:
                 "profile_name": "样例解析失败兜底剖面",
                 "document_scope": "unknown",
                 "recommended_use_case": "样例解析失败，后续仅按招标文件和通用规则生成。",
+                "template_intent": {
+                    "how_to_use": "不使用样例模板，仅保留失败风险提示。",
+                    "reuse_boundaries": [],
+                    "must_map_from_tender": [],
+                    "must_map_from_enterprise": [],
+                    "must_keep_as_placeholder": [],
+                },
                 "outline_template": [],
+                "chapter_blueprints": [],
+                "word_style_profile": {
+                    "page_size": "A4",
+                    "orientation": "portrait",
+                    "margin_top": "2.2cm",
+                    "margin_bottom": "2.2cm",
+                    "margin_left": "2.7cm",
+                    "margin_right": "2.2cm",
+                    "body_font_family": "宋体",
+                    "body_font_size": "10.5pt",
+                    "body_line_height": "1.5",
+                    "body_first_line_indent": "2em",
+                    "heading_font_family": "黑体",
+                    "heading_1_size": "16pt",
+                    "heading_2_size": "14pt",
+                    "heading_3_size": "12pt",
+                    "table_font_size": "9pt",
+                    "table_border_style": "single",
+                },
                 "writing_style": {"voice": "我公司", "tone": "正式投标文件语气", "paragraph_style": "条理化分点"},
                 "quality_risks": [{"risk": "样例风格解析失败", "location": "系统", "fix_rule": str(e)[:120]}],
             }
@@ -2489,7 +2713,7 @@ class OpenAIService:
                 "请先重新执行标准解析，得到完整结构化解析报告后再生成目录。"
             )
         if file_content and len(self._collect_scheme_outline_items(report)) < 2:
-            fallback_bid_doc = self._extract_bid_document_requirements(file_content)
+            fallback_bid_doc = self._extract_bid_document_requirements(file_content, allow_generic_defaults=False)
             fallback_report = {"bid_document_requirements": fallback_bid_doc}
             fallback_items = self._collect_scheme_outline_items(fallback_report)
             if len(fallback_items) >= 2:

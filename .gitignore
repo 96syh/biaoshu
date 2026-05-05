@@ -7,6 +7,7 @@ config.json
 
 # 上传文件目录
 uploads/
+backend/data/
 *.docx
 *.pdf
 

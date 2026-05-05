@@ -10,6 +10,14 @@ import json
 router = APIRouter(prefix="/api/content", tags=["内容管理"])
 
 
+def request_analysis_report_with_enterprise_profile(request: ChapterContentRequest):
+    report = request.analysis_report.model_dump(mode="json") if request.analysis_report else None
+    profile = request.enterprise_material_profile.model_dump(mode="json") if request.enterprise_material_profile else {}
+    if report is not None and profile.get("requirements"):
+        report["enterprise_material_profile"] = profile
+    return report
+
+
 @router.post("/generate-chapter")
 async def generate_chapter_content(request: ChapterContentRequest):
     """为单个章节生成内容"""
@@ -31,8 +39,7 @@ async def generate_chapter_content(request: ChapterContentRequest):
             sibling_chapters=request.sibling_chapters,
             project_overview=request.project_overview,
             analysis_report=(
-                request.analysis_report.model_dump(mode="json")
-                if request.analysis_report else None
+                request_analysis_report_with_enterprise_profile(request)
             ),
             response_matrix=(
                 request.response_matrix.model_dump(mode="json")
@@ -87,8 +94,7 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
                     sibling_chapters=request.sibling_chapters,
                     project_overview=request.project_overview,
                     analysis_report=(
-                        request.analysis_report.model_dump(mode="json")
-                        if request.analysis_report else None
+                        request_analysis_report_with_enterprise_profile(request)
                     ),
                     response_matrix=(
                         request.response_matrix.model_dump(mode="json")

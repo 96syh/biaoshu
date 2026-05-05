@@ -83,6 +83,54 @@ const BID_MODE_OPTIONS: Array<{ value: BidMode; label: string }> = [
   { value: 'full_bid', label: '完整标' },
 ];
 
+const DEFAULT_WORD_STYLE_PROFILE: Record<string, string> = {
+  page_size: 'A4',
+  orientation: 'portrait',
+  margin_top: '2.2cm',
+  margin_bottom: '2.2cm',
+  margin_left: '2.7cm',
+  margin_right: '2.2cm',
+  body_font_family: 'SimSun, STSong, "Songti SC", serif',
+  body_font_size: '10.5pt',
+  body_line_height: '1.5',
+  body_first_line_indent: '2em',
+  heading_font_family: 'SimHei, "Heiti SC", "Microsoft YaHei", sans-serif',
+  heading_1_size: '16pt',
+  heading_2_size: '14pt',
+  heading_3_size: '12pt',
+  table_font_size: '9pt',
+};
+
+const profileRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+
+const normalizeCssValue = (value: unknown, fallback: string) => {
+  const text = String(value || '').trim();
+  return text || fallback;
+};
+
+const buildWordPreviewStyle = (referenceProfile?: Record<string, unknown>): React.CSSProperties => {
+  const wordStyle = {
+    ...DEFAULT_WORD_STYLE_PROFILE,
+    ...profileRecord(referenceProfile?.word_style_profile),
+  };
+  return {
+    '--word-margin-top': normalizeCssValue(wordStyle.margin_top, DEFAULT_WORD_STYLE_PROFILE.margin_top),
+    '--word-margin-bottom': normalizeCssValue(wordStyle.margin_bottom, DEFAULT_WORD_STYLE_PROFILE.margin_bottom),
+    '--word-margin-left': normalizeCssValue(wordStyle.margin_left, DEFAULT_WORD_STYLE_PROFILE.margin_left),
+    '--word-margin-right': normalizeCssValue(wordStyle.margin_right, DEFAULT_WORD_STYLE_PROFILE.margin_right),
+    '--word-body-font': normalizeCssValue(wordStyle.body_font_family, DEFAULT_WORD_STYLE_PROFILE.body_font_family),
+    '--word-body-size': normalizeCssValue(wordStyle.body_font_size, DEFAULT_WORD_STYLE_PROFILE.body_font_size),
+    '--word-line-height': normalizeCssValue(wordStyle.body_line_height, DEFAULT_WORD_STYLE_PROFILE.body_line_height),
+    '--word-first-indent': normalizeCssValue(wordStyle.body_first_line_indent, DEFAULT_WORD_STYLE_PROFILE.body_first_line_indent),
+    '--word-heading-font': normalizeCssValue(wordStyle.heading_font_family, DEFAULT_WORD_STYLE_PROFILE.heading_font_family),
+    '--word-h1-size': normalizeCssValue(wordStyle.heading_1_size, DEFAULT_WORD_STYLE_PROFILE.heading_1_size),
+    '--word-h2-size': normalizeCssValue(wordStyle.heading_2_size, DEFAULT_WORD_STYLE_PROFILE.heading_2_size),
+    '--word-h3-size': normalizeCssValue(wordStyle.heading_3_size, DEFAULT_WORD_STYLE_PROFILE.heading_3_size),
+    '--word-table-size': normalizeCssValue(wordStyle.table_font_size, DEFAULT_WORD_STYLE_PROFILE.table_font_size),
+  } as React.CSSProperties;
+};
+
 const normalizeBidMode = (mode?: unknown): BidMode => (mode === 'full_bid' ? 'full_bid' : 'technical_only');
 const bidModeLabel = (mode?: unknown) => (normalizeBidMode(mode) === 'full_bid' ? '完整标' : '技术标');
 
@@ -125,7 +173,7 @@ const NAV_ITEMS: Array<{ key: NavKey; label: string; description: string; icon: 
 ];
 
 const FLOW_STEPS = ['上传', '标准解析', '目录映射', '正文生成', '合规审校', '导出'];
-const ANALYSIS_STEPS = ['文件解析', '条款识别', '评分项提取', '合规要求提取'];
+const ANALYSIS_STEPS = ['文件解析', '条款识别', '评分项提取', '合规要求提取', '结果校验'];
 const ANALYSIS_REPORT_TIMEOUT_MS = 30 * 60 * 1000;
 const BLOCKING_REPORT_WARNING_PATTERN = /兜底|未完整返回|模型输出未完整|解析失败|超时/;
 const toLiteLLMConfig = (config?: Partial<ConfigData>): ConfigData => ({
@@ -166,13 +214,58 @@ const parseJsonPayload = <T,>(raw: string, label: string): T => {
 
 const getBlockingAnalysisReportWarning = (report?: AnalysisReport | null) => {
   if (!report) return '';
-  const warningTexts = (report.generation_warnings || []).map(item => `${item.severity || ''} ${item.warning || ''}`);
+  const warningTexts = (report.generation_warnings || [])
+    .filter(item => item.severity === 'blocking')
+    .map(item => `${item.severity || ''} ${item.warning || ''}`);
   const riskTexts = (report.rejection_risks || [])
-    .filter(item => item.source === '系统解析状态')
+    .filter(item => item.source === '系统解析状态' && /停止后续|阻塞/.test(item.risk || ''))
     .map(item => item.risk || '');
   const matched = [...warningTexts, ...riskTexts].find(text => BLOCKING_REPORT_WARNING_PATTERN.test(text));
   return matched || '';
 };
+
+const parserStatus = (parserInfo?: Record<string, unknown>) => {
+  const parser = String(parserInfo?.parser || '');
+  const preferred = String(parserInfo?.preferred_parser || '');
+  const fallbackUsed = Boolean(parserInfo?.fallback_used);
+  const isMinerU = parser.toLowerCase() === 'mineru';
+  if (isMinerU) {
+    const detail = [
+      parserInfo?.device ? `设备 ${parserInfo.device}` : '',
+      parserInfo?.backend ? `后端 ${parserInfo.backend}` : '',
+      parserInfo?.content_block_count ? `${parserInfo.content_block_count} 块` : '',
+    ].filter(Boolean).join(' · ');
+    return {
+      label: 'MinerU 已使用',
+      tone: 'success',
+      detail: detail || '已使用 MinerU 解析为 Markdown',
+    };
+  }
+  if (fallbackUsed && preferred === 'mineru') {
+    return {
+      label: 'MinerU 已降级',
+      tone: 'warning',
+      detail: `${parser || '内置解析器'} 已接管。${parserInfo?.fallback_reason ? `原因：${String(parserInfo.fallback_reason).slice(0, 120)}` : ''}`,
+    };
+  }
+  if (parser) {
+    return {
+      label: '未使用 MinerU',
+      tone: 'neutral',
+      detail: `当前使用 ${parser}（${parserInfo?.format || 'plain_text'}）`,
+    };
+  }
+  return {
+    label: '解析器待确认',
+    tone: 'neutral',
+    detail: '上传文件后显示 MinerU 或降级解析器状态',
+  };
+};
+
+const hasMinerUMarkdown = (parserInfo?: Record<string, unknown>) =>
+  String(parserInfo?.parser || '').toLowerCase() === 'mineru'
+  && String(parserInfo?.format || '').toLowerCase() === 'markdown'
+  && !parserInfo?.fallback_used;
 
 const isGeneratedMediaTitle = (value?: string | null) =>
   /-{2,}\s*media\/image\d+\.(png|jpg|jpeg|gif|webp)\s*-{2,}/i.test((value || '').trim());
@@ -228,61 +321,6 @@ const containsOutlineItem = (item: OutlineItem, id?: string): boolean => {
   if (!id) return false;
   if (item.id === id) return true;
   return Boolean(item.children?.some(child => containsOutlineItem(child, id)));
-};
-
-const nextChildId = (parent: OutlineItem) => {
-  const prefix = `${parent.id}.`;
-  const used = new Set((parent.children || []).map(child => child.id));
-  const maxIndex = (parent.children || []).reduce((max, child) => {
-    if (!child.id.startsWith(prefix)) return max;
-    const index = Number.parseInt(child.id.slice(prefix.length).split('.')[0], 10);
-    return Number.isFinite(index) ? Math.max(max, index) : max;
-  }, 0);
-  let index = maxIndex + 1;
-  let candidate = `${prefix}${index}`;
-  while (used.has(candidate)) {
-    index += 1;
-    candidate = `${prefix}${index}`;
-  }
-  return candidate;
-};
-
-const makeOutlineChild = (parent: OutlineItem): OutlineItem => ({
-  id: nextChildId(parent),
-  title: '新章节',
-  description: '请补充本章节的写作范围、响应要点和材料要求。',
-  volume_id: parent.volume_id,
-  chapter_type: parent.chapter_type,
-  fixed_format_sensitive: parent.fixed_format_sensitive,
-  price_sensitive: parent.price_sensitive,
-  anonymity_sensitive: parent.anonymity_sensitive,
-  scoring_item_ids: [],
-  requirement_ids: [],
-  risk_ids: [],
-  material_ids: [],
-  response_matrix_ids: [],
-  source_type: 'manual',
-  expected_depth: 'editable',
-  children: undefined,
-  content: undefined,
-});
-
-const addOutlineChild = (items: OutlineItem[], parentId: string): { items: OutlineItem[]; child: OutlineItem | null } => {
-  let created: OutlineItem | null = null;
-  const nextItems = items.map((item) => {
-    if (item.id === parentId) {
-      created = makeOutlineChild(item);
-      return { ...item, children: [...(item.children || []), created] };
-    }
-    if (!item.children?.length) return item;
-    const result = addOutlineChild(item.children, parentId);
-    if (result.child) {
-      created = result.child;
-      return { ...item, children: result.items };
-    }
-    return item;
-  });
-  return { items: nextItems, child: created };
 };
 
 const deleteOutlineItem = (items: OutlineItem[], id: string): OutlineItem[] =>
@@ -399,6 +437,8 @@ const asList = <T,>(value?: T[] | null): T[] => (Array.isArray(value) ? value : 
 const toRecordItems = <T,>(value?: T[] | null): Array<Record<string, unknown>> =>
   asList(value).map(item => item as unknown as Record<string, unknown>);
 
+const isInternalBidDocumentId = (value?: unknown) => /^BD(?:-[A-Z0-9]+)+$/i.test(toText(value));
+
 const isScoringParseTab = (key?: TenderParseTabKey) =>
   key === 'technical' || key === 'business' || key === 'other';
 
@@ -441,7 +481,9 @@ const appendParseSection = (
 };
 
 const requirementLine = (item: Record<string, unknown>) => {
-  const head = toText(item.name || item.review_type || item.target || item.clause || item.risk || item.id);
+  const rawHead = toText(item.name || item.title || item.review_type || item.target || item.clause || item.risk);
+  const rawId = toText(item.id);
+  const head = rawHead || (isInternalBidDocumentId(rawId) ? '' : rawId);
   const body = toText(item.requirement || item.standard || item.criterion || item.logic || item.clause || item.risk || item.fixed_text);
   const score = toText(item.score);
   const strategy = toText(item.writing_focus || item.response_strategy || item.mitigation || item.fill_rules);
@@ -450,6 +492,22 @@ const requirementLine = (item: Record<string, unknown>) => {
     body ? `要求：${body}` : '',
     strategy ? `响应建议：${strategy}` : '',
   ].filter(Boolean).join('\n');
+};
+
+const bidDocumentCompositionLine = (item: Record<string, unknown>, index: number) => {
+  const title = [
+    item.title,
+    item.name,
+    item.form_name,
+    item.chapter_title,
+    item.requirement_summary,
+  ].map(toText).find(value => value && !isInternalBidDocumentId(value));
+  if (!title) return '';
+  const fixed = item.fixed_format ? '固定格式' : '';
+  const signature = item.signature_required || item.seal_required ? '需签章' : '';
+  const attachment = item.attachment_required ? '需附件' : '';
+  const tags = [fixed, signature, attachment].filter(Boolean).join('、');
+  return `${index + 1}. ${title}${tags ? `（${tags}）` : ''}`;
 };
 
 const splitScoringSubitems = (value: string) => {
@@ -641,7 +699,15 @@ const buildTenderParseTabs = (report: AnalysisReport | null): TenderParseTab[] =
   }
 
   const documentSections: TenderParseSection[] = [];
-  appendParseSection(documentSections, 'document-composition', '投标文件组成', linesOrMissing(composition.map(item => requirementLine(item))), pickEvidence(report, ...composition.map(item => item.source)), composition.length);
+  const compositionLines = composition.map((item, index) => bidDocumentCompositionLine(item, index)).filter(Boolean);
+  appendParseSection(
+    documentSections,
+    'document-composition',
+    '投标文件组成',
+    linesOrMissing(compositionLines),
+    pickEvidence(report, ...composition.map(item => item.source || item.source_ref)),
+    compositionLines.length || composition.length,
+  );
   appendParseSection(documentSections, 'document-price', '投标报价要求', [
     lineOrMissing('报价方式', report.price_rules?.quote_method),
     lineOrMissing('最高限价/限价规则', report.price_rules?.maximum_price_rule),
@@ -912,7 +978,21 @@ const THIRD_LEVEL_TITLE_CATALOG: Array<[RegExp, string[]]> = [
   [/风险|难点|应急/, ['风险识别', '预防控制措施', '应急处置方案']],
   [/沟通|协调|响应/, ['沟通机制', '响应时限要求', '服务承诺落实']],
 ];
+const SECOND_LEVEL_TITLE_CATALOG: Array<[RegExp, string[]]> = [
+  [/范围|内容|服务/, ['服务内容分解', '服务边界与接口', '服务成果与交付']],
+  [/目标/, ['目标理解', '目标分解', '目标达成措施']],
+  [/机构|岗位|职责/, ['组织架构设置', '岗位职责分工', '协同管理机制']],
+  [/人员|团队/, ['人员配置计划', '专业能力保障', '人员管理与考核']],
+  [/沟通|协调/, ['沟通机制设计', '信息反馈流程', '协调保障措施']],
+  [/质量|承诺|措施/, ['质量目标承诺', '过程质量控制', '验收与改进措施']],
+  [/方案|实施|方法/, ['总体实施思路', '关键实施流程', '保障与应急措施']],
+];
+const FALLBACK_SECOND_LEVEL_TITLES = ['需求理解与响应目标', '实施方法与保障措施', '成果交付与验收管理'];
 const FALLBACK_THIRD_LEVEL_TITLES = ['响应要点拆解', '实施措施安排', '支撑材料与交付要求'];
+const AUTO_SECOND_LEVEL_TITLES = new Set([
+  ...SECOND_LEVEL_TITLE_CATALOG.flatMap(([, titles]) => titles),
+  ...FALLBACK_SECOND_LEVEL_TITLES,
+]);
 const AUTO_THIRD_LEVEL_TITLES = new Set([
   ...THIRD_LEVEL_TITLE_CATALOG.flatMap(([, titles]) => titles),
   ...FALLBACK_THIRD_LEVEL_TITLES,
@@ -923,21 +1003,229 @@ const AUTO_THIRD_LEVEL_TITLES = new Set([
   '交付成果与验收口径',
 ]);
 
-const thirdLevelTitlesFor = (title: string, description?: string) => {
-  const text = `${title} ${description || ''}`;
-  const matched = THIRD_LEVEL_TITLE_CATALOG.find(([pattern]) => pattern.test(text));
-  return matched?.[1] || FALLBACK_THIRD_LEVEL_TITLES;
+type ThirdLevelPlan = { title: string; description: string };
+
+type AutoOutlineBasis = {
+  id: string;
+  title: string;
+  description: string;
+  response_strategy?: string;
+  source_refs?: string[];
+  scoring_item_ids?: string[];
+  requirement_ids?: string[];
+  risk_ids?: string[];
+  material_ids?: string[];
+  response_matrix_ids?: string[];
 };
 
-const buildThirdLevelChildren = (item: OutlineItem): OutlineItem[] =>
-  thirdLevelTitlesFor(item.title, item.description).map((title, index) => ({
+const compactOutlineTitle = (value: unknown, fallback = '响应条目') => {
+  const text = String(value || '').replace(/^.+?[:：]\s*/, '').replace(/\s+/g, ' ').trim();
+  return (text || fallback).slice(0, 34);
+};
+
+const outlineMatchTokens = (value: string) =>
+  String(value || '')
+    .split(/[、，,；;。.\s（）()]+/)
+    .map(part => part.trim())
+    .filter(part => part.length >= 2 && !['服务', '方案', '内容', '措施', '要求', '响应', '章节'].includes(part));
+
+const extractOutlinePhrases = (value: string) => {
+  const cleaned = String(value || '')
+    .replace(/【[^】]+】/g, ' ')
+    .replace(/^[\d.、（()）\s]+/, '')
+    .replace(/必须|应当|应|须|需要|围绕|结合|说明|明确|列明|响应/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const phrases = cleaned
+    .split(/[；;。\n\r]/)
+    .flatMap(part => part.split(/(?:包括|包含|覆盖|围绕|从|按|对|及|和|与)/))
+    .flatMap(part => part.split(/[、，,]/))
+    .map(part => part.replace(/^(本项目|本章节|当前章节|该章节|本项|该项|相关)/, '').trim())
+    .map(part => part.replace(/(等|相关|方面|内容|要求|措施|方案|工作)$/g, '').trim())
+    .filter(part => part.length >= 3 && part.length <= 18)
+    .filter(part => !/^(招标文件|评分标准|响应矩阵|原文证据|按要求执行|以.*为准)$/.test(part));
+  return uniqueTexts(phrases, 8);
+};
+
+const contextualThirdLevelPlans = (item: OutlineItem, basis: AutoOutlineBasis): ThirdLevelPlan[] => {
+  const sourceText = [
+    basis.description,
+    basis.response_strategy,
+    item.description,
+    item.title,
+  ].filter(Boolean).join('；');
+  const titleTokens = outlineMatchTokens(item.title).slice(0, 4);
+  const sourcePhrases = extractOutlinePhrases(sourceText);
+  const matched = sourcePhrases.filter(phrase =>
+    titleTokens.length === 0 || titleTokens.some(token => phrase.includes(token) || token.includes(phrase)),
+  );
+  const selected = uniqueTexts([...(matched.length ? matched : sourcePhrases), ...titleTokens], 4);
+  return selected.slice(0, 4).map(title => ({
+    title,
+    description: [
+      `围绕“${title}”展开本二级章节的具体写作内容。`,
+      basis.description ? `对应要求：${basis.description}` : '',
+      basis.response_strategy ? `响应策略：${basis.response_strategy}` : '',
+    ].filter(Boolean).join('；'),
+  }));
+};
+
+const outlineTextMatches = (item: OutlineItem, value: unknown) => {
+  const candidate = String(value || '');
+  if (!candidate) return false;
+  const title = String(item.title || '');
+  if (candidate.includes(title) || title.includes(candidate)) return true;
+  const tokens = outlineMatchTokens(title);
+  if (!tokens.length) return false;
+  return tokens.some(token => candidate.includes(token));
+};
+
+const reportSourceItems = (report?: AnalysisReport | null): Array<Record<string, any>> => {
+  if (!report) return [];
+  return [
+    ...(report.technical_scoring_items || []),
+    ...(report.business_scoring_items || []),
+    ...(report.price_scoring_items || []),
+    ...(report.formal_review_items || []),
+    ...(report.qualification_review_items || []),
+    ...(report.responsiveness_review_items || []),
+    ...(report.qualification_requirements || []),
+    ...(report.formal_response_requirements || []),
+    ...(report.mandatory_clauses || []),
+    ...(report.rejection_risks || []),
+    ...(report.required_materials || []),
+    ...(report.missing_company_materials || []),
+  ];
+};
+
+const sourceItemTitle = (source: Record<string, any>) =>
+  compactOutlineTitle(source.name || source.title || source.clause || source.risk || source.summary || source.purpose || source.id);
+
+const sourceItemDescription = (source: Record<string, any>) =>
+  [
+    source.standard,
+    source.requirement,
+    source.response_strategy,
+    source.writing_focus,
+    source.logic,
+    source.mitigation,
+    source.source,
+  ].filter(Boolean).join('；').slice(0, 220);
+
+const collectAutoOutlineBasis = (item: OutlineItem, report?: AnalysisReport | null): AutoOutlineBasis[] => {
+  const matrixItems = report?.response_matrix?.items || [];
+  const matrixIds = new Set(item.response_matrix_ids || []);
+  const mappedIds = new Set([
+    ...(item.scoring_item_ids || []),
+    ...(item.requirement_ids || []),
+    ...(item.risk_ids || []),
+    ...(item.material_ids || []),
+  ]);
+  const bases: AutoOutlineBasis[] = [];
+  const seen = new Set<string>();
+
+  matrixItems.forEach((matrix) => {
+    const matched = matrixIds.has(matrix.id)
+      || (mappedIds.has(matrix.source_item_id) && outlineTextMatches(item, `${matrix.requirement_summary} ${matrix.response_strategy}`))
+      || (matrix.target_chapter_ids || []).includes(item.id);
+    if (!matched || seen.has(`matrix:${matrix.id}`)) return;
+    seen.add(`matrix:${matrix.id}`);
+    bases.push({
+      id: matrix.id,
+      title: compactOutlineTitle(matrix.requirement_summary || matrix.source_item_id, matrix.id),
+      description: matrix.requirement_summary || '',
+      response_strategy: matrix.response_strategy,
+      source_refs: matrix.source_refs,
+      risk_ids: matrix.risk_ids,
+      material_ids: matrix.required_material_ids,
+      response_matrix_ids: [matrix.id],
+    });
+  });
+
+  const sources = reportSourceItems(report);
+  sources.forEach((source) => {
+    if (!mappedIds.has(source.id) || seen.has(`source:${source.id}`)) return;
+    if (!outlineTextMatches(item, `${sourceItemTitle(source)} ${sourceItemDescription(source)}`)) return;
+    seen.add(`source:${source.id}`);
+    bases.push({
+      id: source.id,
+      title: sourceItemTitle(source),
+      description: sourceItemDescription(source),
+      scoring_item_ids: String(source.id).startsWith('T') || String(source.id).startsWith('B') || String(source.id).startsWith('P') ? [source.id] : [],
+      requirement_ids: String(source.id).match(/^(Q|F|C|E)/) ? [source.id] : [],
+      risk_ids: String(source.id).startsWith('R') ? [source.id] : [],
+      material_ids: String(source.id).match(/^(M|X|EV|FF|SIG)/) ? [source.id] : [],
+    });
+  });
+
+  return bases.slice(0, 8);
+};
+
+const effectiveScoringIds = (item: OutlineItem, report?: AnalysisReport | null) => {
+  const fromBasis = collectAutoOutlineBasis(item, report).flatMap(basis => basis.scoring_item_ids || []);
+  const ids = fromBasis.length ? fromBasis : (item.scoring_item_ids || []);
+  return Array.from(new Set(ids));
+};
+
+const buildEvidenceThirdLevelChildren = (item: OutlineItem, basis: AutoOutlineBasis): OutlineItem[] => {
+  const evidenceText = [
+    basis.material_ids?.length ? `材料：${basis.material_ids.join('、')}` : '',
+    basis.risk_ids?.length ? `风险：${basis.risk_ids.join('、')}` : '',
+    basis.source_refs?.length ? `来源：${basis.source_refs.join('、')}` : '',
+  ].filter(Boolean).join('；');
+  const rows = contextualThirdLevelPlans(item, basis)
+    .map((plan, index) => ({
+      ...plan,
+      description: index === 2 && evidenceText ? `${plan.description}；${evidenceText}` : plan.description,
+    }));
+  return rows.map((row, index) => ({
     ...item,
     id: `${item.id}.${index + 1}`,
-    title,
-    description: `${item.title}：${title}。${item.description || ''}`.trim(),
+    title: row.title,
+    description: row.description,
     content: undefined,
     children: undefined,
   }));
+};
+
+const thirdLevelPattern = (item: OutlineItem) =>
+  (item.children || []).map(child => child.title).join('|');
+
+const hasContentInChildren = (item: OutlineItem) =>
+  Boolean((item.children || []).some(child => child.content?.trim()));
+
+const isRepeatedThirdLevelGroup = (item: OutlineItem, repeatedPatterns: Set<string>) =>
+  Boolean(item.children?.length && !hasContentInChildren(item) && repeatedPatterns.has(thirdLevelPattern(item)));
+
+const buildEvidenceSecondLevelChildren = (item: OutlineItem, report?: AnalysisReport | null): OutlineItem[] =>
+  collectAutoOutlineBasis(item, report).slice(0, 6).map((basis, index) => {
+    const child: OutlineItem = {
+      ...item,
+      id: `${item.id}.${index + 1}`,
+      title: basis.title,
+      description: basis.description || basis.response_strategy || item.description || '',
+      response_matrix_ids: basis.response_matrix_ids || [],
+      scoring_item_ids: basis.scoring_item_ids || item.scoring_item_ids || [],
+      requirement_ids: basis.requirement_ids || item.requirement_ids || [],
+      risk_ids: basis.risk_ids || item.risk_ids || [],
+      material_ids: basis.material_ids || item.material_ids || [],
+      content: undefined,
+      children: undefined,
+    };
+    return { ...child, children: buildEvidenceThirdLevelChildren(child, basis) };
+  });
+
+const isPlaceholderOutlineChild = (item: OutlineItem) =>
+  !item.content?.trim()
+  && (item.source_type === 'manual' || item.title === '新章节')
+  && /^新章节|待补充|请补充/.test(`${item.title}${item.description}`);
+
+const isGeneratedSecondLevelGroup = (item: OutlineItem) =>
+  Boolean(item.children?.length === 3 && item.children.every((child, index) =>
+    child.id === `${item.id}.${index + 1}` &&
+    !child.content?.trim() &&
+    AUTO_SECOND_LEVEL_TITLES.has(child.title)
+  ));
 
 const isGeneratedThirdLevelGroup = (item: OutlineItem) =>
   Boolean(item.children?.length === 3 && item.children.every((child, index) =>
@@ -946,25 +1234,62 @@ const isGeneratedThirdLevelGroup = (item: OutlineItem) =>
     AUTO_THIRD_LEVEL_TITLES.has(child.title)
   ));
 
-const ensureOutlineThirdLevel = (items: OutlineItem[], level = 1): { items: OutlineItem[]; changed: boolean } => {
+const ensureOutlineThirdLevel = (items: OutlineItem[], level = 1, report?: AnalysisReport | null): { items: OutlineItem[]; changed: boolean } => {
   let changed = false;
   const nextItems = items.map((item) => {
-    if (level === 2 && isGeneratedThirdLevelGroup(item)) {
-      const expectedTitles = thirdLevelTitlesFor(item.title, item.description);
-      const currentTitles = item.children?.map(child => child.title).join('|');
-      if (currentTitles !== expectedTitles.join('|')) {
+    let currentItem = item;
+    if (level === 1 && item.children?.length) {
+      const patternCounts = new Map<string, number>();
+      item.children.forEach(child => {
+        if (!child.children?.length || hasContentInChildren(child)) return;
+        const pattern = thirdLevelPattern(child);
+        if (!pattern) return;
+        patternCounts.set(pattern, (patternCounts.get(pattern) || 0) + 1);
+      });
+      const repeatedPatterns = new Set(Array.from(patternCounts.entries()).filter(([, count]) => count > 1).map(([pattern]) => pattern));
+      if (repeatedPatterns.size) {
+        const repairedChildren = item.children.map(child => {
+          if (!isRepeatedThirdLevelGroup(child, repeatedPatterns)) return child;
+          const basis = collectAutoOutlineBasis(child, report)[0];
+          return basis
+            ? { ...child, children: buildEvidenceThirdLevelChildren(child, basis) }
+            : { ...child, children: undefined };
+        });
         changed = true;
-        return { ...item, children: buildThirdLevelChildren(item) };
+        currentItem = { ...item, children: repairedChildren };
       }
     }
-    if (item.children?.length) {
-      const result = ensureOutlineThirdLevel(item.children, level + 1);
-      if (result.changed) changed = true;
-      return result.changed ? { ...item, children: result.items } : item;
+    const hasOnlyPlaceholderChildren = Boolean(item.children?.length && item.children.every(isPlaceholderOutlineChild));
+    if (level === 1 && (!currentItem.children?.length || isGeneratedSecondLevelGroup(currentItem) || hasOnlyPlaceholderChildren)) {
+      const evidenceChildren = buildEvidenceSecondLevelChildren(currentItem, report);
+      if (evidenceChildren.length) {
+        changed = true;
+        return { ...currentItem, children: evidenceChildren };
+      }
+      if (isGeneratedSecondLevelGroup(currentItem) || hasOnlyPlaceholderChildren) {
+        changed = true;
+        return { ...currentItem, children: undefined };
+      }
     }
-    if (level !== 2) return item;
+    if (level === 2 && isGeneratedThirdLevelGroup(currentItem)) {
+      const basis = collectAutoOutlineBasis(currentItem, report)[0];
+      if (basis) {
+        changed = true;
+        return { ...currentItem, children: buildEvidenceThirdLevelChildren(currentItem, basis) };
+      }
+      changed = true;
+      return { ...currentItem, children: undefined };
+    }
+    if (currentItem.children?.length) {
+      const result = ensureOutlineThirdLevel(currentItem.children, level + 1, report);
+      if (result.changed) changed = true;
+      return result.changed ? { ...currentItem, children: result.items } : currentItem;
+    }
+    if (level !== 2) return currentItem;
+    const basis = collectAutoOutlineBasis(currentItem, report)[0];
+    if (!basis) return currentItem;
     changed = true;
-    return { ...item, children: buildThirdLevelChildren(item) };
+    return { ...currentItem, children: buildEvidenceThirdLevelChildren(currentItem, basis) };
   });
   return { items: nextItems, changed };
 };
@@ -1009,6 +1334,7 @@ const App = () => {
   const [generationControl, setGenerationControl] = useState<GenerationControlState>('idle');
   const [generationProgress, setGenerationProgress] = useState<ProgressState | null>(null);
   const [exportDirectory, setExportDirectory] = useState('~/Downloads');
+  const [manualReviewConfirmed, setManualReviewConfirmed] = useState(false);
   const [historyRecords, setHistoryRecords] = useState<DraftHistoryRecord[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
@@ -1022,7 +1348,12 @@ const App = () => {
   const activeReport = state.analysisReport || state.outlineData?.analysis_report || null;
   const effectiveOutline = state.outlineData;
   const activeReferenceProfile = effectiveOutline?.reference_bid_style_profile || activeReport?.reference_bid_style_profile || referenceProfile;
+  const wordPreviewStyle = useMemo(
+    () => buildWordPreviewStyle(activeReferenceProfile as Record<string, unknown>),
+    [activeReferenceProfile],
+  );
   const activeDocumentBlocksPlan = effectiveOutline?.document_blocks_plan || activeReport?.document_blocks_plan || documentBlocksPlan;
+  const activeEnterpriseProfile = activeReport?.enterprise_material_profile || null;
   const activeResponseMatrix = effectiveOutline?.response_matrix || activeReport?.response_matrix || null;
   const responseMatrixItems = activeResponseMatrix?.items || [];
   const visibleMatrixItems = matrixExpanded ? responseMatrixItems : responseMatrixItems.slice(0, 5);
@@ -1061,6 +1392,7 @@ const App = () => {
     || cleanDisplayTitle(effectiveOutline?.project_name)
     || cleanDisplayTitle(uploadedFileName || state.uploadedFileName)
     || '待解析项目';
+  const currentParserStatus = parserStatus(state.parserInfo);
 
   useEffect(() => setLocalConfig(state.config), [state.config]);
 
@@ -1071,7 +1403,13 @@ const App = () => {
   }, [state.uploadedFileName, uploadedFileName]);
 
   useEffect(() => {
-    setHistoryRecords(draftStorage.loadHistory());
+    let cancelled = false;
+    draftStorage.loadHistoryAsync().then((records) => {
+      if (!cancelled) setHistoryRecords(records);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [state.fileContent, state.analysisReport, state.outlineData, state.selectedChapter]);
 
   useEffect(() => {
@@ -1131,16 +1469,18 @@ const App = () => {
 
   useEffect(() => {
     if (!state.outlineData?.outline?.length) return;
-    const result = ensureOutlineThirdLevel(state.outlineData.outline);
+    const result = ensureOutlineThirdLevel(state.outlineData.outline, 1, activeReport);
     if (result.changed) {
       updateOutline({ ...state.outlineData, outline: result.items });
     }
-  }, [state.outlineData, updateOutline]);
+  }, [activeReport, state.outlineData, updateOutline]);
 
   const setError = (text: string) => setNotice({ type: 'error', text });
   const setSuccess = (text: string) => setNotice({ type: 'success', text });
   const setInfo = (text: string) => setNotice({ type: 'info', text });
-  const refreshHistory = () => setHistoryRecords(draftStorage.loadHistory());
+  const refreshHistory = () => {
+    draftStorage.loadHistoryAsync().then(setHistoryRecords);
+  };
 
   const openOutlineEditor = (item: OutlineItem) => {
     setEditingOutlineId(item.id);
@@ -1172,24 +1512,39 @@ const App = () => {
       }),
     };
     updateOutline(nextOutline);
+    setManualReviewConfirmed(false);
     setOutlineDraftRows(flattenOutlineDraftRows(nextOutline.outline));
     setSuccess(`已更新目录节点 ${editingOutlineId}`);
   };
 
   const handleAddOutlineChild = (parent: OutlineItem) => {
     if (!effectiveOutline) return;
-    const result = addOutlineChild(effectiveOutline.outline, parent.id);
-    if (!result.child) {
-      setError('新增子章节失败，请重新选择目录节点');
+    const evidenceChildren = buildEvidenceSecondLevelChildren(parent, activeReport);
+    if (evidenceChildren.length) {
+      const existingIds = new Set((parent.children || []).map(child => child.id));
+      const existingTitles = new Set((parent.children || []).map(child => child.title));
+      const keptChildren = (parent.children || []).filter(child => !isPlaceholderOutlineChild(child));
+      const missingChildren = evidenceChildren.filter(child => !existingIds.has(child.id) && !existingTitles.has(child.title));
+      const nextChildren = keptChildren.length || missingChildren.length
+        ? [...keptChildren, ...missingChildren]
+        : evidenceChildren;
+      const nextOutline = {
+        ...effectiveOutline,
+        outline: updateOutlineItem(effectiveOutline.outline, parent.id, { children: nextChildren }),
+      };
+      updateOutline(nextOutline);
+      setManualReviewConfirmed(false);
+      const selectedChild = missingChildren[0] || nextChildren[0];
+      if (selectedChild) {
+        updateSelectedChapter(selectedChild.id);
+        setActiveDocId(selectedChild.id);
+        openOutlineEditor(selectedChild);
+      }
+      setOutlineDraftRows(flattenOutlineDraftRows(nextOutline.outline));
+      setSuccess(`已按响应矩阵补齐 ${nextChildren.length} 个子章节`);
       return;
     }
-    const nextOutline = { ...effectiveOutline, outline: result.items };
-    updateOutline(nextOutline);
-    updateSelectedChapter(result.child.id);
-    setActiveDocId(result.child.id);
-    setOutlineDraftRows(flattenOutlineDraftRows(nextOutline.outline));
-    openOutlineEditor(result.child);
-    setSuccess(`已新增子章节 ${result.child.id}`);
+    setError('当前章节没有可用于生成子级的响应矩阵、评分项、审查项或材料映射；请先重新生成目录映射，避免创建无依据的“新章节”。');
   };
 
   const handleDeleteOutlineItem = (item: OutlineItem) => {
@@ -1206,6 +1561,7 @@ const App = () => {
     const nextItems = deleteOutlineItem(effectiveOutline.outline, item.id);
     const nextOutline = { ...effectiveOutline, outline: nextItems };
     updateOutline(nextOutline);
+    setManualReviewConfirmed(false);
     setOutlineDraftRows(flattenOutlineDraftRows(nextItems));
     const stillSelected = state.selectedChapter ? findOutlineItem(nextItems, state.selectedChapter) : null;
     if (!stillSelected) {
@@ -1351,11 +1707,12 @@ const App = () => {
     window.history.pushState(null, '', `#${key}`);
   };
 
-  const restoreHistoryRecord = (record: DraftHistoryRecord) => {
-    const activated = draftStorage.activateHistory(record.id);
+  const restoreHistoryRecord = async (record: DraftHistoryRecord) => {
+    const activated = await draftStorage.activateHistoryAsync(record.id);
     const draft = (activated || record).draft;
     restoreDraft(draft);
     setReviewReport(null);
+    setManualReviewConfirmed(false);
     setActiveDocId(draft.selectedChapter || '');
     setUploadedFileName(draft.uploadedFileName || record.title);
     refreshHistory();
@@ -1396,6 +1753,7 @@ const App = () => {
       setUploadedFileName(file.name);
       setReferenceFileName('');
       setReviewReport(null);
+      setManualReviewConfirmed(false);
       setConsistencyReport(null);
       setReferenceProfile({});
       setDocumentBlocksPlan({});
@@ -1405,7 +1763,7 @@ const App = () => {
       setOutlineLiveText('');
       setContentStreamText('');
       setStreamText('');
-      updateFileContent(response.data.file_content, file.name);
+      updateFileContent(response.data.file_content, file.name, response.data.parser_info);
       completeProgress('文件已上传，文本读取完成', taskVersion);
       setSuccess('招标文件已上传，开始进行标准解析');
     } catch (error: any) {
@@ -1422,7 +1780,7 @@ const App = () => {
       return;
     }
     setBusy('reference');
-    const taskVersion = startProgress('样例解析', ['读取样例', '提取风格剖面'], '正在解析成熟投标文件样例', 10);
+    const taskVersion = startProgress('样例解析', ['MinerU 转 Markdown', '提取写作模板'], '正在解析成熟投标文件样例', 10);
     try {
       const response = await documentApi.uploadReferenceStyleFile(file);
       if (!response.data.success || !response.data.reference_bid_style_profile) {
@@ -1437,8 +1795,8 @@ const App = () => {
           reference_bid_style_profile: profile,
         });
       }
-      completeProgress('样例风格剖面已生成', taskVersion);
-      setSuccess('成熟样例已接入，后续响应矩阵、目录、正文和审校会复用其结构风格');
+      completeProgress('样例写作模板已生成', taskVersion);
+      setSuccess('成熟样例已通过 MinerU Markdown 接入，后续响应矩阵、目录、正文和审校会复用其模板结构');
     } catch (error: any) {
       failProgress(error.response?.data?.detail || error.message || '样例解析失败', undefined, taskVersion);
       setError(error.response?.data?.detail || error.message || '样例解析失败');
@@ -1452,15 +1810,23 @@ const App = () => {
       setError('请先上传招标文件');
       return;
     }
+    if (!hasMinerUMarkdown(state.parserInfo)) {
+      setError('请先重新上传招标文件，并等待 MinerU 在上传阶段完成 Markdown 解析；旧草稿或降级解析结果不能进入标准解析。');
+      return;
+    }
     setBusy('analysis');
     const taskVersion = startProgress('标准解析', ANALYSIS_STEPS, '准备调用模型解析招标文件', 6);
     setStreamText('');
     setReviewReport(null);
     setConsistencyReport(null);
+    setManualReviewConfirmed(false);
     try {
       let reportRaw = '';
       advanceProgress('正在用通用提示词结构化招标文件', 20, 1, taskVersion);
-      const reportResponse = await documentApi.analyzeReportStream({ file_content: state.fileContent });
+      const reportResponse = await documentApi.analyzeReportStream({
+        file_content: state.fileContent,
+        config: toLiteLLMConfig(localConfig),
+      });
       await withTaskTimeout(consumeSseStream(reportResponse, (payload) => {
         if (payload.error) throw new Error(payload.message || '结构化解析失败');
         if (typeof payload.chunk === 'string') {
@@ -1474,7 +1840,10 @@ const App = () => {
           advanceProgress(detail, Math.min(92, 20 + Math.floor(reportRaw.length / 220)), nextStep, taskVersion);
         }
       }), '模型解析超时：标准解析长时间未完成，系统已停止后续目录生成，未使用兜底报告。', taskVersion, ANALYSIS_REPORT_TIMEOUT_MS);
-      advanceProgress('正在校验并写入结构化解析结果', 96, 3, taskVersion);
+      advanceProgress('正在校验并写入结构化解析结果', 96, 4, taskVersion);
+      if (!reportRaw.trim()) {
+        throw new Error('后端只返回了心跳，没有返回标准解析 JSON。通常表示模型调用长时间未完成、连接提前结束，或后端任务被中断；系统不会使用兜底报告。');
+      }
       const report = parseJsonPayload<AnalysisReport>(reportRaw, '标准解析');
       const blockingWarning = getBlockingAnalysisReportWarning(report);
       if (blockingWarning) {
@@ -1587,6 +1956,7 @@ const App = () => {
         setDocumentBlocksPlan(nextOutline.document_blocks_plan);
       }
       updateOutline(nextOutline);
+      setManualReviewConfirmed(false);
       const first = collectEntries(nextOutline.outline)[0];
       if (first) updateSelectedChapter(first.item.id);
       setStreamText('');
@@ -1630,6 +2000,7 @@ const App = () => {
         .slice(-12)
         .map(item => ({ chapter_id: item.item.id, summary: `${item.item.title}：${(item.item.content || '').slice(0, 260)}` })),
       enterprise_materials: (activeReport.required_materials || []).filter(item => item.status === 'provided'),
+      enterprise_material_profile: activeEnterpriseProfile || undefined,
       missing_materials: activeReport.missing_company_materials || [],
     };
     const response = await contentApi.generateChapterContentStream(request, options?.signal);
@@ -1661,6 +2032,7 @@ const App = () => {
       outline: updateOutlineItem(outlineSource.outline, entry.item.id, { content }),
     };
     updateOutline(nextOutline);
+    setManualReviewConfirmed(false);
     setActiveDocId(entry.item.id);
     if (scroll) {
       window.requestAnimationFrame(() => {
@@ -1819,6 +2191,7 @@ const App = () => {
       advanceProgress('正在写入合规审校报告', 96, 2);
       const report = parseJsonPayload<ReviewReport>(raw, '合规审校');
       setReviewReport(report);
+      setManualReviewConfirmed(false);
       completeProgress('合规审校完成', taskVersion);
       setSuccess(report.summary.ready_to_export ? '审校通过，可以导出 Word' : '审校完成，请处理阻塞项');
     } catch (error: any) {
@@ -1844,6 +2217,7 @@ const App = () => {
         response_matrix: effectiveOutline.response_matrix || activeReport.response_matrix,
         reference_bid_style_profile: activeReferenceProfile,
         enterprise_materials: (activeReport.required_materials || []).filter(item => item.status === 'provided'),
+        enterprise_material_profile: activeEnterpriseProfile || undefined,
       });
       await consumeSseStream(response, (payload) => {
         if (payload.error) throw new Error(payload.message || '图表素材规划失败');
@@ -1914,8 +2288,12 @@ const App = () => {
       setError('请先生成目录和正文');
       return;
     }
+    if (!manualReviewConfirmed) {
+      setError('导出前必须人工复核并勾选确认，模型生成结果可能存在误读、漏项、虚构和格式偏差。');
+      return;
+    }
     setBusy('export');
-    const taskVersion = startProgress('导出 Word', ['整理章节', '生成文件'], '正在整理章节正文', 20);
+    const taskVersion = startProgress('导出 Word', ['整理章节', '写入复核清单', '生成文件'], '正在整理章节正文', 20);
     try {
       const contentById = Object.fromEntries(entries.map(entry => [entry.item.id, entry.item.content || '']));
       advanceProgress('正在生成 Word 文件', 70, 1);
@@ -1924,7 +2302,11 @@ const App = () => {
         project_name: effectiveOutline.project_name || project?.name || '投标文件',
         project_overview: effectiveOutline.project_overview || state.projectOverview,
         outline: buildExportOutline(effectiveOutline.outline, contentById),
+        analysis_report: activeReport,
+        review_report: reviewReport,
+        reference_bid_style_profile: activeReferenceProfile,
         document_blocks_plan: activeDocumentBlocksPlan,
+        manual_review_confirmed: manualReviewConfirmed,
         export_dir: targetExportDir || undefined,
       });
       const filename = `${effectiveOutline.project_name || project?.name || '投标文件'}.docx`;
@@ -1971,11 +2353,22 @@ const App = () => {
     setBusy('verify');
     setProgress(null);
     try {
-      const response = await configApi.verifyProvider(toLiteLLMConfig(localConfig));
+      const nextConfig = toLiteLLMConfig(localConfig);
+      const response = await configApi.verifyProvider(nextConfig);
       setVerifyResult(response.data);
       const modelCheck = response.data.checks.find(check => check.stage === 'models');
       if (modelCheck?.models?.length) setAvailableModels(modelCheck.models);
-      setNotice({ type: response.data.success ? 'success' : 'error', text: response.data.message });
+      if (response.data.success) {
+        const saveResponse = await configApi.saveConfig(nextConfig);
+        if (!saveResponse.data.success) {
+          throw new Error(saveResponse.data.message || '端点验证成功，但配置保存失败');
+        }
+        setLocalConfig(nextConfig);
+        updateConfig(nextConfig);
+        setNotice({ type: 'success', text: `${response.data.message}，已保存为当前解析配置` });
+        return;
+      }
+      setNotice({ type: 'error', text: response.data.message });
     } catch (error: any) {
       setError(apiErrorMessage(error, '验证端点失败'));
     } finally {
@@ -2094,7 +2487,7 @@ const App = () => {
         </nav>
         <div className="history-panel">
           <div className="history-panel__head">
-            <strong>历史记录</strong>
+            <strong>项目数据库</strong>
             <span>{historyRecords.length}</span>
           </div>
           <div className="history-list">
@@ -2109,7 +2502,7 @@ const App = () => {
                 <span>{record.total ? `${record.completed}/${record.total} 章` : '待生成目录'} · {new Date(record.updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
               </button>
             )) : (
-              <div className="history-empty">生成后自动保存</div>
+              <div className="history-empty">项目会保存到后端数据库</div>
             )}
           </div>
         </div>
@@ -2227,7 +2620,7 @@ const App = () => {
                   <button type="button" className="upload-zone" onClick={() => referenceInputRef.current?.click()}>
                     <DocumentArrowUpIcon className="h-8 w-8" />
                     <strong>选择 PDF 或 DOCX 样例标书</strong>
-                    <span>只抽取目录层级、表格、承诺书和写作风格，不作为项目事实来源。</span>
+                    <span>先用 MinerU 转 Markdown，再抽取目录、段落骨架、表格、承诺书和素材位，不作为项目事实来源。</span>
                   </button>
                   <input
                     ref={referenceInputRef}
@@ -2242,8 +2635,8 @@ const App = () => {
                   <div className="file-pill">
                     <DocumentTextIcon className="h-5 w-5 text-sky-600" />
                     <div>
-                      <strong>{referenceFileName || '未接入样例风格'}</strong>
-                      <span>{Object.keys(activeReferenceProfile || {}).length ? '样例风格剖面已生成' : '可选，建议上传成熟目标文件'}</span>
+                      <strong>{referenceFileName || '未接入写作模板'}</strong>
+                      <span>{Object.keys(activeReferenceProfile || {}).length ? '样例写作模板已生成' : '可选，建议上传成熟目标文件'}</span>
                     </div>
                     {Object.keys(activeReferenceProfile || {}).length ? <CheckCircleIcon className="h-5 w-5 text-emerald-600" /> : null}
                   </div>
@@ -2279,28 +2672,31 @@ const App = () => {
 
                 <div className="ops-panel">
                   <div className="ops-panel__head">
-                    <h2>材料缺失提示</h2>
-                    <span>{activeReport ? `共 ${(activeReport.missing_company_materials || []).length} 项` : '待解析'}</span>
+                    <h2>企业资料画像</h2>
+                    <span>{activeReport ? `待补 ${(activeEnterpriseProfile?.missing_materials || activeReport.missing_company_materials || []).length} 项` : '待解析'}</span>
                   </div>
                   {activeReport ? (
-                    (activeReport.missing_company_materials || []).length ? (
-                      (activeReport.missing_company_materials || []).slice(0, 8).map(item => (
+                    (activeEnterpriseProfile?.missing_materials || activeReport.missing_company_materials || []).length ? (
+                      <>
+                        {activeEnterpriseProfile?.summary ? <div className="field-hint">{activeEnterpriseProfile.summary}</div> : null}
+                        {(activeEnterpriseProfile?.missing_materials || activeReport.missing_company_materials || []).slice(0, 8).map(item => (
                         <div key={item.id} className="warning-row">
                           <ExclamationTriangleIcon className="h-4 w-4 text-amber-500" />
                           <span>{item.name}</span>
                           <strong>待补充</strong>
                         </div>
-                      ))
+                        ))}
+                      </>
                     ) : (
                       <div className="empty-state empty-state--compact">
                         <strong>未识别出缺失材料</strong>
-                        <span>该结果来自当前解析报告，可在审校阶段继续核验。</span>
+                        <span>企业资料已独立成画像，仍需在审校阶段核验证据链和原件一致性。</span>
                       </div>
                     )
                   ) : (
                     <div className="empty-state empty-state--compact">
                       <strong>完成标准解析后显示</strong>
-                      <span>材料清单由模型从资格、商务、签章等要求中抽取。</span>
+                      <span>企业资料画像会独立归纳已提供、待补和人工核验任务。</span>
                     </div>
                   )}
                 </div>
@@ -2317,6 +2713,10 @@ const App = () => {
                     </button>
                   </div>
                   {(busy === 'analysis' || progress?.label === '标准解析') && <TaskProgress progress={progress} onRetry={runAnalysis} />}
+                  <div className={`parser-status parser-status--${currentParserStatus.tone}`}>
+                    <strong>{currentParserStatus.label}</strong>
+                    <span>{currentParserStatus.detail}</span>
+                  </div>
                   {ANALYSIS_STEPS.map((item, index) => {
                     const status = analysisStepStatus(index);
                     return (
@@ -2608,6 +3008,7 @@ const App = () => {
                         <OutlineRows
                           key={section.id}
                           item={section}
+                          report={activeReport}
                           selectedId={selectedEntry?.item.id}
                           editingId={editingOutlineId}
                           onSelect={updateSelectedChapter}
@@ -2677,10 +3078,18 @@ const App = () => {
                         <button type="button" className="danger-button" onClick={stopGeneration}><StopIcon className="h-4 w-4" /> 停止</button>
                       </div>
                     )}
-                    <button type="button" onClick={exportWord} disabled={!effectiveOutline || busy === 'export'}>
+                    <button type="button" onClick={exportWord} disabled={!effectiveOutline || busy === 'export' || !manualReviewConfirmed}>
                       <ArrowDownTrayIcon className="h-4 w-4" /> 导出 Word
                     </button>
                   </div>
+                  <label className="manual-review-control">
+                    <input
+                      type="checkbox"
+                      checked={manualReviewConfirmed}
+                      onChange={event => setManualReviewConfirmed(event.target.checked)}
+                    />
+                    <span>已人工复核模型结果、缺失材料、页码目录、版式、签章位置、图表占位和固定格式风险。</span>
+                  </label>
                   <label className="export-path-control">
                     <span>保存目录</span>
                     <input
@@ -2699,32 +3108,40 @@ const App = () => {
                       <LiveStreamPanel title="正文实时生成" text={contentStreamText || '等待模型返回正文内容...'} />
                     </div>
                   )}
-                  <article ref={docPreviewRef} className="word-document">
-                    {effectiveOutline ? (
-                      <>
-                        <div className="word-document__cover">
-                          <span>投标文件正文</span>
-                          <h2>{effectiveOutline.project_name || project?.name || '待生成标书'}</h2>
-                          <p>左侧目录可跳转到对应章节；未生成正文的章节会保留待编写占位。</p>
+                  <div className="word-document-stage">
+                    <div className="word-ruler" aria-hidden="true">
+                      <span />
+                      <i />
+                      <span />
+                    </div>
+                    <article ref={docPreviewRef} className="word-document" style={wordPreviewStyle}>
+                      {effectiveOutline ? (
+                        <>
+                          <div className="word-document__cover">
+                            <h1>投标文件</h1>
+                            <p>项目名称：{effectiveOutline.project_name || project?.name || '〖待补充：项目名称〗'}</p>
+                            <p>投标人：〖待补充：投标人名称〗（盖单位章）</p>
+                            <p>日期：〖待补充：投标日期〗</p>
+                          </div>
+                          {effectiveOutline.outline.map(section => (
+                            <DocumentPreviewNode
+                              key={section.id}
+                              item={section}
+                              level={1}
+                              activeId={activeDocId || selectedEntry?.item.id}
+                              streamingId={streamingChapterId}
+                              onSelect={scrollToDocumentNode}
+                            />
+                          ))}
+                        </>
+                      ) : (
+                        <div className="word-empty-page">
+                          <strong>等待目录生成</strong>
+                          <span>正文区不会显示示例文本；生成目录并选择章节后，再调用模型写入正式内容。</span>
                         </div>
-                        {effectiveOutline.outline.map(section => (
-                          <DocumentPreviewNode
-                            key={section.id}
-                            item={section}
-                            level={1}
-                            activeId={activeDocId || selectedEntry?.item.id}
-                            streamingId={streamingChapterId}
-                            onSelect={scrollToDocumentNode}
-                          />
-                        ))}
-                      </>
-                    ) : (
-                      <div className="empty-state empty-state--document">
-                        <strong>等待目录生成</strong>
-                        <span>正文区不会显示示例文本；生成目录并选择章节后，再调用模型写入正式内容。</span>
-                      </div>
-                    )}
-                  </article>
+                      )}
+                    </article>
+                  </div>
                 </div>
               </div>
             )}
@@ -2942,6 +3359,7 @@ const App = () => {
 
 interface OutlineRowsProps {
   item: OutlineItem;
+  report?: AnalysisReport | null;
   selectedId?: string;
   editingId?: string;
   level?: number;
@@ -2951,11 +3369,12 @@ interface OutlineRowsProps {
   onDelete: (item: OutlineItem) => void;
 }
 
-const OutlineRows = ({ item, selectedId, editingId, level = 0, onSelect, onEdit, onAddChild, onDelete }: OutlineRowsProps) => {
+const OutlineRows = ({ item, report, selectedId, editingId, level = 0, onSelect, onEdit, onAddChild, onDelete }: OutlineRowsProps) => {
   const hasChildren = Boolean(item.children?.length);
   const [expanded, setExpanded] = useState(level === 0);
   const active = containsOutlineItem(item, selectedId) || containsOutlineItem(item, editingId);
   const editing = item.id === editingId;
+  const scoringIds = effectiveScoringIds(item, report);
   const materialCount = item.material_ids?.length || 0;
   const expectsMaterial = Boolean(
     item.enterprise_required
@@ -3003,7 +3422,7 @@ const OutlineRows = ({ item, selectedId, editingId, level = 0, onSelect, onEdit,
           <button type="button" onClick={(event) => { event.stopPropagation(); onAddChild(item); }}>子级</button>
           <button type="button" className="danger-text-button" onClick={(event) => { event.stopPropagation(); onDelete(item); }}>删除</button>
         </span>
-        <span className="chip chip--green">评分项 {item.scoring_item_ids?.length || '-'}</span>
+        <span className="chip chip--green">评分项 {scoringIds.length || '-'}</span>
         <span className={`chip ${riskLevel(item) === '高风险' ? 'chip--red' : riskLevel(item) === '中风险' ? 'chip--amber' : 'chip--green'}`}>{riskLevel(item)}</span>
         <span className={`chip ${materialTone}`} title={materialHelp}>{materialLabel}</span>
       </div>
@@ -3017,6 +3436,7 @@ const OutlineRows = ({ item, selectedId, editingId, level = 0, onSelect, onEdit,
         <OutlineRows
           key={child.id}
           item={child}
+          report={report}
           selectedId={selectedId}
           editingId={editingId}
           level={level + 1}
@@ -3122,9 +3542,7 @@ const DocumentPreviewNode = ({ item, level, activeId, streamingId, onSelect }: D
     >
       <button type="button" className={headingClass} onClick={() => onSelect(item)}>
         <span>{item.id} {item.title}</span>
-        {!hasChildren && <SparklesIcon className="h-4 w-4" />}
       </button>
-      {item.description && <p className="word-section__desc">{item.description}</p>}
       {!hasChildren && (
         item.content?.trim() ? (
           <div className={`word-section__content ${streaming ? 'word-section__content--streaming' : ''}`}>

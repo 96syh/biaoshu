@@ -43,9 +43,9 @@ class FileService:
     @staticmethod
     def get_parser_mode() -> str:
         """文档解析器选择：auto / mineru / mineru_strict / legacy。"""
-        mode = os.getenv("YIBIAO_DOCUMENT_PARSER", "auto").strip().lower()
+        mode = os.getenv("YIBIAO_DOCUMENT_PARSER", "mineru_strict").strip().lower()
         if mode not in {"auto", "mineru", "mineru_strict", "legacy"}:
-            return "auto"
+            return "mineru_strict"
         return mode
 
     @staticmethod
@@ -572,7 +572,7 @@ class FileService:
         try:
             return await FileService._extract_with_mineru(file_path, file_kind)
         except Exception as exc:
-            if mode == "mineru_strict":
+            if mode in {"mineru", "mineru_strict"}:
                 raise
             text, info = await FileService._extract_with_legacy_parser(file_path, file_kind)
             info.update({

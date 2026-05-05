@@ -1,23 +1,26 @@
 /**
- * 工作台草稿存储
+ * 项目草稿存储
  *
- * 保存工作台草稿和历史记录，避免长流程生成中断后丢失进度。
+ * 主存储已迁移到后端 SQLite 项目数据库。浏览器 localStorage / IndexedDB
+ * 只在启动时清理旧缓存，不再保存业务草稿。
  */
 
 import type { AppState, OutlineItem } from '../types';
+import { projectApi } from '../services/api';
+import type { ProjectRecordResponse } from '../services/api';
 
-const DRAFT_KEY = 'huazheng:draft:v1';
-const CONTENT_BY_ID_KEY = 'huazheng:contentById:v1';
-const HISTORY_KEY = 'huazheng:history:v1';
-const ACTIVE_HISTORY_ID_KEY = 'huazheng:activeHistoryId:v1';
-const WORKSPACE_DRAFT_ENABLED = true;
-const MAX_HISTORY = 12;
+const LEGACY_DRAFT_KEY = 'huazheng:draft:v1';
+const LEGACY_CONTENT_BY_ID_KEY = 'huazheng:contentById:v1';
+const LEGACY_HISTORY_KEY = 'huazheng:history:v1';
+const LEGACY_ACTIVE_HISTORY_ID_KEY = 'huazheng:activeHistoryId:v1';
+const LEGACY_INDEXED_DB_NAME = 'huazheng-workspace-drafts';
 
 export type DraftState = Pick<
   AppState,
   | 'currentStep'
   | 'fileContent'
   | 'uploadedFileName'
+  | 'parserInfo'
   | 'projectOverview'
   | 'techRequirements'
   | 'analysisReport'
@@ -25,7 +28,7 @@ export type DraftState = Pick<
   | 'selectedChapter'
 >;
 
-export type ContentById = Record<string, string>; // 章节id -> content
+export type ContentById = Record<string, string>;
 export type DraftHistoryRecord = {
   id: string;
   title: string;
@@ -37,205 +40,211 @@ export type DraftHistoryRecord = {
   draft: Partial<DraftState>;
 };
 
-const safeJsonParse = <T,>(raw: string | null): T | null => {
-  if (!raw) return null;
+let activeProjectId = '';
+let activeDraft: Partial<DraftState> = {};
+let saveQueue: Promise<unknown> = Promise.resolve();
+let legacyCleaned = false;
+
+const toDraft = (value: unknown): Partial<DraftState> => {
+  if (!value || typeof value !== 'object') return {};
+  return value as Partial<DraftState>;
+};
+
+const toHistoryRecord = (record: ProjectRecordResponse): DraftHistoryRecord => ({
+  id: record.id,
+  title: record.title,
+  createdAt: record.createdAt,
+  updatedAt: record.updatedAt,
+  completed: record.completed,
+  total: record.total,
+  wordCount: record.wordCount,
+  draft: toDraft(record.draft),
+});
+
+const createClientProjectId = () => `project-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+
+const clearLegacyBrowserCache = async () => {
+  if (legacyCleaned || typeof window === 'undefined') return;
+  legacyCleaned = true;
+
   try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return null;
+    window.localStorage.removeItem(LEGACY_DRAFT_KEY);
+    window.localStorage.removeItem(LEGACY_CONTENT_BY_ID_KEY);
+    window.localStorage.removeItem(LEGACY_HISTORY_KEY);
+    window.localStorage.removeItem(LEGACY_ACTIVE_HISTORY_ID_KEY);
+  } catch (error) {
+    console.warn('清理旧 localStorage 缓存失败:', error);
+  }
+
+  try {
+    if (window.indexedDB?.deleteDatabase) {
+      window.indexedDB.deleteDatabase(LEGACY_INDEXED_DB_NAME);
+    }
+  } catch (error) {
+    console.warn('清理旧 IndexedDB 缓存失败:', error);
   }
 };
 
-const isGeneratedMediaTitle = (value?: string) =>
-  /-{2,}\s*media\/image\d+\.(png|jpg|jpeg|gif|webp)\s*-{2,}/i.test((value || '').trim());
-
-const cleanTitle = (value?: string) => {
-  const title = (value || '').trim();
-  if (!title || isGeneratedMediaTitle(title)) return '';
-  return title;
-};
-
-const draftTitle = (draft: Partial<DraftState>) =>
-  cleanTitle(draft.outlineData?.project_name)
-  || cleanTitle(draft.analysisReport?.project?.name)
-  || cleanTitle(draft.uploadedFileName)
-  || cleanTitle(draft.analysisReport?.project?.number)
-  || '未命名标书';
-
-const draftStats = (draft: Partial<DraftState>) => {
-  const outline = draft.outlineData?.outline || [];
-  let completed = 0;
-  let total = 0;
-  let wordCount = 0;
-  const walk = (items: OutlineItem[]) => {
-    items.forEach((item) => {
-      if (item.children?.length) {
-        walk(item.children);
-        return;
+const saveActiveDraft = (draft: Partial<DraftState>) => {
+  const projectId = activeProjectId || createClientProjectId();
+  activeProjectId = projectId;
+  saveQueue = saveQueue
+    .catch(() => undefined)
+    .then(async () => {
+      try {
+        const response = await projectApi.saveActiveProject(draft as Record<string, unknown>, projectId, true);
+        const project = response.data.project;
+        if (project) {
+          activeProjectId = project.id;
+          activeDraft = toDraft(project.draft);
+        }
+      } catch (error) {
+        console.warn('保存项目草稿到后端数据库失败:', error);
       }
-      total += 1;
-      if (item.content?.trim()) completed += 1;
-      wordCount += item.content?.length || 0;
     });
-  };
-  walk(outline);
-  return { completed, total, wordCount };
 };
 
-const createId = () => `draft-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-
-const getActiveHistoryId = () => {
-  let id = localStorage.getItem(ACTIVE_HISTORY_ID_KEY);
-  if (!id) {
-    id = createId();
-    localStorage.setItem(ACTIVE_HISTORY_ID_KEY, id);
-  }
-  return id;
+const walkOutlineLeaves = (outline: OutlineItem[] = [], visit: (item: OutlineItem) => void) => {
+  outline.forEach((item) => {
+    if (item.children?.length) {
+      walkOutlineLeaves(item.children, visit);
+      return;
+    }
+    visit(item);
+  });
 };
+
+const buildContentMapFromDraft = (draft: Partial<DraftState>): ContentById => {
+  const map: ContentById = {};
+  walkOutlineLeaves(draft.outlineData?.outline || [], (item) => {
+    if (item.content) map[item.id] = item.content;
+  });
+  return map;
+};
+
+const updateOutlineContent = (
+  outline: OutlineItem[] = [],
+  contentById: ContentById,
+): OutlineItem[] => outline.map(item => ({
+  ...item,
+  content: contentById[item.id] ?? item.content,
+  children: item.children?.length ? updateOutlineContent(item.children, contentById) : item.children,
+}));
 
 export const draftStorage = {
   loadDraft(): Partial<DraftState> | null {
-    if (!WORKSPACE_DRAFT_ENABLED) {
+    return Object.keys(activeDraft).length ? activeDraft : null;
+  },
+
+  async loadDraftAsync(): Promise<Partial<DraftState> | null> {
+    await clearLegacyBrowserCache();
+    try {
+      const response = await projectApi.getActiveProject();
+      const project = response.data.project;
+      if (!project) {
+        activeProjectId = '';
+        activeDraft = {};
+        return null;
+      }
+      activeProjectId = project.id;
+      activeDraft = toDraft(project.draft);
+      return activeDraft;
+    } catch (error) {
+      console.warn('读取项目数据库草稿失败:', error);
       return null;
     }
-    return safeJsonParse<Partial<DraftState>>(localStorage.getItem(DRAFT_KEY));
   },
 
   saveDraft(partial: Partial<DraftState>) {
-    if (!WORKSPACE_DRAFT_ENABLED) {
-      return;
-    }
-    try {
-      const prev = safeJsonParse<Partial<DraftState>>(localStorage.getItem(DRAFT_KEY)) || {};
-      const next = { ...prev, ...partial };
-      localStorage.setItem(DRAFT_KEY, JSON.stringify(next));
-      draftStorage.upsertHistory(next);
-    } catch (e) {
-      console.warn('保存草稿失败（可能是 localStorage 空间不足）:', e);
-    }
+    activeDraft = { ...activeDraft, ...partial };
+    saveActiveDraft(activeDraft);
   },
 
   startNewHistory() {
-    try {
-      const id = createId();
-      localStorage.setItem(ACTIVE_HISTORY_ID_KEY, id);
-      localStorage.removeItem(DRAFT_KEY);
-      localStorage.removeItem(CONTENT_BY_ID_KEY);
-      return id;
-    } catch {
-      return createId();
-    }
+    activeProjectId = createClientProjectId();
+    activeDraft = {};
+    void clearLegacyBrowserCache();
+    return activeProjectId;
   },
 
   loadHistory(): DraftHistoryRecord[] {
-    return safeJsonParse<DraftHistoryRecord[]>(localStorage.getItem(HISTORY_KEY)) || [];
+    return [];
   },
 
-  upsertHistory(draft: Partial<DraftState>) {
-    if (!WORKSPACE_DRAFT_ENABLED || !draft) return;
+  async loadHistoryAsync(): Promise<DraftHistoryRecord[]> {
+    await clearLegacyBrowserCache();
     try {
-      const id = getActiveHistoryId();
-      const history = draftStorage.loadHistory();
-      const existing = history.find(item => item.id === id);
-      const now = new Date().toISOString();
-      const stats = draftStats(draft);
-      const record: DraftHistoryRecord = {
-        id,
-        title: draftTitle(draft),
-        createdAt: existing?.createdAt || now,
-        updatedAt: now,
-        completed: stats.completed,
-        total: stats.total,
-        wordCount: stats.wordCount,
-        draft,
-      };
-      const nextHistory = [record, ...history.filter(item => item.id !== id)]
-        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
-        .slice(0, MAX_HISTORY);
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory));
-    } catch (e) {
-      console.warn('保存历史记录失败:', e);
+      const response = await projectApi.listProjects();
+      return (response.data.projects || []).map(toHistoryRecord);
+    } catch (error) {
+      console.warn('读取项目列表失败:', error);
+      return [];
     }
   },
 
+  upsertHistory(draft: Partial<DraftState>) {
+    activeDraft = { ...activeDraft, ...draft };
+    saveActiveDraft(activeDraft);
+  },
+
   activateHistory(id: string) {
+    activeProjectId = id;
+    return null;
+  },
+
+  async activateHistoryAsync(id: string) {
+    await clearLegacyBrowserCache();
     try {
-      localStorage.setItem(ACTIVE_HISTORY_ID_KEY, id);
-      const record = draftStorage.loadHistory().find(item => item.id === id);
-      if (record) {
-        localStorage.setItem(DRAFT_KEY, JSON.stringify(record.draft));
-      }
-      return record || null;
-    } catch {
+      const response = await projectApi.activateProject(id);
+      const project = response.data.project;
+      if (!project) return null;
+      activeProjectId = project.id;
+      activeDraft = toDraft(project.draft);
+      return toHistoryRecord(project);
+    } catch (error) {
+      console.warn('切换项目失败:', error);
       return null;
     }
   },
 
   clearAll() {
-    // 仅清理当前应用自己的草稿键，避免误删同域下其他数据
-    try {
-      localStorage.removeItem(DRAFT_KEY);
-      localStorage.removeItem(CONTENT_BY_ID_KEY);
-      localStorage.removeItem(ACTIVE_HISTORY_ID_KEY);
-    } catch (e) {
-      console.warn('清空 localStorage 失败:', e);
-    }
+    activeDraft = {};
+    activeProjectId = '';
+    void clearLegacyBrowserCache();
   },
 
   loadContentById(): ContentById {
-    if (!WORKSPACE_DRAFT_ENABLED) {
-      return {};
-    }
-    return safeJsonParse<ContentById>(localStorage.getItem(CONTENT_BY_ID_KEY)) || {};
+    return buildContentMapFromDraft(activeDraft);
+  },
+
+  async loadContentByIdAsync(): Promise<ContentById> {
+    return buildContentMapFromDraft(activeDraft);
   },
 
   saveContentById(contentById: ContentById) {
-    if (!WORKSPACE_DRAFT_ENABLED) {
-      return;
-    }
-    try {
-      localStorage.setItem(CONTENT_BY_ID_KEY, JSON.stringify(contentById));
-    } catch (e) {
-      console.warn('保存正文内容失败（可能是 localStorage 空间不足）:', e);
-    }
+    if (!activeDraft.outlineData?.outline) return;
+    const nextOutline = updateOutlineContent(activeDraft.outlineData.outline, contentById);
+    activeDraft = {
+      ...activeDraft,
+      outlineData: {
+        ...activeDraft.outlineData,
+        outline: nextOutline,
+      },
+    };
+    saveActiveDraft(activeDraft);
   },
 
   upsertChapterContent(chapterId: string, content: string) {
-    if (!WORKSPACE_DRAFT_ENABLED) {
-      return;
-    }
-    try {
-      const map = draftStorage.loadContentById();
-      map[chapterId] = content;
-      draftStorage.saveContentById(map);
-    } catch (e) {
-      console.warn('保存章节内容失败:', e);
-    }
+    const map = buildContentMapFromDraft(activeDraft);
+    map[chapterId] = content;
+    draftStorage.saveContentById(map);
   },
 
-  /**
-   * 按当前 outline 的叶子节点过滤 contentById，避免目录变更后错误回填。
-   */
   filterContentByOutlineLeaves(outline: OutlineItem[]): ContentById {
-    if (!WORKSPACE_DRAFT_ENABLED) {
-      return {};
-    }
-    const map = draftStorage.loadContentById();
-    const leafIds = new Set<string>();
-    const walk = (items: OutlineItem[]) => {
-      items.forEach((it) => {
-        if (!it.children || it.children.length === 0) {
-          leafIds.add(it.id);
-          return;
-        }
-        walk(it.children);
-      });
-    };
-    walk(outline);
-
+    const source = buildContentMapFromDraft(activeDraft);
     const filtered: ContentById = {};
-    Object.keys(map).forEach((id) => {
-      if (leafIds.has(id)) filtered[id] = map[id];
+    walkOutlineLeaves(outline, (item) => {
+      if (source[item.id]) filtered[item.id] = source[item.id];
     });
     return filtered;
   },

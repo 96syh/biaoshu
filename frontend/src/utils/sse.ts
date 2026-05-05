@@ -32,12 +32,15 @@ const processSseLine = (
 ) => {
   const line = rawLine.trim();
   if (!line.startsWith('data:')) {
-    return;
+    return false;
   }
 
   const data = line.slice(5).trim();
-  if (!data || data === '[DONE]') {
-    return;
+  if (!data) {
+    return false;
+  }
+  if (data === '[DONE]') {
+    return true;
   }
 
   try {
@@ -45,6 +48,7 @@ const processSseLine = (
   } catch {
     // 忽略不完整的行，等待后续 buffer 拼接
   }
+  return false;
 };
 
 export const consumeSseStream = async (
@@ -66,6 +70,7 @@ export const consumeSseStream = async (
 
   const decoder = new TextDecoder();
   let buffer = '';
+  let sawDone = false;
   const waitIfPaused = async () => {
     while (options?.shouldPause?.()) {
       if (options?.isStopped?.()) {
@@ -94,12 +99,16 @@ export const consumeSseStream = async (
       if (options?.isStopped?.()) {
         throw new DOMException('请求已停止', 'AbortError');
       }
-      processSseLine(line, onPayload);
+      sawDone = processSseLine(line, onPayload) || sawDone;
     }
   }
 
   buffer += decoder.decode();
   if (buffer.trim()) {
-    processSseLine(buffer, onPayload);
+    sawDone = processSseLine(buffer, onPayload) || sawDone;
+  }
+
+  if (!sawDone) {
+    throw new Error('标准解析连接在后端发送完成标记前中断，可能是模型网关关闭连接、后端 worker 被终止，或浏览器网络提前结束。');
   }
 };
