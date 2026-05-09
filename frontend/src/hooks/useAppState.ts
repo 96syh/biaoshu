@@ -18,6 +18,7 @@ const initialState: AppState = {
   fileContent: '',
   uploadedFileName: '',
   sourcePreviewHtml: '',
+  sourcePreviewPages: [],
   parserInfo: undefined,
   projectOverview: '',
   techRequirements: '',
@@ -45,7 +46,7 @@ export const useAppState = () => {
     });
   }, []);
 
-  const updateFileContent = useCallback((fileContent: string, uploadedFileName = '', parserInfo?: ParserInfo, sourcePreviewHtml = '') => {
+  const updateFileContent = useCallback((fileContent: string, uploadedFileName = '', parserInfo?: ParserInfo, sourcePreviewHtml = '', sourcePreviewPages: AppState['sourcePreviewPages'] = []) => {
     setState(prev => {
       draftStorage.startNewHistory();
       const next = {
@@ -54,6 +55,7 @@ export const useAppState = () => {
         fileContent,
         uploadedFileName,
         sourcePreviewHtml,
+        sourcePreviewPages,
         parserInfo,
         projectOverview: '',
         techRequirements: '',
@@ -66,6 +68,7 @@ export const useAppState = () => {
         fileContent,
         uploadedFileName,
         sourcePreviewHtml,
+        sourcePreviewPages,
         parserInfo,
         projectOverview: '',
         techRequirements: '',
@@ -120,6 +123,7 @@ export const useAppState = () => {
     | 'fileContent'
     | 'uploadedFileName'
     | 'sourcePreviewHtml'
+    | 'sourcePreviewPages'
     | 'parserInfo'
     | 'projectOverview'
     | 'techRequirements'

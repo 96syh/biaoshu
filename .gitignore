@@ -33,6 +33,7 @@ Thumbs.db
 # 本地运行与打包产物
 .venv311/
 release/
+artifacts/
 
 # Node.js相关
 node_modules/

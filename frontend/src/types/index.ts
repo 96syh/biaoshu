@@ -37,6 +37,20 @@ export interface ParserInfo {
   [key: string]: unknown;
 }
 
+export interface SourceRenderedTextBlock {
+  id: string;
+  text: string;
+  bbox: [number, number, number, number];
+}
+
+export interface SourceRenderedPreviewPage {
+  page_number: number;
+  image_url: string;
+  width: number;
+  height: number;
+  text_blocks: SourceRenderedTextBlock[];
+}
+
 export interface AnalysisProjectInfo {
   name: string;
   number: string;
@@ -550,6 +564,7 @@ export interface AppState {
   fileContent: string;
   uploadedFileName?: string;
   sourcePreviewHtml?: string;
+  sourcePreviewPages?: SourceRenderedPreviewPage[];
   parserInfo?: ParserInfo;
   projectOverview: string;
   techRequirements: string;

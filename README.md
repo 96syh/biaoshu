@@ -14,7 +14,7 @@
 ## 核心能力
 
 - 招标文件上传：支持 PDF、DOCX，单文件大小限制 500MB；暂不支持 `.doc`，需另存为 `.docx` 后上传。
-- 文档解析：优先探测本机 MinerU，将 PDF/DOCX 解析为 Markdown；没有 MinerU 或解析失败时回退到内置 `pdfplumber` / `docx2python` / `PyPDF2` 路径。
+- 文档解析：默认使用内置 `pdfplumber` / `docx2python` / `PyPDF2` 路径；需要版面级 Markdown 时可按需启用本机 MinerU。
 - 标准解析报告：提取项目基础信息、投标文件组成、评分项、资格审查、形式评审、响应性要求、实质性条款、废标风险、材料清单、固定格式、签章要求、报价规则、卷册规则和暗标规则。
 - 响应矩阵：把评分项、资格项、形式项、响应性条款、废标风险、固定格式、签章、报价规则和证明材料映射到目录、正文和审校流程。
 - 目录生成：基于标准解析报告、响应矩阵和招标文件编制要求生成正式目录，支持技术标、服务方案、施工组织、供货方案、商务卷、资格卷、报价卷和完整标等模式。
@@ -99,7 +99,7 @@ yibiao-simple/
 - 前端：React、TypeScript、React Markdown、Heroicons、File Saver、Tailwind CSS。
 - 后端：FastAPI、Pydantic、OpenAI SDK、python-docx、pdfplumber、PyMuPDF、docx2python。
 - 模型网关：LiteLLM Proxy。
-- 文档解析：MinerU 优先，内置解析器兜底。
+- 文档解析：默认内置解析器，可选 MinerU。
 - 文档导出：`python-docx` 生成 DOCX。
 - 实时输出：SSE 流式返回。
 
@@ -116,7 +116,9 @@ yibiao-simple/
 - `/api/document/review-compliance-stream`：执行导出前合规审校。
 - `/api/document/consistency-revision-stream`：生成全文一致性修订报告。
 - `/api/document/export-word`：导出 Word 文档。
-- `/api/expand/upload`：上传已有方案/目录文档并抽取旧目录参考。
+- `/api/expand/upload`：旧扩写兼容接口，默认不注册；需设置 `ENABLE_LEGACY_EXPAND_ROUTER=1`。
+
+可选搜索接口 `/api/search/*` 默认不注册；需安装 `backend/requirements-optional.txt` 并设置 `ENABLE_SEARCH_ROUTER=1`。
 
 ## 重要数据结构
 
@@ -130,6 +132,14 @@ yibiao-simple/
 - `RevisionPlan`：审校后的修订动作清单。
 
 正文和审校阶段不重新解析招标文件，而是复用 `AnalysisReport`、`ResponseMatrix`、目录映射、样例风格剖面、图表素材规划和企业材料上下文。
+
+## 可选能力与产物目录
+
+- 可选搜索路由位于 `backend/app/optional/search.py`，默认不参与 FastAPI 主流程。
+- 旧扩写路由位于 `backend/app/optional/expand.py`，仅保留兼容。
+- MCP DuckDuckGo 示例位于 `backend/optional/mcp/`，手动运行，不被后端默认导入。
+- 构建包、发布包、历史案例库、生成素材和临时验收文件统一放入 `artifacts/`，默认由 `.gitignore` 忽略。
+- 运行态路径可通过 `YIBIAO_PROJECT_DB_PATH`、`YIBIAO_HISTORY_CASE_DB_PATH`、`YIBIAO_GENERATED_ASSET_DIR`、`YIBIAO_FRONTEND_STATIC_DIR` 覆盖。
 
 ## 本地开发
 
@@ -228,20 +238,21 @@ backend/app/config.py
 
 不要把真实 API Key 写入源码、文档或日志。
 
-### 本地 MinerU 文档解析
+### 文档解析器选择
 
-上传解析默认会自动探测本机是否有 `mineru` CLI：
+上传解析默认不接入 MinerU，直接使用内置 `pdfplumber` / `docx2python` / `PyPDF2` 解析器。需要更接近版面结构的 Markdown 输出时，可手动启用本机 `mineru` CLI：
 
-- 有 MinerU：优先用本地 MinerU 将 PDF/DOCX 解析为 Markdown，再进入标准解析、目录和正文流程。
-- 没有 MinerU 或解析失败：自动回退到内置 `pdfplumber` / `docx2python` 解析器。
+- `legacy`：默认模式，只用内置解析器，不调用 MinerU。
+- `auto`：自动用 MinerU，失败后回退到内置解析器。
+- `mineru` / `mineru_strict`：使用 MinerU。
 - `mineru_strict` 模式下 MinerU 失败会直接报错，不再回退。
 
 可选环境变量：
 
 ```bash
-# auto：自动用 MinerU，失败回退；legacy：只用内置解析器；
-# mineru_strict：MinerU 失败则直接报错
-export YIBIAO_DOCUMENT_PARSER=auto
+# legacy：默认，只用内置解析器；auto：自动用 MinerU，失败回退；
+# mineru / mineru_strict：使用 MinerU，mineru_strict 失败则直接报错
+export YIBIAO_DOCUMENT_PARSER=legacy
 
 # MinerU CLI 路径，默认从 PATH 查找 mineru
 export YIBIAO_MINERU_BIN=mineru
@@ -257,6 +268,15 @@ export YIBIAO_MINERU_LANG=ch
 
 # 单文件解析超时，默认 900 秒
 export YIBIAO_MINERU_TIMEOUT=900
+
+# 默认优先速度：不在上传阶段额外渲染 DOCX 页图/HTML 预览，不提取图片并上传外部图床
+export YIBIAO_ENABLE_SOURCE_PREVIEW_PAGES=0
+export YIBIAO_ENABLE_DOCX_HTML_PREVIEW=0
+export YIBIAO_UPLOAD_EXTRACTED_IMAGES=0
+
+# 目录生成默认限制并发，避免本地模型或 LiteLLM 过载；图表素材规划改为前端手动触发
+export YIBIAO_OUTLINE_CONCURRENCY=2
+export YIBIAO_AUTO_DOCUMENT_BLOCKS_PLAN=0
 ```
 
 macOS 上若安装了支持 MPS 的 MinerU/PyTorch，`YIBIAO_MINERU_DEVICE=auto` 会优先选择 MPS；Linux 上检测到 `nvidia-smi` 时会优先选择 CUDA。
@@ -305,7 +325,7 @@ http://localhost:8000
 - 模型配置保存到本机用户目录，草稿历史保存在后端 SQLite 项目库。
 - 招标文件上传后会被后端临时保存，解析完成后会清理临时文件。
 - 模型理解阶段会把招标文本发送到用户配置的 LiteLLM 后端；是否外传取决于 LiteLLM 后端接入的是本地模型、内网模型还是云端模型。
-- 文件解析的 MinerU 默认走本地 CLI；如果配置了 MinerU 远端 API，需要自行确认数据边界。
+- 文件解析默认不接入 MinerU；如果手动启用 MinerU 远端 API，需要自行确认数据边界。
 - 生成结果必须人工复核，不应直接作为最终投标文件提交。
 
 ## 当前限制

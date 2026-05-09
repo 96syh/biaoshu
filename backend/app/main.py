@@ -4,12 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os
+from pathlib import Path
 import fastapi.middleware.cors
 import starlette.middleware.cors
 
 from .config import settings
-from .routers import config, document, outline, content, expand, projects, history_cases
+from .routers import config, document, outline, content, projects, history_cases
 from .services.file_service import FileService
+from .services.model_runtime_monitor import ModelRuntimeMonitor
 
 HTML_NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -17,12 +19,26 @@ HTML_NO_CACHE_HEADERS = {
     "Expires": "0",
 }
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 search = None
-if os.getenv("ENABLE_SEARCH_ROUTER", "false").lower() == "true":
+if _env_enabled("ENABLE_SEARCH_ROUTER", False):
     try:
-        from .routers import search
+        from .optional import search
     except Exception as search_import_error:
         print(f"搜索模块未启用: {search_import_error}")
+
+expand = None
+if _env_enabled("ENABLE_LEGACY_EXPAND_ROUTER", False):
+    try:
+        from .optional import expand
+    except Exception as expand_import_error:
+        print(f"旧扩写模块未启用: {expand_import_error}")
 
 # 创建FastAPI应用实例
 app = FastAPI(
@@ -45,12 +61,14 @@ app.include_router(config.router)
 app.include_router(document.router)
 app.include_router(outline.router)
 app.include_router(content.router)
-app.include_router(expand.router)
 app.include_router(projects.router)
 app.include_router(history_cases.router)
 
 if search is not None:
     app.include_router(search.router)
+
+if expand is not None:
+    app.include_router(expand.router)
 
 FileService.GENERATED_ASSET_DIR.mkdir(parents=True, exist_ok=True)
 app.mount(
@@ -66,17 +84,35 @@ async def health_check():
     return {
         "status": "healthy",
         "app_name": settings.app_name,
-        "version": settings.app_version
+        "version": settings.app_version,
+        "model_runtime": ModelRuntimeMonitor.snapshot(),
     }
 
-# 静态文件服务（用于服务前端构建文件）
-if os.path.exists("static"):
+def _frontend_static_dir() -> Path | None:
+    configured = os.getenv("YIBIAO_FRONTEND_STATIC_DIR", "").strip()
+    candidates = [Path(configured)] if configured else []
+    candidates.extend([
+        Path("static"),
+        Path(__file__).resolve().parents[2] / "artifacts" / "build" / "backend-static",
+    ])
+    for candidate in candidates:
+        if candidate and (candidate / "index.html").exists():
+            return candidate
+    return None
+
+
+FRONTEND_STATIC_DIR = _frontend_static_dir()
+
+# 静态文件服务（用于服务前端构建文件，默认作为 artifact 而非源码主路径）
+if FRONTEND_STATIC_DIR:
     # 挂载静态资源文件夹
-    app.mount("/static", StaticFiles(directory="static/static"), name="static")
+    static_assets_dir = FRONTEND_STATIC_DIR / "static"
+    if static_assets_dir.exists():
+        app.mount("/static", StaticFiles(directory=str(static_assets_dir)), name="static")
 
     def frontend_index_response() -> FileResponse:
         """返回前端入口页，并显式禁止浏览器缓存 HTML 入口"""
-        return FileResponse("static/index.html", headers=HTML_NO_CACHE_HEADERS)
+        return FileResponse(str(FRONTEND_STATIC_DIR / "index.html"), headers=HTML_NO_CACHE_HEADERS)
     
     # 处理React应用的路由（SPA路由支持）
     @app.get("/")
@@ -94,9 +130,9 @@ if os.path.exists("static"):
             raise HTTPException(status_code=404, detail="API endpoint not found")
         
         # 检查是否是静态文件
-        static_file_path = os.path.join("static", full_path)
-        if os.path.exists(static_file_path) and os.path.isfile(static_file_path):
-            return FileResponse(static_file_path)
+        static_file_path = FRONTEND_STATIC_DIR / full_path
+        if static_file_path.exists() and static_file_path.is_file():
+            return FileResponse(str(static_file_path))
         
         # 对于其他所有路径，返回React应用的index.html（SPA路由）
         return frontend_index_response()

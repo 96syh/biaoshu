@@ -25,6 +25,7 @@ jest.mock('./services/api', () => {
       saveConfig: () => Promise.resolve({ data: { success: true, message: 'ok' } }),
       getModels: () => Promise.resolve({ data: { success: true, models: [], message: 'ok' } }),
       verifyProvider: () => Promise.resolve({ data: { success: false, message: '', checks: [] } }),
+      getModelRuntime: () => Promise.resolve({ data: { success: true, active: false, active_count: 0, active_requests: [], last_event: {} } }),
     },
     projectApi: {
       listProjects: () => Promise.resolve(emptyProjectResponse),

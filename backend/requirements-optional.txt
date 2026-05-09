@@ -1,0 +1,10 @@
+# Optional search / MCP / browser extraction capabilities.
+# Install only when enabling ENABLE_SEARCH_ROUTER or running backend/optional/mcp.
+duckduckgo-search==8.1.1
+beautifulsoup4==4.12.3
+requests==2.32.3
+playwright==1.51.0
+seleniumbase==4.33.3
+undetected-chromedriver==3.5.5
+mcp==1.13.1
+asyncio-throttle==1.0.2

@@ -152,6 +152,15 @@ async def match_reference_case(request: ReferenceMatchRequest):
                 candidates,
             )
             selected = next((item for item in candidates if item.get("project_id") == selected_id), selected)
+            guarded_selected, guard_reason = HistoryCaseService.validate_reference_selection(
+                selected,
+                candidates,
+                request.file_content,
+                request.analysis_report,
+            )
+            if guard_reason:
+                selected = guarded_selected
+                llm_reason = f"{llm_reason}；{guard_reason}" if llm_reason else guard_reason
         except Exception as exc:
             llm_reason = f"LLM 选择失败，已使用规则得分最高候选：{str(exc)}"
 
@@ -223,7 +232,8 @@ async def _select_reference_candidate_with_llm(
 2. 项目对象最接近，例如油库、加油站、LNG、管道、化工装置、电力新能源等；
 3. 服务类型最接近，例如设计、勘察、可研、初设、消防专篇、框架服务；
 4. 优先选择中标案例，但不要为了中标牺牲领域匹配；
-5. 只从候选中选择，禁止编造。
+5. 如果当前项目是油库/加油站/销售公司工程设计服务，不要选择只有油管、管道、管线迁改对象的案例，除非候选同时覆盖油库/加油站；
+6. 只从候选中选择，禁止编造。
 
 只返回 JSON：{"selected_project_id":"...","reason":"...","confidence":0.0}"""
     user_prompt = f"""当前招标文件摘要：

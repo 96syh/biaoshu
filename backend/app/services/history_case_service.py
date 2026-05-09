@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -11,7 +12,15 @@ from typing import Any, Dict, List
 class HistoryCaseService:
     """Read-only access to the generated historical bid case library."""
 
-    DB_PATH = Path(__file__).resolve().parents[2] / "data" / "history_cases.sqlite3"
+    REPO_ROOT = Path(__file__).resolve().parents[3]
+    HISTORY_ARTIFACT_ROOT = REPO_ROOT / "artifacts" / "data" / "history_cases"
+    LEGACY_HISTORY_ARTIFACT_ROOT = REPO_ROOT / "backend" / "data" / "history_cases"
+    DB_PATH = Path(
+        os.getenv(
+            "YIBIAO_HISTORY_CASE_DB_PATH",
+            str(REPO_ROOT / "artifacts" / "data" / "history_cases.sqlite3"),
+        )
+    )
     MATCH_HINTS = [
         "石油", "中石油", "中石化", "油库", "加油站", "加能站", "油罐",
         "燃气", "天然气", "LNG", "CNG", "加气", "气化",
@@ -29,12 +38,59 @@ class HistoryCaseService:
         "压力管道", "特种设备", "工程设计", "工程咨询", "化工石化医药",
         "石油化工", "市政公用", "消防", "勘察", "可研", "初设", "施工图",
     ]
+    OBJECT_GROUPS = {
+        "oil_depot_station": ("油库", "加油站", "加能站", "油罐", "服务区", "销售公司"),
+        "pipeline": ("管道", "管线", "输油", "输气", "油管", "迁改", "增压"),
+        "gas_lng": ("燃气", "天然气", "LNG", "CNG", "加气"),
+        "chemical": ("化工", "煤化工", "炼化", "合成氨", "硝酸", "纯苯"),
+        "new_energy": ("光伏", "新能源", "充电", "储能", "电力"),
+        "hydrogen": ("氢", "制氢", "加氢", "输氢"),
+    }
+    SERVICE_GROUPS = {
+        "design": ("工程设计", "设计服务", "设计商", "施工图", "初步设计", "初设"),
+        "feasibility": ("可研", "可行性研究"),
+        "survey": ("勘察", "测绘"),
+        "consulting": ("咨询", "评估", "造价"),
+    }
 
     @classmethod
     def _connect(cls) -> sqlite3.Connection:
         conn = sqlite3.connect(str(cls.DB_PATH))
         conn.row_factory = sqlite3.Row
         return conn
+
+    @classmethod
+    def _resolve_history_artifact_path(cls, raw_path: str) -> Path:
+        """Resolve persisted history artifact paths across data directory moves."""
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            return Path()
+
+        original = Path(path_text)
+        candidates = [original]
+        marker_roots = (
+            ("backend/data/history_cases/", cls.HISTORY_ARTIFACT_ROOT),
+            ("artifacts/data/history_cases/", cls.HISTORY_ARTIFACT_ROOT),
+        )
+        for marker, target_root in marker_roots:
+            if marker in path_text:
+                suffix = path_text.split(marker, 1)[1]
+                candidates.append(target_root / suffix)
+
+        try:
+            candidates.append(cls.HISTORY_ARTIFACT_ROOT / original.relative_to(cls.LEGACY_HISTORY_ARTIFACT_ROOT))
+        except ValueError:
+            pass
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return original
+
+    @classmethod
+    def _normalize_artifact_path_for_response(cls, raw_path: Any) -> str:
+        resolved = cls._resolve_history_artifact_path(str(raw_path or ""))
+        return str(resolved) if str(resolved) else ""
 
     @classmethod
     def summary(cls) -> Dict[str, Any]:
@@ -336,13 +392,17 @@ class HistoryCaseService:
                 "best_document_id": row.get("document_id", ""),
                 "best_file_name": row.get("file_name", ""),
                 "best_document_path": row.get("document_path", ""),
-                "markdown_path": row.get("markdown_path", ""),
-                "pageindex_tree_path": row.get("pageindex_tree_path", ""),
+                "markdown_path": cls._normalize_artifact_path_for_response(row.get("markdown_path", "")),
+                "pageindex_tree_path": cls._normalize_artifact_path_for_response(row.get("pageindex_tree_path", "")),
                 "snippet": row.get("snippet", ""),
                 "score": 0.0,
                 "match_reasons": [],
+                "_scored_hit_keys": set(),
             })
-            record["score"] = float(record["score"]) + score
+            scored_hit_keys = record.setdefault("_scored_hit_keys", set())
+            if reason not in scored_hit_keys:
+                record["score"] = float(record["score"]) + score
+                scored_hit_keys.add(reason)
             if reason not in record["match_reasons"]:
                 record["match_reasons"].append(reason)
             if row.get("snippet") and len(str(row.get("snippet"))) > len(str(record.get("snippet") or "")):
@@ -350,8 +410,8 @@ class HistoryCaseService:
                 record["best_document_id"] = row.get("document_id", "")
                 record["best_file_name"] = row.get("file_name", "")
                 record["best_document_path"] = row.get("document_path", "")
-                record["markdown_path"] = row.get("markdown_path", "")
-                record["pageindex_tree_path"] = row.get("pageindex_tree_path", "")
+                record["markdown_path"] = cls._normalize_artifact_path_for_response(row.get("markdown_path", ""))
+                record["pageindex_tree_path"] = cls._normalize_artifact_path_for_response(row.get("pageindex_tree_path", ""))
 
         for index, term in enumerate(query_terms[:10]):
             for row in cls.search(term, limit=12):
@@ -394,15 +454,53 @@ class HistoryCaseService:
                 for row in rows:
                     add_result(dict(row), 3.0, f"元数据命中：{term}")
 
+        cls._apply_reference_match_rerank(project_scores.values(), query_text)
         candidates = sorted(project_scores.values(), key=lambda item: (-float(item["score"]), item["year"], item["batch"]))[:limit]
         for index, item in enumerate(candidates, 1):
             item["rank"] = index
             item["score"] = round(float(item["score"]), 2)
+            item.pop("_scored_hit_keys", None)
         return candidates
 
     @classmethod
+    def validate_reference_selection(
+        cls,
+        selected: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+        tender_text: str,
+        analysis_report: Dict[str, Any] | None = None,
+    ) -> tuple[Dict[str, Any], str]:
+        """防止 LLM 为了“中标”选择领域明显错配的历史案例。"""
+        if not selected or not candidates:
+            return selected, ""
+        best = candidates[0]
+        if selected.get("project_id") == best.get("project_id"):
+            return selected, ""
+
+        query_text = cls._build_match_query_text(tender_text, analysis_report or {})
+        query_groups = cls._object_groups(query_text)
+        selected_groups = cls._object_groups(cls._candidate_match_text(selected))
+        best_groups = cls._object_groups(cls._candidate_match_text(best))
+        selected_score = float(selected.get("score") or 0)
+        best_score = float(best.get("score") or 0)
+
+        # 典型误选：当前是油库/加油站设计框架，LLM 选了中标的油管/管道迁改。
+        if (
+            "oil_depot_station" in query_groups
+            and "oil_depot_station" not in selected_groups
+            and "pipeline" in selected_groups
+            and "oil_depot_station" in best_groups
+        ):
+            return best, "LLM 选择被规则纠偏：当前项目核心对象是油库/加油站，候选为油管/管道迁改，领域对象不匹配。"
+
+        if query_groups and not (query_groups & selected_groups) and (query_groups & best_groups) and selected_score < best_score + 8:
+            return best, "LLM 选择被规则纠偏：所选案例缺少当前项目核心对象命中，已使用规则得分最高且对象匹配的案例。"
+
+        return selected, ""
+
+    @classmethod
     def load_markdown(cls, markdown_path: str, max_chars: int = 60000) -> str:
-        path = Path(markdown_path)
+        path = cls._resolve_history_artifact_path(markdown_path)
         if not path.exists() or not path.is_file():
             return ""
         return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
@@ -511,7 +609,122 @@ class HistoryCaseService:
                     "requirement": requirement or query_text,
                     "query_text": query_text,
                 })
-        return items[:80]
+
+        cls._append_parse_section_check_items(items, seen_ids, analysis_report)
+        return items[:120]
+
+    @classmethod
+    def _append_parse_section_check_items(
+        cls,
+        items: list[dict[str, Any]],
+        seen_ids: set[str],
+        analysis_report: Dict[str, Any],
+    ) -> None:
+        """补充前端解析页分组项，让历史库核对结果能直接映射到左侧选项。"""
+        project = analysis_report.get("project") if isinstance(analysis_report.get("project"), dict) else {}
+        bid_doc = analysis_report.get("bid_document_requirements") if isinstance(analysis_report.get("bid_document_requirements"), dict) else {}
+        selected_target = bid_doc.get("selected_generation_target") if isinstance(bid_doc.get("selected_generation_target"), dict) else {}
+        base_outline = cls._as_dict_items(selected_target.get("base_outline_items"))
+        scheme_outline = cls._as_dict_items(bid_doc.get("scheme_or_technical_outline_requirements"))
+        composition = cls._as_dict_items(bid_doc.get("composition"))
+        fixed_forms = cls._as_dict_items(analysis_report.get("fixed_format_forms"))
+        all_requirement_items = (
+            cls._as_dict_items(analysis_report.get("qualification_requirements"))
+            + cls._as_dict_items(analysis_report.get("qualification_review_items"))
+            + cls._as_dict_items(analysis_report.get("formal_review_items"))
+            + cls._as_dict_items(analysis_report.get("responsiveness_review_items"))
+            + cls._as_dict_items(analysis_report.get("formal_response_requirements"))
+            + cls._as_dict_items(analysis_report.get("mandatory_clauses"))
+            + cls._as_dict_items(analysis_report.get("rejection_risks"))
+            + cls._as_dict_items(analysis_report.get("required_materials"))
+            + fixed_forms
+            + cls._as_dict_items(analysis_report.get("signature_requirements"))
+            + cls._as_dict_items(analysis_report.get("evidence_chain_requirements"))
+        )
+
+        def add(item_id: str, category: str, category_label: str, label: str, parts: list[Any]) -> None:
+            if item_id in seen_ids:
+                return
+            query_text = "；".join(
+                cls._text(part)
+                for part in parts
+                if cls._text(part)
+            )
+            if not query_text.strip():
+                return
+            seen_ids.add(item_id)
+            items.append({
+                "item_id": item_id,
+                "category": category,
+                "category_label": category_label,
+                "label": label,
+                "score": "",
+                "requirement": query_text,
+                "query_text": f"{label}；{query_text}",
+            })
+
+        def item_text(records: list[dict[str, Any]], keywords: tuple[str, ...] = ()) -> str:
+            texts: list[str] = []
+            for record in records:
+                text = "；".join(
+                    cls._text(record.get(key))
+                    for key in (
+                        "title", "name", "review_type", "target", "requirement",
+                        "standard", "criterion", "logic", "risk", "clause",
+                        "source", "source_ref", "purpose", "requirement_summary",
+                    )
+                    if cls._text(record.get(key))
+                )
+                if not keywords or any(keyword in text for keyword in keywords):
+                    texts.append(text)
+            return "；".join(texts[:8])
+
+        project_parts = [
+            project.get("name"),
+            project.get("number"),
+            project.get("purchaser"),
+            project.get("agency"),
+            project.get("service_scope"),
+            project.get("service_period"),
+            project.get("quality_requirements"),
+            project.get("submission_requirements"),
+            project.get("signature_requirements"),
+        ]
+        add("basic-owner", "parse_section", "基础信息", "招标人/代理信息", [project.get("purchaser"), project.get("agency"), project.get("name")])
+        add("basic-project", "parse_section", "基础信息", "项目信息", [project.get("name"), project.get("number"), project.get("project_type"), project.get("budget"), project.get("maximum_price")])
+        add("basic-time", "parse_section", "基础信息", "关键时间/内容", [project.get("bid_deadline"), project.get("opening_time"), project.get("service_period"), project.get("service_scope")])
+        add("basic-bond", "parse_section", "基础信息", "保证金相关", [project.get("bid_bond"), project.get("performance_bond")])
+        add("basic-other", "parse_section", "基础信息", "其他信息", [project.get("service_location"), project.get("quality_requirements"), project.get("bid_validity"), project.get("submission_method")])
+
+        add("qualification-review", "parse_section", "资格审查", "资格评审", [item_text(all_requirement_items, ("资格", "资质", "业绩", "人员", "信誉", "财务", "联合体"))])
+        add("qualification-formal", "parse_section", "资格审查", "形式评审标准", [item_text(cls._as_dict_items(analysis_report.get("formal_review_items")))])
+        add("qualification-responsive", "parse_section", "资格审查", "响应性评审标准", [item_text(cls._as_dict_items(analysis_report.get("responsiveness_review_items")) + cls._as_dict_items(analysis_report.get("formal_response_requirements")) + cls._as_dict_items(analysis_report.get("mandatory_clauses")))])
+
+        add("document-composition", "parse_section", "投标文件要求", "投标文件组成", [item_text(composition)])
+        add("document-price", "parse_section", "投标文件要求", "投标报价要求", [
+            item_text(cls._as_dict_items([analysis_report.get("price_rules")]) if isinstance(analysis_report.get("price_rules"), dict) else []),
+        ])
+        add("document-submit", "parse_section", "投标文件要求", "投标文件递交方式", [project.get("submission_method"), project.get("submission_requirements"), project.get("electronic_platform"), project.get("signature_requirements")])
+        add("document-scheme", "parse_section", "投标文件要求", "方案要求", [selected_target.get("target_title"), selected_target.get("base_outline_strategy"), item_text(base_outline + scheme_outline), item_text(fixed_forms)])
+
+        add("process-opening", "parse_section", "开评定标流程", "开标", [project.get("opening_time"), project.get("bid_deadline"), project.get("electronic_platform"), item_text(all_requirement_items, ("开标", "解密", "签到", "开标大厅"))])
+        add("process-review", "parse_section", "开评定标流程", "评标", [item_text(all_requirement_items, ("评标", "评审", "澄清", "修正"))])
+        add("process-award", "parse_section", "开评定标流程", "定标", [item_text(all_requirement_items, ("定标", "中标", "推荐中标", "候选人"))])
+        add("process-followup", "parse_section", "开评定标流程", "后续要求", [item_text(all_requirement_items, ("合同", "履约", "服务费", "通知书", "公示", "质疑"))])
+
+        add("supplement-tech-spec", "parse_section", "补充信息归纳", "技术规格", [
+            project.get("service_scope"),
+            project.get("quality_requirements"),
+            item_text(cls._as_dict_items(analysis_report.get("technical_scoring_items")) + scheme_outline, ("技术", "规格", "服务", "设计", "方案")),
+        ])
+        add("supplement-contract-time", "parse_section", "补充信息归纳", "合同时间", [project.get("service_period")])
+        add("supplement-background", "parse_section", "补充信息归纳", "项目背景", [project.get("name"), project.get("project_type"), project.get("funding_source")])
+        add("supplement-format", "parse_section", "补充信息归纳", "方案与格式要求", [selected_target.get("target_title"), item_text(base_outline + scheme_outline)])
+        add("supplement-special", "parse_section", "补充信息归纳", "其他特殊要求", [item_text(all_requirement_items, ("特殊", "必须", "不得", "承诺", "偏离", "暗标"))])
+        add("supplement-sample", "parse_section", "补充信息归纳", "样品要求", [item_text(all_requirement_items, ("样品", "样本", "演示"))])
+        add("supplement-payment", "parse_section", "补充信息归纳", "付款方式", [item_text(all_requirement_items, ("付款", "支付", "价款", "结算"))])
+        add("supplement-share", "parse_section", "补充信息归纳", "中标份额分配规则", [item_text(all_requirement_items, ("份额", "分配", "中标份额"))])
+        add("supplement-count", "parse_section", "补充信息归纳", "中标数量规则", [item_text(all_requirement_items, ("中标数量", "入围", "候选人数量", "标包数量"))])
 
     @classmethod
     def _check_single_requirement(cls, item: Dict[str, Any], limit_per_item: int) -> Dict[str, Any]:
@@ -654,33 +867,158 @@ class HistoryCaseService:
         parts = [tender_text[:12000]]
         project = analysis_report.get("project") if isinstance(analysis_report, dict) else None
         if isinstance(project, dict):
-            parts.extend(str(project.get(key) or "") for key in ("name", "number", "owner", "location", "scope"))
-        selected = analysis_report.get("selected_generation_target") if isinstance(analysis_report, dict) else None
+            parts.extend(
+                str(project.get(key) or "")
+                for key in (
+                    "name",
+                    "number",
+                    "owner",
+                    "purchaser",
+                    "location",
+                    "service_location",
+                    "scope",
+                    "service_scope",
+                    "project_type",
+                )
+            )
+        bid_doc = analysis_report.get("bid_document_requirements") if isinstance(analysis_report, dict) else None
+        selected = bid_doc.get("selected_generation_target") if isinstance(bid_doc, dict) else None
         if isinstance(selected, dict):
             parts.extend(str(selected.get(key) or "") for key in ("target_title", "reason", "source"))
-        for key in ("technical_score_items", "service_requirements", "scheme_or_technical_outline_requirements"):
+        for key in ("technical_scoring_items", "technical_score_items", "service_requirements"):
             value = analysis_report.get(key) if isinstance(analysis_report, dict) else None
             if value:
                 parts.append(json.dumps(value, ensure_ascii=False)[:4000])
+        if isinstance(bid_doc, dict):
+            for key in ("scheme_or_technical_outline_requirements", "composition"):
+                value = bid_doc.get(key)
+                if value:
+                    parts.append(json.dumps(value, ensure_ascii=False)[:4000])
         return "\n".join(part for part in parts if part)
 
     @classmethod
     def _extract_match_terms(cls, text: str) -> List[str]:
         terms: list[str] = []
         normalized = text or ""
-        for hint in cls.MATCH_HINTS:
-            if hint and hint in normalized and hint not in terms:
-                terms.append(hint)
-        title_candidates = re.findall(r"[\u4e00-\u9fffA-Za-z0-9（）()、\-]{4,38}(?:项目|工程|服务|采购|设计|可研|初设|专篇|框架)", normalized)
-        for term in title_candidates[:8]:
-            cleaned = term.strip("：:，,。；; ")
+
+        def add(term: str) -> None:
+            cleaned = re.sub(r"\s+", " ", str(term or "")).strip("：:，,。；; ")
             if cleaned and cleaned not in terms:
                 terms.append(cleaned)
+
+        title_candidates = re.findall(r"[\u4e00-\u9fffA-Za-z0-9（）()、\-]{4,38}(?:项目|工程|服务|采购|设计|可研|初设|专篇|框架)", normalized)
+        for term in title_candidates[:8]:
+            add(term)
+
+        object_keywords = [
+            keyword
+            for keywords in cls.OBJECT_GROUPS.values()
+            for keyword in keywords
+            if keyword in normalized
+        ]
+        service_keywords = [
+            keyword
+            for keywords in cls.SERVICE_GROUPS.values()
+            for keyword in keywords
+            if keyword in normalized
+        ]
+        for object_keyword in object_keywords[:4]:
+            for service_keyword in service_keywords[:3]:
+                add(f"{object_keyword} {service_keyword}")
+
+        for hint in cls.MATCH_HINTS:
+            if hint and hint in normalized:
+                add(hint)
+
         if not terms:
             compact = re.sub(r"\s+", "", normalized)
             if compact:
-                terms.append(compact[:24])
+                add(compact[:24])
         return terms[:14]
+
+    @classmethod
+    def _object_groups(cls, text: str) -> set[str]:
+        normalized = str(text or "")
+        return {
+            group
+            for group, keywords in cls.OBJECT_GROUPS.items()
+            if any(keyword in normalized for keyword in keywords)
+        }
+
+    @classmethod
+    def _service_groups(cls, text: str) -> set[str]:
+        normalized = str(text or "")
+        return {
+            group
+            for group, keywords in cls.SERVICE_GROUPS.items()
+            if any(keyword in normalized for keyword in keywords)
+        }
+
+    @staticmethod
+    def _candidate_match_text(candidate: Dict[str, Any]) -> str:
+        return " ".join(
+            str(candidate.get(key) or "")
+            for key in (
+                "project_title",
+                "subject",
+                "primary_domain",
+                "primary_subdomain",
+                "domain_keywords",
+                "best_file_name",
+                "snippet",
+            )
+        )
+
+    @classmethod
+    def _apply_reference_match_rerank(cls, candidates: Any, query_text: str) -> None:
+        query_groups = cls._object_groups(query_text)
+        query_services = cls._service_groups(query_text)
+        query_has_cnpc = bool(re.search(r"中国石油|中石油|CNPC", query_text, flags=re.IGNORECASE))
+
+        for item in candidates:
+            candidate_text = cls._candidate_match_text(item)
+            candidate_groups = cls._object_groups(candidate_text)
+            candidate_services = cls._service_groups(candidate_text)
+            common_groups = query_groups & candidate_groups
+            common_services = query_services & candidate_services
+            adjustment = 0.0
+
+            if common_groups:
+                adjustment += 18.0 * len(common_groups)
+                item["match_reasons"].append(f"核心对象匹配：{'、'.join(sorted(common_groups))}")
+
+            if common_services:
+                adjustment += 14.0 * len(common_services)
+                item["match_reasons"].append(f"服务类型匹配：{'、'.join(sorted(common_services))}")
+
+            if "design" in query_services and "design" not in candidate_services:
+                adjustment -= 8.0
+                item["match_reasons"].append("服务类型降权：当前为工程设计服务，候选缺少设计服务特征")
+                if "feasibility" in candidate_services:
+                    adjustment -= 12.0
+                    item["match_reasons"].append("服务类型降权：候选偏可研编制")
+
+            if "oil_depot_station" in query_groups:
+                if "oil_depot_station" in candidate_groups:
+                    adjustment += 24.0
+                    item["match_reasons"].append("油库/加油站对象匹配")
+                elif "pipeline" in candidate_groups:
+                    adjustment -= 32.0
+                    item["match_reasons"].append("对象降权：当前为油库/加油站，候选偏油管/管道迁改")
+
+            if query_has_cnpc and re.search(r"中国石油|中石油|CNPC", candidate_text, flags=re.IGNORECASE):
+                adjustment += 10.0
+                item["match_reasons"].append("业主体系匹配：中国石油")
+
+            result = str(item.get("result") or "")
+            if "中标" in result and "未中" not in result:
+                if common_groups:
+                    adjustment += 6.0
+                    item["match_reasons"].append("中标案例加权")
+                else:
+                    adjustment += 1.0
+
+            item["score"] = float(item.get("score") or 0) + adjustment
 
     @staticmethod
     def _make_snippet(query: str, body: str, fallback: str = "") -> str:

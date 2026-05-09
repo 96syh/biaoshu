@@ -8,7 +8,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 import logging
 
-from ..services.search_service import search_service
+from .search_service import search_service
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ async def search_documents(request: SearchRequest):
         
         # 创建临时搜索服务实例（如果参数与默认不同）
         if request.max_results != 5 or request.safe_search != "moderate" or request.region != "cn":
-            from ..services.search_service import SearchService
+            from .search_service import SearchService
             temp_service = SearchService(
                 max_results=request.max_results,
                 safe_search=request.safe_search,
@@ -138,7 +138,7 @@ async def search_formatted(request: SearchRequest):
         
         # 创建临时搜索服务实例（如果参数与默认不同）
         if request.max_results != 5 or request.safe_search != "moderate" or request.region != "cn":
-            from ..services.search_service import SearchService
+            from .search_service import SearchService
             temp_service = SearchService(
                 max_results=request.max_results,
                 safe_search=request.safe_search,

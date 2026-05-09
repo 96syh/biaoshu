@@ -47,15 +47,42 @@ class FileService:
     # 图片上传配置
     IMAGE_UPLOAD_URL = "https://mt.agnet.top/image/upload"
     IMAGE_UPLOAD_TIMEOUT = 30  # 超时时间（秒）
-    GENERATED_ASSET_DIR = Path(__file__).resolve().parents[2] / "data" / "generated_assets"
+    GENERATED_ASSET_DIR = Path(
+        os.getenv(
+            "YIBIAO_GENERATED_ASSET_DIR",
+            str(Path(__file__).resolve().parents[3] / "artifacts" / "data" / "generated_assets"),
+        )
+    )
     GENERATED_ASSET_URL_PREFIX = "/generated-assets"
+
+    @staticmethod
+    def _env_enabled(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+    @staticmethod
+    def extracted_image_uploads_enabled() -> bool:
+        """是否在文本解析阶段提取图片并上传到外部图床，默认关闭以避免慢上传。"""
+        return FileService._env_enabled("YIBIAO_UPLOAD_EXTRACTED_IMAGES", False)
+
+    @staticmethod
+    def source_preview_pages_enabled() -> bool:
+        """是否把 DOCX 额外渲染成页图预览，默认关闭以避免 LibreOffice 渲染拖慢上传。"""
+        return FileService._env_enabled("YIBIAO_ENABLE_SOURCE_PREVIEW_PAGES", False)
+
+    @staticmethod
+    def docx_html_preview_enabled() -> bool:
+        """是否生成 DOCX 样式化 HTML 预览，默认关闭，优先保证上传解析速度。"""
+        return FileService._env_enabled("YIBIAO_ENABLE_DOCX_HTML_PREVIEW", False)
 
     @staticmethod
     def get_parser_mode() -> str:
         """文档解析器选择：auto / mineru / mineru_strict / legacy。"""
-        mode = os.getenv("YIBIAO_DOCUMENT_PARSER", "mineru_strict").strip().lower()
+        mode = os.getenv("YIBIAO_DOCUMENT_PARSER", "legacy").strip().lower()
         if mode not in {"auto", "mineru", "mineru_strict", "legacy"}:
-            return "mineru_strict"
+            return "legacy"
         return mode
 
     @staticmethod
@@ -388,6 +415,157 @@ class FileService:
         return f'<div class="docx-source-preview"{page_style}>{"".join(body_html)}</div>'
 
     @staticmethod
+    def _office_converter_command() -> str:
+        candidates = [
+            os.getenv("YIBIAO_SOFFICE_BIN", "").strip(),
+            shutil.which("soffice") or "",
+            shutil.which("libreoffice") or "",
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        ]
+        return next((candidate for candidate in candidates if candidate and os.path.exists(candidate)), "")
+
+    @staticmethod
+    def _pdf_renderer_command() -> str:
+        candidates = [
+            os.getenv("YIBIAO_PDFTOPPM_BIN", "").strip(),
+            shutil.which("pdftoppm") or "",
+        ]
+        return next((candidate for candidate in candidates if candidate and os.path.exists(candidate)), "")
+
+    @staticmethod
+    def _pdf_text_blocks(pdf_path: Path) -> Dict[int, Dict[str, Any]]:
+        if not HAS_ADVANCED_LIBS:
+            return {}
+        pages: Dict[int, Dict[str, Any]] = {}
+        try:
+            document = fitz.open(str(pdf_path))
+            for page_index, page in enumerate(document, start=1):
+                rect = page.rect
+                blocks = []
+                for block_index, block in enumerate(page.get_text("blocks")):
+                    if len(block) < 5:
+                        continue
+                    x0, y0, x1, y1, text = block[:5]
+                    text = re.sub(r"\s+", " ", str(text or "")).strip()
+                    if not text:
+                        continue
+                    blocks.append({
+                        "id": f"p{page_index}-b{block_index}",
+                        "text": text,
+                        "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                    })
+                pages[page_index] = {
+                    "width": float(rect.width),
+                    "height": float(rect.height),
+                    "text_blocks": blocks,
+                }
+            document.close()
+        except Exception as exc:
+            print(f"PDF 文本块抽取失败: {exc}")
+        return pages
+
+    @staticmethod
+    def build_office_source_preview_pages(file_path: str, file_kind: str) -> List[Dict[str, Any]]:
+        """将上传源文件渲染为 Office/PDF 页面图片，并附带文本块坐标用于前端定位。"""
+        if file_kind != "docx":
+            return []
+
+        soffice_bin = FileService._office_converter_command()
+        pdftoppm_bin = FileService._pdf_renderer_command()
+        if not soffice_bin or not pdftoppm_bin:
+            return []
+
+        max_pages = int(os.getenv("YIBIAO_SOURCE_PREVIEW_MAX_PAGES", "20"))
+        if max_pages <= 0:
+            return []
+        dpi = int(os.getenv("YIBIAO_SOURCE_PREVIEW_DPI", "120"))
+        timeout = int(os.getenv("YIBIAO_SOURCE_PREVIEW_TIMEOUT", "180"))
+        source = Path(file_path)
+        FileService.GENERATED_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix="yibiao-office-preview-") as temp_dir:
+            temp_path = Path(temp_dir)
+            pdf_dir = temp_path / "pdf"
+            png_dir = temp_path / "pages"
+            profile_dir = temp_path / "lo-profile"
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            png_dir.mkdir(parents=True, exist_ok=True)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+
+            convert_command = [
+                soffice_bin,
+                "--headless",
+                "--invisible",
+                "--nodefault",
+                "--nofirststartwizard",
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(pdf_dir),
+                str(source),
+            ]
+            proc = subprocess.run(
+                convert_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"Office 渲染 PDF 失败: {(proc.stderr or proc.stdout)[-800:]}")
+
+            pdf_files = sorted(pdf_dir.glob("*.pdf"))
+            if not pdf_files:
+                raise RuntimeError("Office 渲染未生成 PDF")
+            pdf_path = pdf_files[0]
+            text_page_map = FileService._pdf_text_blocks(pdf_path)
+
+            output_prefix = png_dir / "page"
+            render_command = [
+                pdftoppm_bin,
+                "-png",
+                "-r",
+                str(dpi),
+                "-f",
+                "1",
+                "-l",
+                str(max_pages),
+                str(pdf_path),
+                str(output_prefix),
+            ]
+            proc = subprocess.run(
+                render_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"PDF 页图渲染失败: {(proc.stderr or proc.stdout)[-800:]}")
+
+            def image_page_number(path: Path) -> int:
+                match = re.search(r"-(\d+)\.png$", path.name)
+                return int(match.group(1)) if match else 0
+
+            pages: List[Dict[str, Any]] = []
+            for index, image_path in enumerate(sorted(png_dir.glob("page-*.png"), key=image_page_number), start=1):
+                if index > max_pages:
+                    break
+                stored_name = f"source-page-{uuid.uuid4().hex[:12]}-{index:03d}.png"
+                target = FileService.GENERATED_ASSET_DIR / stored_name
+                shutil.copyfile(image_path, target)
+                page_info = text_page_map.get(index, {})
+                pages.append({
+                    "page_number": index,
+                    "image_url": f"{FileService.GENERATED_ASSET_URL_PREFIX}/{stored_name}",
+                    "width": page_info.get("width") or 595.0,
+                    "height": page_info.get("height") or 842.0,
+                    "text_blocks": page_info.get("text_blocks") or [],
+                })
+            return pages
+
+    @staticmethod
     def _safe_file_cleanup(file_path: str, max_retries: int = 3) -> bool:
         """安全删除文件，带重试机制"""
         for attempt in range(max_retries):
@@ -446,8 +624,8 @@ class FileService:
             image_references = []  # 存储图片引用映射
             global_img_counter = 1
 
-            # 获取PDF文档的所有图片信息，用于后续匹配
-            all_images = FileService.extract_images_from_pdf(file_path)
+            # 图片提取和外传很慢，默认关闭；需要图片引用时再通过环境变量启用。
+            all_images = FileService.extract_images_from_pdf(file_path) if FileService.extracted_image_uploads_enabled() else []
             page_images_map = {}
             for img_data, ext, page_num, img_index in all_images:
                 if page_num not in page_images_map:
@@ -778,8 +956,8 @@ class FileService:
             image_references = []  # 存储图片引用映射
             global_img_counter = 1
 
-            # 获取Word文档的所有图片信息
-            all_images = FileService.extract_images_from_docx(file_path)
+            # 图片提取和外传很慢，默认关闭；需要图片引用时再通过环境变量启用。
+            all_images = FileService.extract_images_from_docx(file_path) if FileService.extracted_image_uploads_enabled() else []
 
             # 使用上下文管理器确保文件及时关闭，避免Windows上的锁定
             with docx2python(file_path) as content:
@@ -859,8 +1037,8 @@ class FileService:
             image_references = []  # 存储图片引用映射
             global_img_counter = 1
 
-            # 获取Word文档的所有图片信息
-            all_images = FileService.extract_images_from_docx(file_path)
+            # 图片提取和外传很慢，默认关闭；需要图片引用时再通过环境变量启用。
+            all_images = FileService.extract_images_from_docx(file_path) if FileService.extracted_image_uploads_enabled() else []
 
             # 提取段落文本，同时处理图片
             for paragraph in doc.paragraphs:
@@ -953,13 +1131,23 @@ class FileService:
             if not text.strip():
                 raise Exception("无法从文件中提取文本内容")
             source_preview_html = ""
+            source_preview_pages: List[Dict[str, Any]] = []
             if file_kind == "docx":
-                try:
-                    source_preview_html = FileService.build_docx_source_preview_html(file_path)
-                except Exception as preview_error:
-                    print(f"DOCX 样式预览生成失败: {preview_error}")
+                if FileService.source_preview_pages_enabled():
+                    try:
+                        source_preview_pages = FileService.build_office_source_preview_pages(file_path, file_kind)
+                    except Exception as preview_error:
+                        print(f"DOCX Office 页图预览生成失败: {preview_error}")
+                if FileService.docx_html_preview_enabled():
+                    try:
+                        source_preview_html = FileService.build_docx_source_preview_html(file_path)
+                    except Exception as preview_error:
+                        print(f"DOCX 样式预览生成失败: {preview_error}")
             parser_info.setdefault("saved_file", os.path.basename(file_path))
             parser_info.setdefault("file_size", os.path.getsize(file_path))
+            if source_preview_pages:
+                parser_info.setdefault("source_preview_renderer", "libreoffice-pdftoppm")
+                parser_info.setdefault("source_preview_page_count", len(source_preview_pages))
 
             # 成功提取后，使用安全的文件清理方法
             FileService._safe_file_cleanup(file_path)
@@ -968,6 +1156,7 @@ class FileService:
                 "file_content": text,
                 "parser_info": parser_info,
                 "source_preview_html": source_preview_html,
+                "source_preview_pages": source_preview_pages,
             }
 
         except Exception as e:

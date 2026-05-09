@@ -3,7 +3,7 @@
 
 The script scans historical folders named like ``2024年招投标-技术1`` and imports
 all project folders under them. It stores structured metadata, full-text search
-content, and PageIndex-compatible tree JSON in ``backend/data``.
+content, and PageIndex-compatible tree JSON in ``artifacts/data``.
 """
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ import docx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HISTORY_ROOT = REPO_ROOT
-DEFAULT_DB_PATH = REPO_ROOT / "backend" / "data" / "history_cases.sqlite3"
-DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "backend" / "data" / "history_cases"
+DEFAULT_DB_PATH = REPO_ROOT / "artifacts" / "data" / "history_cases.sqlite3"
+DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "artifacts" / "data" / "history_cases"
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc"}
 RESULT_TAGS = ("中标", "未中", "流标", "废标", "放弃", "陪标", "待定", "延期")
 DOMAIN_RULES = [

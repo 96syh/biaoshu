@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -12,7 +13,12 @@ from typing import Any, Dict, List, Optional
 class ProjectService:
     """用 SQLite 保存项目草稿，替代浏览器缓存作为主存储。"""
 
-    DB_PATH = Path(__file__).resolve().parents[2] / "data" / "projects.sqlite3"
+    DB_PATH = Path(
+        os.getenv(
+            "YIBIAO_PROJECT_DB_PATH",
+            str(Path(__file__).resolve().parents[3] / "artifacts" / "data" / "projects.sqlite3"),
+        )
+    )
 
     @classmethod
     def _connect(cls) -> sqlite3.Connection:

@@ -85,6 +85,7 @@ async def upload_file(file: UploadFile = File(...)):
         file_content = parse_result.get("file_content", "")
         parser_info = parse_result.get("parser_info", {})
         source_preview_html = parse_result.get("source_preview_html") or ""
+        source_preview_pages = parse_result.get("source_preview_pages") or []
         parser_name = parser_info.get("parser") or "unknown"
         fallback_note = "（已降级到内置解析器）" if parser_info.get("fallback_used") else ""
         
@@ -93,6 +94,7 @@ async def upload_file(file: UploadFile = File(...)):
             message=f"文件 {file.filename} 上传成功，解析器：{parser_name}{fallback_note}，已在上传阶段转换为 {parser_info.get('format') or '文本'}",
             file_content=file_content,
             source_preview_html=source_preview_html,
+            source_preview_pages=source_preview_pages,
             parser_info=parser_info,
         )
         
@@ -268,7 +270,7 @@ async def analyze_report_stream(request: AnalysisReportRequest):
                 yield _analysis_stream_payload(
                     task_state,
                     0,
-                    "文件解析完成：MinerU Markdown 已进入标准解析队列",
+                    "文件解析完成：招标文本已进入标准解析队列",
                     12,
                 )
                 await wait_if_paused()
@@ -442,16 +444,6 @@ async def reference_style_upload(file: UploadFile = File(...)):
         parse_result = await FileService.process_uploaded_file_with_metadata(file)
         file_content = parse_result.get("file_content", "")
         parser_info = parse_result.get("parser_info", {})
-        if (
-            str(parser_info.get("parser") or "").lower() != "mineru"
-            or str(parser_info.get("format") or "").lower() != "markdown"
-        ):
-            return FileUploadResponse(
-                success=False,
-                message="成熟样例必须先通过 MinerU 转换为 Markdown 后再生成模板剖面；请检查 MinerU 配置或将 YIBIAO_DOCUMENT_PARSER 设置为 mineru_strict。",
-                parser_info=parser_info,
-            )
-
         config = config_manager.load_config()
         auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
         if auth_error:
@@ -473,7 +465,7 @@ async def reference_style_upload(file: UploadFile = File(...)):
                     slot["source_ref"] = asset.get("source_path")
         return FileUploadResponse(
             success=True,
-            message=f"样例文件 {file.filename} 已通过 MinerU Markdown 解析，并生成写作模板剖面",
+            message=f"样例文件 {file.filename} 已通过 {parser_info.get('parser') or '文档解析器'} 解析，并生成写作模板剖面",
             file_content=file_content,
             parser_info=parser_info,
             reference_bid_style_profile=profile,

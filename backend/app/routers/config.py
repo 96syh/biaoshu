@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException
 from ..models.schemas import ConfigRequest, ConfigResponse, ModelListResponse, ProviderVerifyResponse
 from ..services.openai_service import OpenAIService
+from ..services.model_runtime_monitor import ModelRuntimeMonitor
 from ..utils.config_manager import config_manager
 from ..utils.provider_registry import (
     DEFAULT_PROVIDER,
@@ -59,6 +60,15 @@ async def load_config():
         return config
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"加载配置时发生错误: {str(e)}")
+
+
+@router.get("/model-runtime", response_model=dict)
+async def get_model_runtime():
+    """返回当前模型调用运行状态，用于前端和启动脚本监听。"""
+    return {
+        "success": True,
+        **ModelRuntimeMonitor.snapshot(),
+    }
 
 
 @router.post("/models", response_model=ModelListResponse)

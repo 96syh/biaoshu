@@ -14,6 +14,7 @@ import type {
   OutlineData,
   OutlineItem,
   RequiredMaterial,
+  SourceRenderedPreviewPage,
   VisualAssetGenerationRequest,
   VisualAssetGenerationResponse,
 } from '../types';
@@ -49,10 +50,11 @@ const getDefaultApiBaseUrl = () => {
 };
 
 const API_BASE_URL = getDefaultApiBaseUrl();
+export const apiBaseUrl = API_BASE_URL;
 
 const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 120000, // 调整为60秒
+  timeout: 600000,
 });
 
 // 响应拦截器
@@ -77,6 +79,7 @@ export interface FileUploadResponse {
   message: string;
   file_content?: string;
   source_preview_html?: string;
+  source_preview_pages?: SourceRenderedPreviewPage[];
   old_outline?: string;
   parser_info?: Record<string, unknown>;
   reference_bid_style_profile?: Record<string, unknown>;
@@ -169,6 +172,28 @@ export interface ProviderVerifyResponse {
   checks: ProviderCheckItem[];
 }
 
+export interface ModelRuntimeEvent {
+  request_id?: string;
+  provider?: string;
+  model_name?: string;
+  api_mode?: string;
+  base_url?: string;
+  status?: 'idle' | 'connecting' | 'streaming' | 'success' | 'error' | string;
+  message?: string;
+  chunk_count?: number;
+  elapsed_ms?: number;
+  started_at?: string;
+  updated_at?: string;
+}
+
+export interface ModelRuntimeResponse {
+  success: boolean;
+  active: boolean;
+  active_count: number;
+  active_requests: ModelRuntimeEvent[];
+  last_event: ModelRuntimeEvent;
+}
+
 export interface ProjectRecordResponse {
   id: string;
   title: string;
@@ -258,6 +283,10 @@ export const configApi = {
   // 验证当前模型端点
   verifyProvider: (config: ConfigData) =>
     api.post<ProviderVerifyResponse>('/api/config/verify', config),
+
+  // 模型运行状态
+  getModelRuntime: () =>
+    api.get<ModelRuntimeResponse>('/api/config/model-runtime'),
 };
 
 // 项目数据库 API
@@ -295,6 +324,7 @@ export const documentApi = {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
+      timeout: 600000,
     });
   },
 
@@ -306,7 +336,7 @@ export const documentApi = {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
-      timeout: 300000,
+      timeout: 600000,
     });
   },
 
@@ -440,7 +470,7 @@ export const expandApi = {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
-      timeout: 300000, // 文件上传专用超时设置：5分钟
+      timeout: 600000,
     });
   },
 };

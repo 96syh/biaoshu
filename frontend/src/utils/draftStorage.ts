@@ -21,6 +21,7 @@ export type DraftState = Pick<
   | 'fileContent'
   | 'uploadedFileName'
   | 'sourcePreviewHtml'
+  | 'sourcePreviewPages'
   | 'parserInfo'
   | 'projectOverview'
   | 'techRequirements'
@@ -50,8 +51,8 @@ let pendingProjectId = '';
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let firstPendingSaveAt = 0;
 
-const DRAFT_SAVE_DEBOUNCE_MS = 1200;
-const DRAFT_SAVE_MAX_WAIT_MS = 5000;
+const DRAFT_SAVE_DEBOUNCE_MS = 3000;
+const DRAFT_SAVE_MAX_WAIT_MS = 15000;
 
 const toDraft = (value: unknown): Partial<DraftState> => {
   if (!value || typeof value !== 'object') return {};
