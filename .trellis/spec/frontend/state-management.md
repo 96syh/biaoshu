@@ -43,8 +43,10 @@ Server data is synchronized manually:
 - Analysis streams accumulate into local buffers, then commit final overview and
   requirements to app state.
 - Outline generation streams JSON text, then parses and commits `outlineData`.
-- Chapter generation streams content and writes per-chapter content into
-  `draftStorage` as it arrives.
+- Chapter generation streams content into the live outline preview as chunks
+  arrive. Persisted `draftStorage` saves are coalesced/debounced, and generation
+  completion explicitly flushes the final draft so large active drafts do not
+  hammer the backend SQLite database on every chunk.
 
 ---
 
@@ -56,4 +58,7 @@ Avoid:
 - Letting stale generated content survive after uploading a new tender file.
 - Treating `draftStorage` as authoritative after the outline changes; filter
   cached content by current leaf node ids.
+- Restoring per-chunk backend writes for large draft JSON payloads. Live UI
+  updates can be frequent; backend persistence should stay batched and have
+  explicit flush points after final chapter or batch saves.
 - Advancing steps automatically before required source data exists.

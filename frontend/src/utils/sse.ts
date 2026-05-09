@@ -43,11 +43,14 @@ const processSseLine = (
     return true;
   }
 
+  let payload: SsePayload;
   try {
-    onPayload(JSON.parse(data));
+    payload = JSON.parse(data);
   } catch {
     // 忽略不完整的行，等待后续 buffer 拼接
+    return false;
   }
+  onPayload(payload);
   return false;
 };
 

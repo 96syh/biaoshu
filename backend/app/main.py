@@ -8,7 +8,8 @@ import fastapi.middleware.cors
 import starlette.middleware.cors
 
 from .config import settings
-from .routers import config, document, outline, content, expand, projects
+from .routers import config, document, outline, content, expand, projects, history_cases
+from .services.file_service import FileService
 
 HTML_NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -46,9 +47,17 @@ app.include_router(outline.router)
 app.include_router(content.router)
 app.include_router(expand.router)
 app.include_router(projects.router)
+app.include_router(history_cases.router)
 
 if search is not None:
     app.include_router(search.router)
+
+FileService.GENERATED_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+app.mount(
+    FileService.GENERATED_ASSET_URL_PREFIX,
+    StaticFiles(directory=str(FileService.GENERATED_ASSET_DIR)),
+    name="generated_assets",
+)
 
 # 健康检查端点
 @app.get("/health")

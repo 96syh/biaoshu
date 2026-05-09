@@ -1,19 +1,27 @@
 """文件处理服务"""
 import aiofiles
+import html
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
 import gc
 import io
 import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 import PyPDF2
 import docx
+from docx.document import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from fastapi import UploadFile
 import aiohttp
 import asyncio
@@ -39,6 +47,8 @@ class FileService:
     # 图片上传配置
     IMAGE_UPLOAD_URL = "https://mt.agnet.top/image/upload"
     IMAGE_UPLOAD_TIMEOUT = 30  # 超时时间（秒）
+    GENERATED_ASSET_DIR = Path(__file__).resolve().parents[2] / "data" / "generated_assets"
+    GENERATED_ASSET_URL_PREFIX = "/generated-assets"
 
     @staticmethod
     def get_parser_mode() -> str:
@@ -241,6 +251,141 @@ class FileService:
             gc.collect()
             print(f"Word文档图片提取失败: {str(e)}")
             return []
+
+    @staticmethod
+    def _twips_to_pt(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return round(float(value.twips) / 20, 2)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _length_to_pt(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return round(float(value.pt), 2)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _paragraph_style(paragraph: Paragraph) -> str:
+        fmt = paragraph.paragraph_format
+        styles: List[str] = []
+        alignment = paragraph.alignment or fmt.alignment
+        if alignment is not None:
+            alignment_map = {0: "left", 1: "center", 2: "right", 3: "justify"}
+            styles.append(f"text-align:{alignment_map.get(int(alignment), 'left')}")
+        first_line = FileService._twips_to_pt(fmt.first_line_indent)
+        left_indent = FileService._twips_to_pt(fmt.left_indent)
+        right_indent = FileService._twips_to_pt(fmt.right_indent)
+        space_before = FileService._length_to_pt(fmt.space_before)
+        space_after = FileService._length_to_pt(fmt.space_after)
+        if first_line is not None:
+            styles.append(f"text-indent:{first_line}pt")
+        if left_indent is not None:
+            styles.append(f"margin-left:{left_indent}pt")
+        if right_indent is not None:
+            styles.append(f"margin-right:{right_indent}pt")
+        if space_before is not None:
+            styles.append(f"margin-top:{space_before}pt")
+        if space_after is not None:
+            styles.append(f"margin-bottom:{space_after}pt")
+        if fmt.line_spacing:
+            try:
+                styles.append(f"line-height:{float(fmt.line_spacing):.2f}")
+            except Exception:
+                pass
+        return ";".join(styles)
+
+    @staticmethod
+    def _run_html(run: Any) -> str:
+        text = html.escape(run.text or "").replace("\n", "<br />")
+        if not text:
+            return ""
+        styles: List[str] = []
+        font = run.font
+        if font.name:
+            styles.append(f"font-family:'{html.escape(font.name)}'")
+        if font.size:
+            styles.append(f"font-size:{round(font.size.pt, 2)}pt")
+        if font.color and font.color.rgb:
+            styles.append(f"color:#{font.color.rgb}")
+        if run.bold:
+            styles.append("font-weight:700")
+        if run.italic:
+            styles.append("font-style:italic")
+        if run.underline:
+            styles.append("text-decoration:underline")
+        style_attr = f' style="{";".join(styles)}"' if styles else ""
+        return f"<span{style_attr}>{text}</span>"
+
+    @staticmethod
+    def _paragraph_html(paragraph: Paragraph) -> str:
+        text_html = "".join(FileService._run_html(run) for run in paragraph.runs)
+        if not text_html:
+            text_html = html.escape(paragraph.text or "")
+        style_name = (paragraph.style.name if paragraph.style else "") or ""
+        level_match = re.search(r"heading\s*(\d+)|标题\s*(\d+)", style_name, re.IGNORECASE)
+        level = int(next((value for value in (level_match.groups() if level_match else []) if value), "0") or 0)
+        tag = f"h{min(max(level, 1), 4)}" if level else "p"
+        style_attr = FileService._paragraph_style(paragraph)
+        style_attr = f' style="{style_attr}"' if style_attr else ""
+        return f'<{tag} data-style="{html.escape(style_name)}"{style_attr}>{text_html or "&nbsp;"}</{tag}>'
+
+    @staticmethod
+    def _table_html(table: Table) -> str:
+        rows: List[str] = []
+        for row in table.rows:
+            cells = []
+            for cell in row.cells:
+                cell_html = "".join(FileService._paragraph_html(paragraph) for paragraph in cell.paragraphs)
+                cells.append(f"<td>{cell_html or '&nbsp;'}</td>")
+            rows.append(f"<tr>{''.join(cells)}</tr>")
+        return f'<table class="docx-source-table"><tbody>{"".join(rows)}</tbody></table>'
+
+    @staticmethod
+    def _iter_docx_blocks(document: DocxDocument):
+        for child in document.element.body.iterchildren():
+            if isinstance(child, CT_P):
+                yield Paragraph(child, document)
+            elif isinstance(child, CT_Tbl):
+                yield Table(child, document)
+
+    @staticmethod
+    def build_docx_source_preview_html(file_path: str) -> str:
+        """将 DOCX 转为样式化 HTML 片段，用于前端接近 Word 的原文预览。"""
+        if not file_path.lower().endswith(".docx"):
+            return ""
+        document = docx.Document(file_path)
+        body_html: List[str] = []
+        for block in FileService._iter_docx_blocks(document):
+            if isinstance(block, Paragraph):
+                body_html.append(FileService._paragraph_html(block))
+            elif isinstance(block, Table):
+                body_html.append(FileService._table_html(block))
+
+        section = document.sections[0] if document.sections else None
+        page_style = ""
+        if section:
+            width = FileService._length_to_pt(section.page_width)
+            height = FileService._length_to_pt(section.page_height)
+            top = FileService._length_to_pt(section.top_margin)
+            right = FileService._length_to_pt(section.right_margin)
+            bottom = FileService._length_to_pt(section.bottom_margin)
+            left = FileService._length_to_pt(section.left_margin)
+            style_bits = []
+            if width:
+                style_bits.append(f"--docx-page-width:{width}pt")
+            if height:
+                style_bits.append(f"--docx-page-min-height:{height}pt")
+            if all(value is not None for value in (top, right, bottom, left)):
+                style_bits.append(f"--docx-page-padding:{top}pt {right}pt {bottom}pt {left}pt")
+            page_style = f' style="{";".join(style_bits)}"' if style_bits else ""
+
+        return f'<div class="docx-source-preview"{page_style}>{"".join(body_html)}</div>'
 
     @staticmethod
     def _safe_file_cleanup(file_path: str, max_retries: int = 3) -> bool:
@@ -476,6 +621,47 @@ class FileService:
         return 0
 
     @staticmethod
+    def _persist_mineru_images(markdown: str, markdown_file: Path) -> Tuple[str, List[Dict[str, Any]]]:
+        """把 MinerU 生成的相对图片复制到后端可访问目录，并重写 Markdown 图片链接。"""
+        if not markdown:
+            return markdown, []
+
+        FileService.GENERATED_ASSET_DIR.mkdir(parents=True, exist_ok=True)
+        image_assets: List[Dict[str, Any]] = []
+
+        def replace_image(match: re.Match) -> str:
+            alt_text = match.group(1).strip()
+            raw_path = match.group(2).strip()
+            if re.match(r"^(?:https?:)?//|^data:", raw_path, flags=re.IGNORECASE):
+                image_assets.append({
+                    "alt": alt_text,
+                    "url": raw_path,
+                    "source_path": raw_path,
+                })
+                return match.group(0)
+
+            relative_path = raw_path.split("#", 1)[0].split("?", 1)[0]
+            source = (markdown_file.parent / relative_path).resolve()
+            if not source.exists() or not source.is_file():
+                return match.group(0)
+
+            suffix = source.suffix.lower() or ".png"
+            stored_name = f"mineru-{uuid.uuid4().hex[:12]}{suffix}"
+            target = FileService.GENERATED_ASSET_DIR / stored_name
+            shutil.copyfile(source, target)
+            url = f"{FileService.GENERATED_ASSET_URL_PREFIX}/{stored_name}"
+            image_assets.append({
+                "alt": alt_text,
+                "url": url,
+                "source_path": raw_path,
+                "filename": stored_name,
+            })
+            return f"![{alt_text}]({url})"
+
+        rewritten = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_image, markdown)
+        return rewritten, image_assets
+
+    @staticmethod
     async def _extract_with_mineru(file_path: str, file_kind: str) -> Tuple[str, Dict[str, Any]]:
         """用本机 MinerU CLI 把文件解析成 Markdown。"""
         mineru_bin = FileService._mineru_command()
@@ -529,6 +715,7 @@ class FileService:
             markdown = markdown_file.read_text(encoding="utf-8").strip()
             if not markdown:
                 raise RuntimeError("MinerU Markdown 输出为空")
+            markdown, image_assets = FileService._persist_mineru_images(markdown, markdown_file)
 
             return markdown, {
                 "parser": "mineru",
@@ -541,6 +728,7 @@ class FileService:
                 "markdown_file": markdown_file.name,
                 "content_list_file": content_json.name if content_json else "",
                 "content_block_count": FileService._load_mineru_block_count(content_json),
+                "image_assets": image_assets,
                 "fallback_used": False,
             }
 
@@ -764,6 +952,12 @@ class FileService:
             text, parser_info = await FileService._extract_with_configured_parser(file_path, file_kind)
             if not text.strip():
                 raise Exception("无法从文件中提取文本内容")
+            source_preview_html = ""
+            if file_kind == "docx":
+                try:
+                    source_preview_html = FileService.build_docx_source_preview_html(file_path)
+                except Exception as preview_error:
+                    print(f"DOCX 样式预览生成失败: {preview_error}")
             parser_info.setdefault("saved_file", os.path.basename(file_path))
             parser_info.setdefault("file_size", os.path.getsize(file_path))
 
@@ -773,6 +967,7 @@ class FileService:
             return {
                 "file_content": text,
                 "parser_info": parser_info,
+                "source_preview_html": source_preview_html,
             }
 
         except Exception as e:

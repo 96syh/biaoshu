@@ -20,6 +20,7 @@ export type DraftState = Pick<
   | 'currentStep'
   | 'fileContent'
   | 'uploadedFileName'
+  | 'sourcePreviewHtml'
   | 'parserInfo'
   | 'projectOverview'
   | 'techRequirements'
@@ -44,6 +45,13 @@ let activeProjectId = '';
 let activeDraft: Partial<DraftState> = {};
 let saveQueue: Promise<unknown> = Promise.resolve();
 let legacyCleaned = false;
+let pendingDraft: Partial<DraftState> | null = null;
+let pendingProjectId = '';
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let firstPendingSaveAt = 0;
+
+const DRAFT_SAVE_DEBOUNCE_MS = 1200;
+const DRAFT_SAVE_MAX_WAIT_MS = 5000;
 
 const toDraft = (value: unknown): Partial<DraftState> => {
   if (!value || typeof value !== 'object') return {};
@@ -85,9 +93,7 @@ const clearLegacyBrowserCache = async () => {
   }
 };
 
-const saveActiveDraft = (draft: Partial<DraftState>) => {
-  const projectId = activeProjectId || createClientProjectId();
-  activeProjectId = projectId;
+const persistActiveDraft = (draft: Partial<DraftState>, projectId: string) => {
   saveQueue = saveQueue
     .catch(() => undefined)
     .then(async () => {
@@ -96,12 +102,58 @@ const saveActiveDraft = (draft: Partial<DraftState>) => {
         const project = response.data.project;
         if (project) {
           activeProjectId = project.id;
-          activeDraft = toDraft(project.draft);
         }
       } catch (error) {
         console.warn('保存项目草稿到后端数据库失败:', error);
       }
     });
+};
+
+const flushPendingDraftSave = () => {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  if (!pendingDraft || !pendingProjectId) return saveQueue;
+
+  const draft = pendingDraft;
+  const projectId = pendingProjectId;
+  pendingDraft = null;
+  pendingProjectId = '';
+  firstPendingSaveAt = 0;
+  persistActiveDraft(draft, projectId);
+  return saveQueue;
+};
+
+const clearPendingDraftSave = () => {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  pendingDraft = null;
+  pendingProjectId = '';
+  firstPendingSaveAt = 0;
+};
+
+const saveActiveDraft = (draft: Partial<DraftState>, immediate = false) => {
+  const projectId = activeProjectId || createClientProjectId();
+  activeProjectId = projectId;
+  pendingDraft = draft;
+  pendingProjectId = projectId;
+  if (!firstPendingSaveAt) {
+    firstPendingSaveAt = Date.now();
+  }
+
+  if (immediate || Date.now() - firstPendingSaveAt >= DRAFT_SAVE_MAX_WAIT_MS) {
+    return flushPendingDraftSave();
+  }
+
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    void flushPendingDraftSave();
+  }, DRAFT_SAVE_DEBOUNCE_MS);
+
+  return saveQueue;
 };
 
 const walkOutlineLeaves = (outline: OutlineItem[] = [], visit: (item: OutlineItem) => void) => {
@@ -132,6 +184,13 @@ const updateOutlineContent = (
 }));
 
 export const draftStorage = {
+  async prepareSession() {
+    await clearLegacyBrowserCache();
+    clearPendingDraftSave();
+    activeDraft = {};
+    activeProjectId = '';
+  },
+
   loadDraft(): Partial<DraftState> | null {
     return Object.keys(activeDraft).length ? activeDraft : null;
   },
@@ -160,7 +219,12 @@ export const draftStorage = {
     saveActiveDraft(activeDraft);
   },
 
+  flushPendingSave() {
+    return flushPendingDraftSave();
+  },
+
   startNewHistory() {
+    clearPendingDraftSave();
     activeProjectId = createClientProjectId();
     activeDraft = {};
     void clearLegacyBrowserCache();
@@ -184,10 +248,11 @@ export const draftStorage = {
 
   upsertHistory(draft: Partial<DraftState>) {
     activeDraft = { ...activeDraft, ...draft };
-    saveActiveDraft(activeDraft);
+    saveActiveDraft(activeDraft, true);
   },
 
   activateHistory(id: string) {
+    clearPendingDraftSave();
     activeProjectId = id;
     return null;
   },
@@ -195,6 +260,7 @@ export const draftStorage = {
   async activateHistoryAsync(id: string) {
     await clearLegacyBrowserCache();
     try {
+      clearPendingDraftSave();
       const response = await projectApi.activateProject(id);
       const project = response.data.project;
       if (!project) return null;
@@ -208,6 +274,7 @@ export const draftStorage = {
   },
 
   clearAll() {
+    clearPendingDraftSave();
     activeDraft = {};
     activeProjectId = '';
     void clearLegacyBrowserCache();

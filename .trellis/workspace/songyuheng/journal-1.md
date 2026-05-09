@@ -38,6 +38,52 @@ Filled backend/frontend Trellis specs from the existing FastAPI and React codeba
 - None - task complete
 
 
+## Session 5: Fix review findings for draft persistence, bid modes, tests, and docs
+
+**Date**: 2026-05-05
+**Task**: Fix four review findings from the current uncommitted changes
+**Branch**: `master`
+
+### Summary
+
+Resolved the follow-up findings by coalescing large draft persistence during
+streaming generation, preserving all backend-supported bid generation modes in
+the frontend, replacing the broken default CRA test with a current workspace
+smoke test, and sanitizing local model documentation so tracked docs no longer
+contain internal endpoint or API key examples.
+
+### Main Changes
+
+- Added debounced draft saves with explicit flush points after final chapter and
+  batch generation commits.
+- Expanded frontend `BidMode` to match the backend enum and replaced the
+  two-button mode selector with a compact selector covering specialized modes.
+- Mocked ESM/network-facing frontend dependencies in Jest and asserted the
+  current local workspace shell.
+- Updated local model, README, and Trellis docs with the new persistence,
+  BidMode, testing, and secret-handling constraints.
+
+### Git Commits
+
+(No commits - remediation session)
+
+### Testing
+
+- [OK] `cd frontend && ./node_modules/.bin/tsc --noEmit --pretty false`
+- [OK] `cd frontend && npm run test -- --watchAll=false`
+- [OK] `cd frontend && npm run build`
+- [OK] `cd backend && ../.venv311/bin/python -c "import app.main; print('backend_import_ok')"`
+- [OK] `rg -n "dz6120|192\\.168\\.3\\.8|DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ" .`
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Rotate any real model key that may have been committed before this cleanup.
+
+
 ## Session 2: Document prompt workflow optimization
 
 **Date**: 2026-04-24

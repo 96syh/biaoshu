@@ -17,6 +17,7 @@ const initialState: AppState = {
   },
   fileContent: '',
   uploadedFileName: '',
+  sourcePreviewHtml: '',
   parserInfo: undefined,
   projectOverview: '',
   techRequirements: '',
@@ -26,20 +27,10 @@ const initialState: AppState = {
 };
 
 export const useAppState = () => {
-  const [state, setState] = useState<AppState>(() => {
-    const draft = draftStorage.loadDraft();
-    return { ...initialState, ...draft };
-  });
+  const [state, setState] = useState<AppState>(initialState);
 
   useEffect(() => {
-    let cancelled = false;
-    draftStorage.loadDraftAsync().then((draft) => {
-      if (cancelled || !draft) return;
-      setState(prev => ({ ...prev, ...draft }));
-    });
-    return () => {
-      cancelled = true;
-    };
+    void draftStorage.prepareSession();
   }, []);
 
   const updateConfig = useCallback((config: ConfigData) => {
@@ -54,7 +45,7 @@ export const useAppState = () => {
     });
   }, []);
 
-  const updateFileContent = useCallback((fileContent: string, uploadedFileName = '', parserInfo?: ParserInfo) => {
+  const updateFileContent = useCallback((fileContent: string, uploadedFileName = '', parserInfo?: ParserInfo, sourcePreviewHtml = '') => {
     setState(prev => {
       draftStorage.startNewHistory();
       const next = {
@@ -62,6 +53,7 @@ export const useAppState = () => {
         currentStep: 0,
         fileContent,
         uploadedFileName,
+        sourcePreviewHtml,
         parserInfo,
         projectOverview: '',
         techRequirements: '',
@@ -73,6 +65,7 @@ export const useAppState = () => {
         currentStep: 0,
         fileContent,
         uploadedFileName,
+        sourcePreviewHtml,
         parserInfo,
         projectOverview: '',
         techRequirements: '',
@@ -126,6 +119,7 @@ export const useAppState = () => {
     | 'currentStep'
     | 'fileContent'
     | 'uploadedFileName'
+    | 'sourcePreviewHtml'
     | 'parserInfo'
     | 'projectOverview'
     | 'techRequirements'

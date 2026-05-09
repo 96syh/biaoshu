@@ -1,13 +1,23 @@
 # 本地大模型调用 API 文档
 
-本文档说明如何调用你当前部署在局域网中的本地模型服务，以及如何通过本项目后端接入该模型。
+本文档说明如何调用你部署在局域网中的本地模型服务，以及如何通过本项目后端接入该模型。
 
-当前已验证可用的本地模型配置：
+> 安全约束：本文档只保留占位示例，不提交真实局域网地址、API Key 或模型内部名称。真实配置请通过前端“模型配置”面板、后端运行环境变量或本机私有配置文件维护；如果历史提交中过真实 Key，请按模型服务侧流程轮换。
 
-- `Base URL`: `http://192.168.3.8:8000/v1`
-- `API Key`: `dz6120`
-- `Model`: `DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ`
+示例本地模型配置：
+
+- `Base URL`: `${MODEL_BASE_URL}`
+- `API Key`: `${MODEL_API_KEY}`
+- `Model`: `${MODEL_ID}`
 - `协议`: OpenAI Compatible API
+
+下面示例中的 `${...}` 均为占位符。复制命令前，请先替换为实际值，或在本机私有终端会话中设置：
+
+```bash
+export MODEL_BASE_URL="http://your-model-host:8000/v1"
+export MODEL_API_KEY="your-private-model-api-key"
+export MODEL_ID="your-model-id"
+```
 
 ## 1. 前置条件
 
@@ -15,13 +25,13 @@
 
 1. 服务已经启动。
 2. 服务监听在 `0.0.0.0:8000` 或实际局域网 IP，而不是只监听 `127.0.0.1:8000`。
-3. 当前调用机器可以访问 `192.168.3.8:8000`。
+3. 当前调用机器可以访问 `${MODEL_BASE_URL}` 对应的主机和端口。
 4. 模型服务启用了 OpenAI 兼容接口。
 
 建议先执行以下命令做联通性检查：
 
 ```bash
-curl -H "Authorization: Bearer dz6120" http://192.168.3.8:8000/v1/models
+curl -H "Authorization: Bearer ${MODEL_API_KEY}" "${MODEL_BASE_URL}/models"
 ```
 
 如果返回模型列表，说明服务已可被局域网访问。
@@ -32,13 +42,13 @@ curl -H "Authorization: Bearer dz6120" http://192.168.3.8:8000/v1/models
 
 - 方法：`GET`
 - 地址：`/v1/models`
-- 完整地址：`http://192.168.3.8:8000/v1/models`
+- 完整地址：`${MODEL_BASE_URL}/models`
 
 请求示例：
 
 ```bash
-curl -H "Authorization: Bearer dz6120" \
-  http://192.168.3.8:8000/v1/models
+curl -H "Authorization: Bearer ${MODEL_API_KEY}" \
+  "${MODEL_BASE_URL}/models"
 ```
 
 响应示例：
@@ -48,7 +58,7 @@ curl -H "Authorization: Bearer dz6120" \
   "object": "list",
   "data": [
     {
-      "id": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+      "id": "${MODEL_ID}",
       "object": "model",
       "created": 1776089753,
       "owned_by": "omlx"
@@ -61,12 +71,12 @@ curl -H "Authorization: Bearer dz6120" \
 
 - 方法：`POST`
 - 地址：`/v1/chat/completions`
-- 完整地址：`http://192.168.3.8:8000/v1/chat/completions`
+- 完整地址：`${MODEL_BASE_URL}/chat/completions`
 - Content-Type：`application/json`
 
 请求体字段：
 
-- `model`: 模型名，当前使用 `DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ`
+- `model`: 模型名，当前使用 `${MODEL_ID}`
 - `messages`: 对话消息数组
 - `temperature`: 采样温度，结构化任务建议 `0` 到 `0.3`
 - `max_tokens`: 最大输出 token 数
@@ -75,11 +85,11 @@ curl -H "Authorization: Bearer dz6120" \
 非流式示例：
 
 ```bash
-curl http://192.168.3.8:8000/v1/chat/completions \
+curl "${MODEL_BASE_URL}/chat/completions" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer dz6120" \
+  -H "Authorization: Bearer ${MODEL_API_KEY}" \
   -d '{
-    "model": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    "model": "${MODEL_ID}",
     "messages": [
       {
         "role": "user",
@@ -99,7 +109,7 @@ curl http://192.168.3.8:8000/v1/chat/completions \
   "id": "chatcmpl-9cf698c1",
   "object": "chat.completion",
   "created": 1776089758,
-  "model": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+  "model": "${MODEL_ID}",
   "choices": [
     {
       "index": 0,
@@ -116,11 +126,11 @@ curl http://192.168.3.8:8000/v1/chat/completions \
 流式示例：
 
 ```bash
-curl -N http://192.168.3.8:8000/v1/chat/completions \
+curl -N "${MODEL_BASE_URL}/chat/completions" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer dz6120" \
+  -H "Authorization: Bearer ${MODEL_API_KEY}" \
   -d '{
-    "model": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    "model": "${MODEL_ID}",
     "messages": [
       {
         "role": "user",
@@ -138,13 +148,15 @@ curl -N http://192.168.3.8:8000/v1/chat/completions \
 ### 3.1 Python 示例
 
 ```python
+import os
 import requests
 
-base_url = "http://192.168.3.8:8000/v1"
-api_key = "dz6120"
+base_url = os.environ["MODEL_BASE_URL"]
+api_key = os.environ["MODEL_API_KEY"]
+model_id = os.environ["MODEL_ID"]
 
 payload = {
-    "model": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    "model": model_id,
     "messages": [
         {"role": "system", "content": "你是一个专业的技术方案顾问。"},
         {"role": "user", "content": "请写一个投标系统的技术架构概述。"},
@@ -169,17 +181,25 @@ data = response.json()
 print(data["choices"][0]["message"]["content"])
 ```
 
-### 3.2 JavaScript 示例
+### 3.2 Node.js 示例
 
 ```javascript
-const response = await fetch("http://192.168.3.8:8000/v1/chat/completions", {
+const baseUrl = process.env.MODEL_BASE_URL;
+const apiKey = process.env.MODEL_API_KEY;
+const modelId = process.env.MODEL_ID;
+
+if (!baseUrl || !apiKey || !modelId) {
+  throw new Error("Missing MODEL_BASE_URL, MODEL_API_KEY, or MODEL_ID");
+}
+
+const response = await fetch(`${baseUrl}/chat/completions`, {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    "Authorization": "Bearer dz6120",
+    "Authorization": `Bearer ${apiKey}`,
   },
   body: JSON.stringify({
-    model: "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    model: modelId,
     messages: [
       { role: "system", content: "你是一个专业的投标文档助手。" },
       { role: "user", content: "请输出一份项目实施计划的目录。" }
@@ -214,9 +234,9 @@ curl http://127.0.0.1:8090/api/config/save \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "custom",
-    "api_key": "dz6120",
-    "base_url": "http://192.168.3.8:8000/v1",
-    "model_name": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    "api_key": "${MODEL_API_KEY}",
+    "base_url": "${MODEL_BASE_URL}",
+    "model_name": "${MODEL_ID}",
     "api_mode": "chat"
   }'
 ```
@@ -240,9 +260,9 @@ curl http://127.0.0.1:8090/api/config/verify \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "custom",
-    "api_key": "dz6120",
-    "base_url": "http://192.168.3.8:8000/v1",
-    "model_name": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    "api_key": "${MODEL_API_KEY}",
+    "base_url": "${MODEL_BASE_URL}",
+    "model_name": "${MODEL_ID}",
     "api_mode": "chat"
   }'
 ```
@@ -254,28 +274,28 @@ curl http://127.0.0.1:8090/api/config/verify \
   "success": true,
   "message": "模型端点验证通过，可用于当前项目。",
   "provider": "custom",
-  "normalized_base_url": "http://192.168.3.8:8000/v1",
-  "resolved_base_url": "http://192.168.3.8:8000/v1",
+  "normalized_base_url": "${MODEL_BASE_URL}",
+  "resolved_base_url": "${MODEL_BASE_URL}",
   "base_url_candidates": [
-    "http://192.168.3.8:8000/v1"
+    "${MODEL_BASE_URL}"
   ],
-  "model_name": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+  "model_name": "${MODEL_ID}",
   "api_mode": "chat",
   "checks": [
     {
       "stage": "models",
       "success": true,
       "detail": "成功获取到 1 个模型",
-      "url": "http://192.168.3.8:8000/v1/models",
+      "url": "${MODEL_BASE_URL}/models",
       "http_status": 200
     },
     {
       "stage": "chat",
       "success": true,
       "detail": "OpenAI 兼容聊天接口调用成功",
-      "url": "http://192.168.3.8:8000/v1/chat/completions",
+      "url": "${MODEL_BASE_URL}/chat/completions",
       "http_status": 200,
-      "model_name": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ"
+      "model_name": "${MODEL_ID}"
     }
   ]
 }
@@ -293,9 +313,9 @@ curl http://127.0.0.1:8090/api/config/models \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "custom",
-    "api_key": "dz6120",
-    "base_url": "http://192.168.3.8:8000/v1",
-    "model_name": "DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    "api_key": "${MODEL_API_KEY}",
+    "base_url": "${MODEL_BASE_URL}",
+    "model_name": "${MODEL_ID}",
     "api_mode": "chat"
   }'
 ```
@@ -373,15 +393,15 @@ curl http://127.0.0.1:8090/api/config/models \
 
 ```bash
 # 1. 检查模型列表
-curl -H "Authorization: Bearer dz6120" \
-  http://192.168.3.8:8000/v1/models
+curl -H "Authorization: Bearer ${MODEL_API_KEY}" \
+  "${MODEL_BASE_URL}/models"
 
 # 2. 检查最小对话
-curl http://192.168.3.8:8000/v1/chat/completions \
+curl "${MODEL_BASE_URL}/chat/completions" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer dz6120" \
+  -H "Authorization: Bearer ${MODEL_API_KEY}" \
   -d '{
-    "model":"DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    "model":"${MODEL_ID}",
     "messages":[{"role":"user","content":"请只回复OK"}],
     "temperature":0,
     "max_tokens":16,
@@ -393,9 +413,9 @@ curl http://127.0.0.1:8090/api/config/verify \
   -H "Content-Type: application/json" \
   -d '{
     "provider":"custom",
-    "api_key":"dz6120",
-    "base_url":"http://192.168.3.8:8000/v1",
-    "model_name":"DeepSeek-R1-0528-Qwen3-8B-4bit-AWQ",
+    "api_key":"${MODEL_API_KEY}",
+    "base_url":"${MODEL_BASE_URL}",
+    "model_name":"${MODEL_ID}",
     "api_mode":"chat"
   }'
 ```

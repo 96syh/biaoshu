@@ -13,6 +13,7 @@ API_URL="${REACT_APP_API_URL:-http://$BACKEND_HOST:$BACKEND_PORT}"
 FRONTEND_URL="http://$FRONTEND_HOST:$FRONTEND_PORT"
 HEALTH_URL="http://$BACKEND_HOST:$BACKEND_PORT/health"
 OPEN_BROWSER="${OPEN_BROWSER:-1}"
+AUTO_INSTALL="${AUTO_INSTALL:-1}"
 
 LOG_DIR="${TMPDIR:-/tmp}/yibiao-simple-dev"
 BACKEND_LOG="$LOG_DIR/backend.log"
@@ -104,16 +105,37 @@ select_python() {
 
 check_backend_deps() {
   local python_bin="$1"
+  if "$python_bin" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ "$AUTO_INSTALL" != "1" ]; then
+    fail "backend dependencies are missing for $python_bin. Run: '$python_bin' -m pip install -r '$BACKEND_DIR/requirements.txt'"
+  fi
+
+  [ -f "$BACKEND_DIR/requirements.txt" ] || fail "backend requirements file not found: $BACKEND_DIR/requirements.txt"
+  log "Backend dependencies are missing; installing backend/requirements.txt"
+  "$python_bin" -m pip install -r "$BACKEND_DIR/requirements.txt"
   "$python_bin" -c "import fastapi, uvicorn" >/dev/null 2>&1 || {
-    fail "backend dependencies are missing for $python_bin. Install backend/requirements.txt first."
+    fail "backend dependencies are still unavailable after install for $python_bin"
   }
 }
 
 check_frontend_deps() {
   command_exists npm || fail "npm is not installed or not on PATH."
-  [ -d "$FRONTEND_DIR/node_modules" ] || {
+  if [ -d "$FRONTEND_DIR/node_modules" ]; then
+    return 0
+  fi
+
+  if [ "$AUTO_INSTALL" != "1" ]; then
     fail "frontend dependencies are missing. Run: cd '$FRONTEND_DIR' && npm install"
-  }
+  fi
+
+  log "Frontend dependencies are missing; running npm install"
+  (
+    cd "$FRONTEND_DIR"
+    npm install
+  )
 }
 
 start_backend() {
@@ -132,6 +154,12 @@ start_backend() {
   : > "$BACKEND_LOG"
   (
     cd "$BACKEND_DIR"
+    if [ -f ".env" ]; then
+      set -a
+      # shellcheck disable=SC1091
+      . "./.env"
+      set +a
+    fi
     HOST="$BACKEND_HOST" PORT="$BACKEND_PORT" WORKERS=1 "$python_bin" run.py
   ) >>"$BACKEND_LOG" 2>&1 &
   BACKEND_PID=$!
@@ -211,6 +239,7 @@ main() {
   log "Project root: $ROOT_DIR"
   log "Using Python: $python_bin"
   log "Fixed ports: backend=$BACKEND_PORT frontend=$FRONTEND_PORT"
+  log "Auto install missing dependencies: $AUTO_INSTALL"
 
   check_backend_deps "$python_bin"
   check_frontend_deps

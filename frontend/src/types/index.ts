@@ -10,7 +10,18 @@ export interface ConfigData {
   api_mode?: 'auto' | 'chat' | 'responses' | 'anthropic';
 }
 
-export type BidMode = 'technical_only' | 'full_bid';
+export type BidMode =
+  | 'technical_only'
+  | 'technical_service_plan'
+  | 'service_plan'
+  | 'full_bid'
+  | 'business_technical'
+  | 'business_volume'
+  | 'qualification_volume'
+  | 'price_volume'
+  | 'construction_plan'
+  | 'goods_supply_plan'
+  | 'unknown';
 
 export interface ParserInfo {
   parser?: string;
@@ -366,6 +377,7 @@ export interface OutlineData {
   coverage_summary?: string;
   reference_bid_style_profile?: Record<string, unknown>;
   document_blocks_plan?: Record<string, unknown>;
+  asset_library?: Record<string, unknown>;
   bid_mode?: BidMode;
 }
 
@@ -486,6 +498,23 @@ export interface DocumentBlocksPlanRequest {
   asset_library?: Record<string, unknown>;
 }
 
+export interface VisualAssetGenerationRequest {
+  chapter_id?: string;
+  chapter_title?: string;
+  project_name?: string;
+  block: Record<string, unknown>;
+  reference_bid_style_profile?: Record<string, unknown>;
+  size?: string;
+}
+
+export interface VisualAssetGenerationResponse {
+  success: boolean;
+  message: string;
+  prompt: string;
+  image_url?: string;
+  b64_json?: string;
+}
+
 export interface ConsistencyRevisionRequest {
   full_bid_draft: OutlineItem[];
   analysis_report?: AnalysisReport;
@@ -520,6 +549,7 @@ export interface AppState {
   config: ConfigData;
   fileContent: string;
   uploadedFileName?: string;
+  sourcePreviewHtml?: string;
   parserInfo?: ParserInfo;
   projectOverview: string;
   techRequirements: string;

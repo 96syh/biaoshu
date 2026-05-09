@@ -14,6 +14,8 @@ import type {
   OutlineData,
   OutlineItem,
   RequiredMaterial,
+  VisualAssetGenerationRequest,
+  VisualAssetGenerationResponse,
 } from '../types';
 
 export type {
@@ -74,10 +76,74 @@ export interface FileUploadResponse {
   success: boolean;
   message: string;
   file_content?: string;
+  source_preview_html?: string;
   old_outline?: string;
   parser_info?: Record<string, unknown>;
   reference_bid_style_profile?: Record<string, unknown>;
   document_blocks_plan?: Record<string, unknown>;
+}
+
+export interface HistoryReferenceMatchRequest {
+  file_content: string;
+  analysis_report?: AnalysisReport | Record<string, unknown>;
+  limit?: number;
+  use_llm?: boolean;
+}
+
+export interface HistoryReferenceMatchResponse {
+  success: boolean;
+  message: string;
+  matched_case?: Record<string, any>;
+  candidates?: Record<string, any>[];
+  llm_reason?: string;
+  reference_bid_style_profile?: Record<string, unknown>;
+}
+
+export interface HistoryRequirementEvidence {
+  project_id?: string;
+  project_title?: string;
+  result?: string;
+  primary_domain?: string;
+  primary_subdomain?: string;
+  document_id?: string;
+  file_name?: string;
+  document_path?: string;
+  pageindex_tree_path?: string;
+  snippet?: string;
+  matched_term?: string;
+  is_winning_case?: boolean;
+}
+
+export interface HistoryRequirementCheck {
+  item_id: string;
+  category: 'qualification' | 'scoring' | string;
+  category_label: string;
+  label: string;
+  score?: string;
+  requirement?: string;
+  search_terms?: string[];
+  satisfied: boolean;
+  confidence: number;
+  reason: string;
+  evidence: HistoryRequirementEvidence[];
+}
+
+export interface HistoryRequirementCheckRequest {
+  analysis_report: AnalysisReport | Record<string, unknown>;
+  limit_per_item?: number;
+  use_llm?: boolean;
+}
+
+export interface HistoryRequirementCheckResponse {
+  success: boolean;
+  message: string;
+  summary: {
+    total: number;
+    satisfied: number;
+    not_found: number;
+  };
+  checks: HistoryRequirementCheck[];
+  llm_reason?: string;
 }
 
 export interface ProviderCheckItem {
@@ -244,6 +310,18 @@ export const documentApi = {
     });
   },
 
+  // 根据当前招标文件自动匹配历史案例库，并生成成熟样例剖面
+  matchHistoryReference: (data: HistoryReferenceMatchRequest) =>
+    api.post<HistoryReferenceMatchResponse>('/api/history-cases/match-reference', data, {
+      timeout: 420000,
+    }),
+
+  // 用历史中标案例库核对标准解析中的评分项和资质项
+  checkHistoryRequirements: (data: HistoryRequirementCheckRequest) =>
+    api.post<HistoryRequirementCheckResponse>('/api/history-cases/check-requirements', data, {
+      timeout: 420000,
+    }),
+
 
   // 流式分析文档
   analyzeDocumentStream: (data: AnalysisRequest) =>
@@ -287,6 +365,12 @@ export const documentApi = {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(data),
+    }),
+
+  // 生成单个图表素材图片
+  generateVisualAsset: (data: VisualAssetGenerationRequest) =>
+    api.post<VisualAssetGenerationResponse>('/api/document/generate-visual-asset', data, {
+      timeout: 240000,
     }),
 
   // 流式生成全文一致性修订报告

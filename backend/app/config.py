@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     
     # OpenAI默认设置
     default_model: str = "gpt-3.5-turbo"
+
+    # 图表素材生成设置
+    yibiao_image_api_url: str = "https://img.yeelo.fun/v1/images/generations"
+    yibiao_image_api_key: str = ""
+    yibiao_image_model: str = "gpt-image-1"
+    yibiao_image_timeout_seconds: int = 180
     
     class Config:
         env_file = ".env"

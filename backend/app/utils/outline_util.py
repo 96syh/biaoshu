@@ -79,19 +79,18 @@ def calculate_nodes_distribution(level1_count: int, important_indexes: tuple[int
 
 def generate_one_outline_json_by_level1(level1_title: str, level1_index: int, nodes_distribution: Dict) -> Dict:
     """
-    根据一级标题生成该标题下的完整大纲结构
+    根据一级标题生成该标题下的二级大纲骨架
     
     Args:
         level1_title: 一级标题
         level1_index: 一级标题的索引（从1开始）
-        nodes_distribution: 节点分配信息，包含 level2_nodes 和 leaf_per_level2
+        nodes_distribution: 节点分配信息，至少包含 level2_nodes
         
     Returns:
         Dict: 一级标题的完整大纲结构
     """
-    # 获取当前一级节点下的二级节点数量和叶子节点分配
+    # 获取当前一级节点下的二级节点数量
     level2_count = nodes_distribution['level2_nodes'][level1_index - 1]
-    leaf_distribution = nodes_distribution['leaf_per_level2'][level1_index - 1]
     
     # 创建一级节点
     level1_node = {
@@ -131,26 +130,6 @@ def generate_one_outline_json_by_level1(level1_title: str, level1_index: int, no
             "response_matrix_ids": [],
             "children": []
         }
-        
-        # 创建三级节点（叶子节点）
-        leaf_count = leaf_distribution[j]
-        for k in range(leaf_count):
-            level2_node["children"].append({
-                "id":f"{level1_index}.{j+1}.{k+1}",
-                "title": "",  # 三级标题留空
-                "description": "",
-                "volume_id": "",
-                "chapter_type": "",
-                "fixed_format_sensitive": False,
-                "price_sensitive": False,
-                "anonymity_sensitive": False,
-                "expected_word_count": 0,
-                "scoring_item_ids": [],
-                "requirement_ids": [],
-                "risk_ids": [],
-                "material_ids": [],
-                "response_matrix_ids": []
-            })
         
         level1_node["children"].append(level2_node)
     

@@ -23,6 +23,8 @@ Type organization:
 - Component-only props and helper interfaces: inside the component file.
 - Backend contract source of truth: `backend/app/models/schemas.py`; keep
   frontend interfaces aligned with Pydantic schemas.
+- Bid generation modes are a backend contract. `frontend/src/types/index.ts`
+  must include every `BidMode` enum value from `backend/app/models/schemas.py`.
 
 ---
 
@@ -44,6 +46,9 @@ Common patterns:
 
 - Use discriminated string values for known modes, for example
   `analysis_type: 'overview' | 'requirements'`.
+- Preserve backend-supported bid modes end to end. Alias normalization is fine,
+  but unknown or specialized modes must not be silently rewritten to
+  `technical_only` unless that is the explicit fallback behavior.
 - Use explicit interfaces for provider verification payloads.
 - Prefer `OutlineData` and `OutlineItem` from shared types over `any`.
 - Keep nullable values explicit with `null` or optional fields.
@@ -56,6 +61,8 @@ Avoid:
 
 - Introducing new `any` fields when the backend schema is known.
 - Changing API interfaces only on the frontend or only on the backend.
+- Collapsing backend enum values in frontend helpers because the current UI only
+  exposes a smaller set of buttons.
 - Assuming every SSE payload has the same shape; `document`, `outline`, and
   `content` streams use different fields.
 - Type assertions that hide missing/null content from model responses.

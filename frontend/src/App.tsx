@@ -14,6 +14,7 @@ import {
   FolderIcon,
   PauseIcon,
   PencilSquareIcon,
+  PhotoIcon,
   PlayIcon,
   ShieldCheckIcon,
   SparklesIcon,
@@ -24,6 +25,8 @@ import { useAppState } from './hooks/useAppState';
 import { DEFAULT_PROVIDER_ID, LITELLM_PROVIDER } from './constants/providers';
 import {
   ChapterContentRequest,
+  HistoryRequirementEvidence,
+  HistoryRequirementCheck,
   ProviderVerifyResponse,
   configApi,
   contentApi,
@@ -41,9 +44,28 @@ import {
 } from './types';
 import { consumeSseStream } from './utils/sse';
 import { DraftHistoryRecord, draftStorage } from './utils/draftStorage';
+import {
+  GeneratedVisualAsset,
+  PlannedBlock,
+  PlannedBlockGroup,
+  VisualAssetResult,
+  attachGeneratedAssetToPlan,
+  blockAssetKey,
+  blockTypeLabel,
+  generatedAssetFromBlock,
+  isVisualBlockType,
+  normalizeDocumentBlocksPlan,
+  referenceSlotImageSrc,
+  referenceSlotTitle,
+  referenceSlotTypeLabel,
+  visualAssetImageSrc,
+  visualAssetResultFromBlock,
+  visualAssetsFromPlanGroups,
+  visualBlocksByChapterFromGroups,
+} from './utils/visualAssets';
 
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
-type NavKey = 'project' | 'analysis' | 'outline' | 'content' | 'review' | 'config';
+type NavKey = 'project' | 'analysis' | 'outline' | 'assets' | 'content' | 'review' | 'config';
 type ProgressState = {
   label: string;
   detail: string;
@@ -71,6 +93,16 @@ type TenderParseTab = {
   label: string;
   sections: TenderParseSection[];
 };
+type SourcePreviewBlockType = 'blank' | 'paragraph' | 'heading1' | 'heading2' | 'heading3' | 'image';
+type SourcePreviewBlock = {
+  sourceIndex: number;
+  text: string;
+  type: SourcePreviewBlockType;
+};
+type SourcePreviewPage = {
+  pageNumber: number;
+  blocks: SourcePreviewBlock[];
+};
 type TenderScoringRow = {
   id: string;
   item: string;
@@ -79,10 +111,54 @@ type TenderScoringRow = {
   subitems: string[];
   evidence: string[];
 };
+type ActiveHistoryEvidenceGroup = {
+  title: string;
+  checks: HistoryRequirementCheck[];
+};
 const BID_MODE_OPTIONS: Array<{ value: BidMode; label: string }> = [
   { value: 'technical_only', label: '技术标' },
   { value: 'full_bid', label: '完整标' },
 ];
+
+const BID_MODE_LABELS: Record<BidMode, string> = BID_MODE_OPTIONS.reduce(
+  (labels, option) => ({ ...labels, [option.value]: option.label }),
+  {} as Record<BidMode, string>,
+);
+
+const BID_MODE_VALUES = new Set<BidMode>(BID_MODE_OPTIONS.map(option => option.value));
+
+const BID_MODE_ALIASES: Record<string, BidMode> = {
+  technical: 'technical_only',
+  technical_bid: 'technical_only',
+  tech: 'technical_only',
+  tech_bid: 'technical_only',
+  technical_service: 'technical_only',
+  technical_service_plan: 'technical_only',
+  service: 'technical_only',
+  service_plan: 'technical_only',
+  construction: 'technical_only',
+  construction_plan: 'technical_only',
+  construction_organization: 'technical_only',
+  goods_supply: 'technical_only',
+  goods_supply_plan: 'technical_only',
+  supply_plan: 'technical_only',
+  business: 'full_bid',
+  business_technical: 'full_bid',
+  business_volume: 'full_bid',
+  commercial: 'full_bid',
+  commercial_volume: 'full_bid',
+  qualification: 'full_bid',
+  qualification_volume: 'full_bid',
+  qualification_bid: 'full_bid',
+  price: 'full_bid',
+  price_volume: 'full_bid',
+  quote: 'full_bid',
+  quotation: 'full_bid',
+  full: 'full_bid',
+  complete: 'full_bid',
+  complete_bid: 'full_bid',
+  unknown: 'technical_only',
+};
 
 const DEFAULT_WORD_STYLE_PROFILE: Record<string, string> = {
   page_size: 'A4',
@@ -142,8 +218,12 @@ const buildWordPreviewStyle = (referenceProfile?: Record<string, unknown>): Reac
   } as React.CSSProperties;
 };
 
-const normalizeBidMode = (mode?: unknown): BidMode => (mode === 'full_bid' ? 'full_bid' : 'technical_only');
-const bidModeLabel = (mode?: unknown) => (normalizeBidMode(mode) === 'full_bid' ? '完整标' : '技术标');
+const normalizeBidMode = (mode?: unknown): BidMode => {
+  const value = String(mode || '').trim();
+  if (BID_MODE_VALUES.has(value as BidMode)) return value as BidMode;
+  return BID_MODE_ALIASES[value] || 'technical_only';
+};
+const bidModeLabel = (mode?: unknown) => BID_MODE_LABELS[normalizeBidMode(mode)];
 
 interface ChapterEntry {
   item: OutlineItem;
@@ -164,6 +244,10 @@ const PAGE_META: Record<Exclude<NavKey, 'config'>, { title: string; description:
     title: '生成目录',
     description: '把评分项、审查项、风险项和材料项映射到正式投标文件目录。',
   },
+  assets: {
+    title: '图表素材',
+    description: '规划并生成组织图、流程图、方案信息图和可替换素材。',
+  },
   content: {
     title: '生成正文',
     description: '选择章节生成正文，预览当前章节内容，并支持批量生成与导出。',
@@ -178,6 +262,7 @@ const NAV_ITEMS: Array<{ key: NavKey; label: string; description: string; icon: 
   { key: 'project', label: '上传文件', description: '选择招标文件', icon: FolderIcon, target: 'panel-analysis' },
   { key: 'analysis', label: '开始解析', description: '抽取条款与评分', icon: DocumentTextIcon, target: 'panel-analysis' },
   { key: 'outline', label: '生成目录', description: '映射评分风险', icon: Bars3BottomLeftIcon, target: 'panel-outline' },
+  { key: 'assets', label: '图表素材', description: '生成图表素材', icon: PhotoIcon, target: 'panel-assets' },
   { key: 'content', label: '生成正文', description: '写入选中章节', icon: PencilSquareIcon, target: 'panel-content' },
   { key: 'review', label: '执行审校', description: '检查合规风险', icon: ShieldCheckIcon, target: 'panel-review' },
   { key: 'config', label: '模型配置', description: 'LiteLLM 接入', icon: Cog6ToothIcon },
@@ -186,6 +271,7 @@ const NAV_ITEMS: Array<{ key: NavKey; label: string; description: string; icon: 
 const FLOW_STEPS = ['上传', '标准解析', '目录映射', '正文生成', '合规审校', '导出'];
 const ANALYSIS_STEPS = ['文件解析', '条款识别', '评分项提取', '合规要求提取', '结果校验'];
 const BLOCKING_REPORT_WARNING_PATTERN = /兜底|未完整返回|模型输出未完整|解析失败|超时/;
+const CLIENT_GENERATION_FALLBACKS_ENABLED = process.env.REACT_APP_ENABLE_GENERATION_FALLBACKS === '1';
 const toLiteLLMConfig = (config?: Partial<ConfigData>): ConfigData => ({
   provider: DEFAULT_PROVIDER_ID,
   api_key: config?.api_key || '',
@@ -232,44 +318,6 @@ const getBlockingAnalysisReportWarning = (report?: AnalysisReport | null) => {
     .map(item => item.risk || '');
   const matched = [...warningTexts, ...riskTexts].find(text => BLOCKING_REPORT_WARNING_PATTERN.test(text));
   return matched || '';
-};
-
-const parserStatus = (parserInfo?: Record<string, unknown>) => {
-  const parser = String(parserInfo?.parser || '');
-  const preferred = String(parserInfo?.preferred_parser || '');
-  const fallbackUsed = Boolean(parserInfo?.fallback_used);
-  const isMinerU = parser.toLowerCase() === 'mineru';
-  if (isMinerU) {
-    const detail = [
-      parserInfo?.device ? `设备 ${parserInfo.device}` : '',
-      parserInfo?.backend ? `后端 ${parserInfo.backend}` : '',
-      parserInfo?.content_block_count ? `${parserInfo.content_block_count} 块` : '',
-    ].filter(Boolean).join(' · ');
-    return {
-      label: 'MinerU 已使用',
-      tone: 'success',
-      detail: detail || '已使用 MinerU 解析为 Markdown',
-    };
-  }
-  if (fallbackUsed && preferred === 'mineru') {
-    return {
-      label: 'MinerU 已降级',
-      tone: 'warning',
-      detail: `${parser || '内置解析器'} 已接管。${parserInfo?.fallback_reason ? `原因：${String(parserInfo.fallback_reason).slice(0, 120)}` : ''}`,
-    };
-  }
-  if (parser) {
-    return {
-      label: '未使用 MinerU',
-      tone: 'neutral',
-      detail: `当前使用 ${parser}（${parserInfo?.format || 'plain_text'}）`,
-    };
-  }
-  return {
-    label: '解析器待确认',
-    tone: 'neutral',
-    detail: '上传文件后显示 MinerU 或降级解析器状态',
-  };
 };
 
 const hasMinerUMarkdown = (parserInfo?: Record<string, unknown>) =>
@@ -452,6 +500,20 @@ const isInternalBidDocumentId = (value?: unknown) => /^BD(?:-[A-Z0-9]+)+$/i.test
 const isScoringParseTab = (key?: TenderParseTabKey) =>
   key === 'technical' || key === 'business' || key === 'other';
 
+const historyEvidenceTitle = (item: HistoryRequirementEvidence) =>
+  [
+    item.project_title || item.file_name || '历史案例',
+    item.result,
+    item.primary_domain || item.primary_subdomain,
+  ].filter(Boolean).join(' · ');
+
+const historyEvidenceMeta = (item: HistoryRequirementEvidence) =>
+  [
+    item.file_name,
+    item.pageindex_tree_path,
+    item.matched_term ? `命中：${item.matched_term}` : '',
+  ].filter(Boolean).join(' / ');
+
 const uniqueTexts = (values: string[], limit = 5) => {
   const seen = new Set<string>();
   return values
@@ -488,6 +550,132 @@ const appendParseSection = (
   const evidenceLines = uniqueTexts(evidence.map(toText).filter(isMeaningfulValue), 6);
   if (!contentLines.length && !evidenceLines.length) return;
   sections.push({ id, title, content: contentLines, evidence: evidenceLines, count });
+};
+
+const normalizeSourceText = (value: string) =>
+  value.replace(/\s+/g, '').replace(/[：:，,。；;（）()【】《》<>]/g, '').replace(/\[|\]/g, '').toLowerCase();
+
+const sourceSearchTokens = (section?: TenderParseSection) => {
+  if (!section) return [];
+  return uniqueTexts(
+    [...section.evidence, ...section.content]
+      .flatMap(line => String(line || '').split(/[：:\n]/).map(part => part.trim()))
+      .filter(value => isMeaningfulValue(value) && value.length >= 4),
+    12,
+  );
+};
+
+const sourceSearchTokensFromText = (text?: string) =>
+  uniqueTexts(
+    String(text || '')
+      .split(/[：:\n。；;]/)
+      .map(part => part.trim())
+      .filter(value => isMeaningfulValue(value) && value.length >= 4),
+    8,
+  );
+
+const findSourceLineIndex = (lines: string[], section?: TenderParseSection) => {
+  const tokens = sourceSearchTokens(section).map(normalizeSourceText).filter(token => token.length >= 4);
+  if (!tokens.length) return -1;
+  return lines.findIndex(line => {
+    const normalizedLine = normalizeSourceText(line);
+    if (normalizedLine.length < 4) return false;
+    return tokens.some(token => normalizedLine.includes(token) || token.includes(normalizedLine));
+  });
+};
+
+const findSourceLineIndexByText = (lines: string[], text?: string) => {
+  const tokens = sourceSearchTokensFromText(text).map(normalizeSourceText).filter(token => token.length >= 4);
+  if (!tokens.length) return -1;
+  return lines.findIndex(line => {
+    const normalizedLine = normalizeSourceText(line);
+    if (normalizedLine.length < 4) return false;
+    return tokens.some(token => normalizedLine.includes(token) || token.includes(normalizedLine));
+  });
+};
+
+const markdownImagePattern = /!\[[^\]]*]\(([^)]+)\)/g;
+const markdownTableDividerPattern = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
+
+const stripPreviewInlineMarkup = (value: string) =>
+  value
+    .replace(/<a\s+[^>]*id=["'][^"']+["'][^>]*>\s*<\/a>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?u>/gi, '')
+    .replace(/<\/?(strong|b|em|i)>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .trim();
+
+const buildSourcePreviewBlock = (line: string, sourceIndex: number): SourcePreviewBlock => {
+  const raw = line.trimEnd();
+  const trimmed = raw.trim();
+  if (!trimmed || markdownTableDividerPattern.test(trimmed)) {
+    return { sourceIndex, text: '', type: 'blank' };
+  }
+
+  if (markdownImagePattern.test(trimmed) && trimmed.replace(markdownImagePattern, '').trim() === '') {
+    markdownImagePattern.lastIndex = 0;
+    return { sourceIndex, text: '文档图片 / 图示', type: 'image' };
+  }
+  markdownImagePattern.lastIndex = 0;
+
+  const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+  if (headingMatch) {
+    const level = headingMatch[1].length;
+    const text = stripPreviewInlineMarkup(headingMatch[2].replace(markdownImagePattern, ''));
+    return {
+      sourceIndex,
+      text,
+      type: level === 1 ? 'heading1' : level === 2 ? 'heading2' : 'heading3',
+    };
+  }
+
+  const imageCleaned = trimmed.replace(markdownImagePattern, '【图片】');
+  const tableCleaned = imageCleaned.startsWith('|') && imageCleaned.endsWith('|')
+    ? imageCleaned.split('|').map(part => part.trim()).filter(Boolean).join('    ')
+    : imageCleaned;
+  const text = stripPreviewInlineMarkup(tableCleaned);
+  if (!text) return { sourceIndex, text: '', type: 'blank' };
+  return { sourceIndex, text, type: 'paragraph' };
+};
+
+const estimateSourcePreviewBlockUnits = (block: SourcePreviewBlock) => {
+  if (block.type === 'blank') return 0.45;
+  if (block.type === 'image') return 4.5;
+  if (block.type === 'heading1') return 3.2;
+  if (block.type === 'heading2') return 2.4;
+  if (block.type === 'heading3') return 2;
+  return Math.max(1.2, Math.ceil(block.text.length / 34) * 1.18);
+};
+
+const paginateSourcePreviewBlocks = (blocks: SourcePreviewBlock[]) => {
+  const pages: SourcePreviewPage[] = [];
+  let currentBlocks: SourcePreviewBlock[] = [];
+  let currentUnits = 0;
+  const pageUnitLimit = 30;
+
+  blocks.forEach(block => {
+    const units = estimateSourcePreviewBlockUnits(block);
+    if (currentBlocks.length && currentUnits + units > pageUnitLimit) {
+      pages.push({ pageNumber: pages.length + 1, blocks: currentBlocks });
+      currentBlocks = [];
+      currentUnits = 0;
+    }
+    currentBlocks.push(block);
+    currentUnits += units;
+  });
+
+  if (currentBlocks.length) {
+    pages.push({ pageNumber: pages.length + 1, blocks: currentBlocks });
+  }
+  return pages;
 };
 
 const requirementLine = (item: Record<string, unknown>) => {
@@ -1316,6 +1504,7 @@ const App = () => {
   } = useAppState();
 
   const [activeNav, setActiveNav] = useState<NavKey>('project');
+  const [navCollapsed, setNavCollapsed] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState(state.uploadedFileName || '');
   const [referenceFileName, setReferenceFileName] = useState('');
@@ -1324,19 +1513,26 @@ const App = () => {
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [streamText, setStreamText] = useState('');
-  const [outlineLiveText, setOutlineLiveText] = useState('');
-  const [contentStreamText, setContentStreamText] = useState('');
+  const [, setContentStreamText] = useState('');
   const [reviewReport, setReviewReport] = useState<ReviewReport | null>(null);
   const [consistencyReport, setConsistencyReport] = useState<ConsistencyRevisionReport | null>(null);
   const [referenceProfile, setReferenceProfile] = useState<Record<string, unknown>>({});
+  const [matchedHistoryCase, setMatchedHistoryCase] = useState<Record<string, any> | null>(null);
+  const [historyRequirementChecks, setHistoryRequirementChecks] = useState<Record<string, HistoryRequirementCheck>>({});
+  const [historyRequirementSummary, setHistoryRequirementSummary] = useState<{ total: number; satisfied: number; not_found: number } | null>(null);
+  const [checkingHistoryRequirements, setCheckingHistoryRequirements] = useState(false);
   const [documentBlocksPlan, setDocumentBlocksPlan] = useState<Record<string, unknown>>({});
+  const [visualAssetResults, setVisualAssetResults] = useState<Record<string, VisualAssetResult>>({});
+  const [activeReferenceSlotIndex, setActiveReferenceSlotIndex] = useState(0);
   const [verifyResult, setVerifyResult] = useState<ProviderVerifyResponse | null>(null);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [localConfig, setLocalConfig] = useState<ConfigData>(state.config);
   const [selectedBidMode, setSelectedBidMode] = useState<BidMode>('full_bid');
-  const [matrixExpanded, setMatrixExpanded] = useState(false);
   const [activeParseTabKey, setActiveParseTabKey] = useState<TenderParseTabKey>('basic');
   const [activeParseSectionId, setActiveParseSectionId] = useState('');
+  const [activeSourceQuery, setActiveSourceQuery] = useState('');
+  const [activeSourceLabel, setActiveSourceLabel] = useState('');
+  const [analysisRevealPercent, setAnalysisRevealPercent] = useState(0);
   const [activeDocId, setActiveDocId] = useState('');
   const [outlineDraftRows, setOutlineDraftRows] = useState<DraftOutlineRow[]>([]);
   const [editingOutlineId, setEditingOutlineId] = useState('');
@@ -1349,9 +1545,13 @@ const App = () => {
   const [exportDirectory, setExportDirectory] = useState('~/Downloads');
   const [manualReviewConfirmed, setManualReviewConfirmed] = useState(false);
   const [historyRecords, setHistoryRecords] = useState<DraftHistoryRecord[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [evidenceHighlighted, setEvidenceHighlighted] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
   const docPreviewRef = useRef<HTMLElement>(null);
+  const docStageRef = useRef<HTMLDivElement>(null);
+  const evidencePanelRef = useRef<HTMLDivElement>(null);
   const progressVersionRef = useRef(0);
   const generationAbortRef = useRef<AbortController | null>(null);
   const generationPausedRef = useRef(false);
@@ -1370,6 +1570,11 @@ const App = () => {
       : referenceProfile;
   const activeReferenceProfile = isUsableReferenceProfile(rawReferenceProfile) ? rawReferenceProfile : EMPTY_REFERENCE_PROFILE;
   const activeReferenceRecord = profileRecord(activeReferenceProfile);
+  const referenceImageSlots = useMemo(
+    () => (Array.isArray(activeReferenceRecord.image_slots) ? activeReferenceRecord.image_slots as Record<string, any>[] : []),
+    [activeReferenceRecord],
+  );
+  const selectedReferenceSlot = referenceImageSlots[activeReferenceSlotIndex] || referenceImageSlots[0] || null;
   const referenceWordStyle = profileRecord(activeReferenceRecord.word_style_profile);
   const hasReferenceProfile = Object.keys(activeReferenceRecord).length > 0;
   const referenceProfileStats = [
@@ -1383,19 +1588,96 @@ const App = () => {
     [activeReferenceProfile],
   );
   const activeDocumentBlocksPlan = effectiveOutline?.document_blocks_plan || activeReport?.document_blocks_plan || documentBlocksPlan;
+  const displayDocumentBlocksPlan = useMemo(
+    () => normalizeDocumentBlocksPlan(activeDocumentBlocksPlan as Record<string, unknown>, referenceImageSlots, effectiveOutline?.outline || []),
+    [activeDocumentBlocksPlan, referenceImageSlots, effectiveOutline?.outline],
+  );
+  const plannedBlockGroups = useMemo<PlannedBlockGroup[]>(() => {
+    const rawGroups = (displayDocumentBlocksPlan as any)?.document_blocks;
+    if (!Array.isArray(rawGroups)) return [];
+    return rawGroups.map((group: any) => ({
+      chapter_id: String(group?.chapter_id || ''),
+      chapter_title: String(group?.chapter_title || ''),
+      blocks: Array.isArray(group?.blocks) ? group.blocks : [],
+    })).filter(group => group.chapter_id || group.blocks.length);
+  }, [displayDocumentBlocksPlan]);
+  const plannedBlocksCount = plannedBlockGroups.reduce((sum, group) => sum + group.blocks.length, 0);
+  const visualBlocksCount = plannedBlockGroups.reduce(
+    (sum, group) => sum + group.blocks.filter(block => isVisualBlockType(block.block_type)).length,
+    0,
+  );
+  const activeVisualAssets = useMemo(
+    () => visualAssetsFromPlanGroups(plannedBlockGroups, visualAssetResults),
+    [plannedBlockGroups, visualAssetResults],
+  );
+  const activeAssetLibrary = useMemo(
+    () => ({ visual_assets: activeVisualAssets }),
+    [activeVisualAssets],
+  );
+  const visualBlocksByChapter = useMemo(
+    () => visualBlocksByChapterFromGroups(plannedBlockGroups, visualAssetResults),
+    [plannedBlockGroups, visualAssetResults],
+  );
+  const generatedVisualCount = activeVisualAssets.length;
   const activeEnterpriseProfile = activeReport?.enterprise_material_profile || null;
   const activeResponseMatrix = effectiveOutline?.response_matrix || activeReport?.response_matrix || null;
   const responseMatrixItems = activeResponseMatrix?.items || [];
-  const visibleMatrixItems = matrixExpanded ? responseMatrixItems : responseMatrixItems.slice(0, 5);
-  const highRiskMatrixCount = responseMatrixItems.filter(item => item.priority === 'high' || item.blocking).length;
   const uncoveredMatrixCount = activeResponseMatrix?.uncovered_ids?.length || responseMatrixItems.filter(item => item.status !== 'covered').length;
   const tenderParseTabs = useMemo(() => buildTenderParseTabs(activeReport), [activeReport]);
   const activeParseTab = tenderParseTabs.find(tab => tab.key === activeParseTabKey) || tenderParseTabs[0];
   const activeParseSection = activeParseTab?.sections.find(section => section.id === activeParseSectionId) || activeParseTab?.sections[0];
+  const sourceLines = useMemo(
+    () => (state.fileContent || '').split(/\r?\n/).map(line => line.trimEnd()),
+    [state.fileContent],
+  );
+  const sourcePreviewBlocks = useMemo<SourcePreviewBlock[]>(
+    () => sourceLines.map((line, index) => buildSourcePreviewBlock(line, index)),
+    [sourceLines],
+  );
+  const sourcePreviewPages = useMemo<SourcePreviewPage[]>(
+    () => paginateSourcePreviewBlocks(sourcePreviewBlocks),
+    [sourcePreviewBlocks],
+  );
+  const activeSourceLineIndex = useMemo(
+    () => activeSourceQuery
+      ? findSourceLineIndexByText(sourceLines, activeSourceQuery)
+      : findSourceLineIndex(sourceLines, activeParseSection),
+    [activeParseSection, activeSourceQuery, sourceLines],
+  );
   const activeScoringRows = useMemo(
     () => activeReport && activeParseTab ? buildScoringRows(activeReport, activeParseTab.key) : [],
     [activeReport, activeParseTab],
   );
+  const historyRequirementCheckList = useMemo(
+    () => Object.values(historyRequirementChecks),
+    [historyRequirementChecks],
+  );
+  const activeQualificationHistoryChecks = useMemo(
+    () => historyRequirementCheckList.filter(check => check.category === 'qualification'),
+    [historyRequirementCheckList],
+  );
+  const activeScoringHistoryChecks = useMemo(
+    () => activeScoringRows
+      .map(row => historyRequirementChecks[row.id])
+      .filter((check): check is HistoryRequirementCheck => Boolean(check)),
+    [activeScoringRows, historyRequirementChecks],
+  );
+  const activeHistoryEvidenceGroup = useMemo<ActiveHistoryEvidenceGroup>(() => {
+    if (!activeParseTab) return { title: '历史数据库证据', checks: [] };
+    if (activeParseTab.key === 'qualification') {
+      return { title: '资质类历史数据库证据', checks: activeQualificationHistoryChecks };
+    }
+    if (isScoringParseTab(activeParseTab.key)) {
+      return { title: `${activeParseTab.label}历史数据库证据`, checks: activeScoringHistoryChecks };
+    }
+    return { title: '历史数据库证据', checks: [] };
+  }, [activeParseTab, activeQualificationHistoryChecks, activeScoringHistoryChecks]);
+  const activeHistoryEvidenceStats = useMemo(() => {
+    const total = activeHistoryEvidenceGroup.checks.length;
+    const satisfied = activeHistoryEvidenceGroup.checks.filter(check => check.satisfied).length;
+    const evidenceCount = activeHistoryEvidenceGroup.checks.reduce((sum, check) => sum + (check.evidence?.length || 0), 0);
+    return { total, satisfied, evidenceCount };
+  }, [activeHistoryEvidenceGroup]);
   const entries = useMemo(() => effectiveOutline ? collectEntries(effectiveOutline.outline) : [], [effectiveOutline]);
   const selectedEntry = entries.find(entry => entry.item.id === state.selectedChapter) || entries[0];
   const editingOutlineItem = useMemo(
@@ -1422,9 +1704,12 @@ const App = () => {
     || cleanDisplayTitle(effectiveOutline?.project_name)
     || cleanDisplayTitle(uploadedFileName || state.uploadedFileName)
     || '待解析项目';
-  const currentParserStatus = parserStatus(state.parserInfo);
 
   useEffect(() => setLocalConfig(state.config), [state.config]);
+
+  useEffect(() => {
+    setActiveReferenceSlotIndex(0);
+  }, [referenceImageSlots.length]);
 
   useEffect(() => {
     if (state.uploadedFileName && state.uploadedFileName !== uploadedFileName) {
@@ -1433,6 +1718,7 @@ const App = () => {
   }, [state.uploadedFileName, uploadedFileName]);
 
   useEffect(() => {
+    if (!historyOpen) return;
     let cancelled = false;
     draftStorage.loadHistoryAsync().then((records) => {
       if (!cancelled) setHistoryRecords(records);
@@ -1440,7 +1726,7 @@ const App = () => {
     return () => {
       cancelled = true;
     };
-  }, [state.fileContent, state.analysisReport, state.outlineData, state.selectedChapter]);
+  }, [historyOpen, state.fileContent, state.analysisReport, state.outlineData, state.selectedChapter]);
 
   useEffect(() => {
     const syncPageFromHash = () => {
@@ -1498,6 +1784,56 @@ const App = () => {
   }, [activeParseSectionId, activeParseTabKey, tenderParseTabs]);
 
   useEffect(() => {
+    if (activeNav !== 'analysis' || !activeReport) {
+      setAnalysisRevealPercent(0);
+      return;
+    }
+
+    setAnalysisRevealPercent(0);
+    let nextPercent = 0;
+    const timer = window.setInterval(() => {
+      nextPercent = Math.min(100, nextPercent + 12);
+      setAnalysisRevealPercent(nextPercent);
+      if (nextPercent >= 100) window.clearInterval(timer);
+    }, 90);
+
+    return () => window.clearInterval(timer);
+  }, [activeNav, activeReport]);
+
+  useEffect(() => {
+    if (!evidenceHighlighted || activeNav !== 'analysis') return;
+    window.requestAnimationFrame(() => {
+      if (state.sourcePreviewHtml) {
+        const panel = evidencePanelRef.current;
+        const tokens = (activeSourceQuery ? sourceSearchTokensFromText(activeSourceQuery) : sourceSearchTokens(activeParseSection))
+          .map(normalizeSourceText)
+          .filter(token => token.length >= 4);
+        panel?.querySelectorAll('.docx-source-node--active').forEach(node => node.classList.remove('docx-source-node--active'));
+        const nodes = Array.from(panel?.querySelectorAll<HTMLElement>('.docx-source-preview p, .docx-source-preview h1, .docx-source-preview h2, .docx-source-preview h3, .docx-source-preview h4, .docx-source-preview td') || []);
+        const target = nodes.find(node => {
+          const normalizedText = normalizeSourceText(node.innerText || node.textContent || '');
+          return normalizedText.length >= 4 && tokens.some(token => normalizedText.includes(token) || token.includes(normalizedText));
+        });
+        if (target) {
+          target.classList.add('docx-source-node--active');
+          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          return;
+        }
+        evidencePanelRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
+      }
+      if (activeSourceLineIndex >= 0) {
+        document.getElementById(`source-line-${activeSourceLineIndex}`)?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'center',
+        });
+        return;
+      }
+      evidencePanelRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  }, [activeNav, activeParseSection, activeSourceLineIndex, activeSourceQuery, evidenceHighlighted, state.sourcePreviewHtml]);
+
+  useEffect(() => {
     if (!state.outlineData?.outline?.length) return;
     const result = ensureOutlineThirdLevel(state.outlineData.outline, 1, activeReport);
     if (result.changed) {
@@ -1509,7 +1845,37 @@ const App = () => {
   const setSuccess = (text: string) => setNotice({ type: 'success', text });
   const setInfo = (text: string) => setNotice({ type: 'info', text });
   const refreshHistory = () => {
+    if (!historyOpen) return;
     draftStorage.loadHistoryAsync().then(setHistoryRecords);
+  };
+
+  const toggleHistoryPanel = () => {
+    setHistoryOpen(prev => {
+      const next = !prev;
+      if (next) draftStorage.loadHistoryAsync().then(setHistoryRecords);
+      return next;
+    });
+  };
+
+  const selectParseSection = (sectionId: string) => {
+    setActiveParseSectionId(sectionId);
+    setActiveSourceQuery('');
+    setActiveSourceLabel('');
+    setEvidenceHighlighted(true);
+    window.requestAnimationFrame(() => {
+      evidencePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' });
+    });
+    window.setTimeout(() => setEvidenceHighlighted(false), 1100);
+  };
+
+  const locateSourceItem = (label: string, text: string) => {
+    setActiveSourceQuery(text);
+    setActiveSourceLabel(label);
+    setEvidenceHighlighted(true);
+    window.requestAnimationFrame(() => {
+      evidencePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' });
+    });
+    window.setTimeout(() => setEvidenceHighlighted(false), 1100);
   };
 
   const openOutlineEditor = (item: OutlineItem) => {
@@ -1743,13 +2109,27 @@ const App = () => {
     setGenerationProgress(prev => prev ? { ...prev, detail: '已停止生成，可重新选择章节继续', status: 'error' } : prev);
   };
 
+  const scrollDocumentStageTo = (itemId: string) => {
+    window.requestAnimationFrame(() => {
+      const target = document.getElementById(docSectionId(itemId));
+      if (!target) return;
+      const stage = docStageRef.current;
+      if (!stage) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+      }
+      const stageRect = stage.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const nextTop = Math.max(0, stage.scrollTop + targetRect.top - stageRect.top - 18);
+      stage.scrollTo({ top: nextTop, behavior: 'smooth' });
+    });
+  };
+
   const scrollToDocumentNode = (item: OutlineItem) => {
     const firstLeaf = findFirstLeaf(item);
     setActiveDocId(item.id);
     updateSelectedChapter(firstLeaf.id);
-    window.requestAnimationFrame(() => {
-      document.getElementById(docSectionId(item.id))?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
+    scrollDocumentStageTo(item.id);
   };
 
   const goToPage = (key: NavKey) => {
@@ -1787,7 +2167,7 @@ const App = () => {
     const normalizedMode = normalizeBidMode(mode);
     setSelectedBidMode(normalizedMode);
     if (effectiveOutline) updateOutline({ ...effectiveOutline, bid_mode: normalizedMode });
-    setInfo(normalizedMode === 'technical_only' ? '已切换为技术标生成，后续目录、正文和审校会按技术标模式请求模型' : '已切换为完整标生成');
+    setInfo(`已切换为${bidModeLabel(normalizedMode)}生成，后续目录、正文和审校会按该模式请求模型`);
   };
 
   const handleUpload = async (file: File) => {
@@ -1810,13 +2190,15 @@ const App = () => {
       setManualReviewConfirmed(false);
       setConsistencyReport(null);
       setDocumentBlocksPlan({});
+      setVisualAssetResults({});
+      setHistoryRequirementChecks({});
+      setHistoryRequirementSummary(null);
       setActiveDocId('');
       setOutlineDraftRows([]);
       setStreamingChapterId('');
-      setOutlineLiveText('');
       setContentStreamText('');
       setStreamText('');
-      updateFileContent(response.data.file_content, file.name, response.data.parser_info);
+      updateFileContent(response.data.file_content, file.name, response.data.parser_info, response.data.source_preview_html || '');
       completeProgress('文件已上传，文本读取完成', taskVersion);
       setSuccess('招标文件已上传，开始进行标准解析');
     } catch (error: any) {
@@ -1829,6 +2211,7 @@ const App = () => {
 
   const clearReferenceProfileFromDraft = () => {
     setReferenceProfile({});
+    setMatchedHistoryCase(null);
     if (state.analysisReport) {
       updateAnalysisResults(state.projectOverview, state.techRequirements, {
         ...state.analysisReport,
@@ -1887,6 +2270,183 @@ const App = () => {
     } finally {
       setBusy('');
     }
+  };
+
+  const runHistoryReferenceMatch = async () => {
+    if (!state.fileContent?.trim()) {
+      setError('请先上传并解析招标文件，再自动匹配历史案例库');
+      return;
+    }
+    setBusy('reference-match');
+    const taskVersion = startProgress(
+      '历史案例匹配',
+      ['召回历史案例', 'LLM 选择案例', '生成样例模板'],
+      '正在从历史标书数据库匹配成熟案例',
+      8,
+    );
+    try {
+      const response = await documentApi.matchHistoryReference({
+        file_content: state.fileContent,
+        analysis_report: activeReport || {},
+        limit: 8,
+        use_llm: true,
+      });
+      if (!response.data.success || !response.data.reference_bid_style_profile) {
+        throw new Error(response.data.message || '历史案例匹配失败');
+      }
+      const profile = response.data.reference_bid_style_profile;
+      const matched = response.data.matched_case || null;
+      setReferenceFile(null);
+      setMatchedHistoryCase(matched);
+      setReferenceFileName(matched?.project_title || '历史案例库自动匹配');
+      setReferenceProfile(profile);
+      if (state.analysisReport) {
+        updateAnalysisResults(state.projectOverview, state.techRequirements, {
+          ...state.analysisReport,
+          reference_bid_style_profile: profile,
+        });
+      }
+      if (effectiveOutline) {
+        updateOutline({ ...effectiveOutline, reference_bid_style_profile: profile });
+      }
+      completeProgress('历史案例已匹配并生成样例模板', taskVersion);
+      setSuccess(`已匹配历史案例：${matched?.project_title || '历史案例库'}`);
+    } catch (error: any) {
+      failProgress(error.response?.data?.detail || error.message || '历史案例匹配失败', undefined, taskVersion);
+      setError(error.response?.data?.detail || error.message || '历史案例匹配失败');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const runHistoryRequirementCheck = async (report: AnalysisReport | null = activeReport, silent = false) => {
+    if (!report) {
+      if (!silent) setError('请先完成标准解析，再进行历史库满足性检查');
+      return;
+    }
+    setCheckingHistoryRequirements(true);
+    if (!silent) setInfo('正在用历史中标案例库核对评分项和资质项');
+    try {
+      const response = await documentApi.checkHistoryRequirements({
+        analysis_report: report,
+        limit_per_item: 3,
+        use_llm: true,
+      });
+      if (!response.data.success) {
+        throw new Error(response.data.message || '历史库满足性检查失败');
+      }
+      const nextChecks = response.data.checks.reduce<Record<string, HistoryRequirementCheck>>((acc, check) => {
+        acc[check.item_id] = check;
+        return acc;
+      }, {});
+      setHistoryRequirementChecks(nextChecks);
+      setHistoryRequirementSummary(response.data.summary);
+      if (!silent) {
+        setSuccess(`历史库检查完成：${response.data.summary.satisfied}/${response.data.summary.total} 项命中中标案例证据`);
+      }
+    } catch (error: any) {
+      if (!silent) setError(error.response?.data?.detail || error.message || '历史库满足性检查失败');
+    } finally {
+      setCheckingHistoryRequirements(false);
+    }
+  };
+
+  const renderHistoryRequirementBadge = (check?: HistoryRequirementCheck) => {
+    if (checkingHistoryRequirements && !check) {
+      return <span className="history-check-badge history-check-badge--pending">检索中</span>;
+    }
+    if (!check) {
+      return <span className="history-check-badge history-check-badge--idle">待检索</span>;
+    }
+    return (
+      <div className={`history-check-card ${check.satisfied ? 'history-check-card--ok' : 'history-check-card--miss'}`}>
+        <div className="history-check-card__status">
+          {check.satisfied ? <CheckCircleIcon className="h-4 w-4" /> : <XMarkIcon className="h-4 w-4" />}
+          <strong>{check.satisfied ? '满足' : '未命中'}</strong>
+          <span>{Math.round((check.confidence || 0) * 100)}%</span>
+        </div>
+        <p>{check.reason}</p>
+        {check.evidence?.length > 0 && (
+          <div className="history-check-evidence">
+            {check.evidence.slice(0, 2).map((item, index) => (
+              <span key={`${check.item_id}-history-${index}`}>
+                {item.project_title || item.file_name || '历史案例'}{item.result ? ` · ${item.result}` : ''}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderActiveHistoryEvidencePanel = () => {
+    const checks = activeHistoryEvidenceGroup.checks;
+    const canCheck = Boolean(activeReport);
+    return (
+      <section className="history-source-panel" aria-label="历史数据库证据">
+        <div className="history-source-panel__head">
+          <div>
+            <strong>{activeHistoryEvidenceGroup.title}</strong>
+            <span>
+              {checkingHistoryRequirements
+                ? '正在检索历史中标案例'
+                : activeHistoryEvidenceStats.total
+                  ? `${activeHistoryEvidenceStats.satisfied}/${activeHistoryEvidenceStats.total} 项满足，${activeHistoryEvidenceStats.evidenceCount} 条证据`
+                  : canCheck
+                    ? '当前页签暂无可显示的核对结果'
+                    : '标准解析后自动检索'}
+            </span>
+          </div>
+          {canCheck && (
+            <button
+              type="button"
+              className="text-link"
+              onClick={() => runHistoryRequirementCheck(activeReport)}
+              disabled={checkingHistoryRequirements}
+            >
+              {checkingHistoryRequirements ? '检索中' : '重新检索'}
+            </button>
+          )}
+        </div>
+
+        {checkingHistoryRequirements && !checks.length ? (
+          <div className="history-source-empty">正在用历史数据库核对解析出的资质项和评分项。</div>
+        ) : checks.length ? (
+          <div className="history-source-list">
+            {checks.map(check => (
+              <article key={`history-source-${check.item_id}`} className={`history-source-card ${check.satisfied ? 'history-source-card--ok' : 'history-source-card--miss'}`}>
+                <div className="history-source-card__title">
+                  {check.satisfied ? <CheckCircleIcon className="h-4 w-4" /> : <XMarkIcon className="h-4 w-4" />}
+                  <strong>{check.label}</strong>
+                  <span>{check.satisfied ? '满足' : '未命中'}</span>
+                </div>
+                <p>{check.reason}</p>
+                {check.requirement && <small>{check.requirement}</small>}
+                {check.evidence?.length > 0 ? (
+                  <div className="history-source-evidence-list">
+                    {check.evidence.slice(0, 3).map((item, index) => (
+                      <div key={`${check.item_id}-detail-${index}`} className="history-source-evidence">
+                        <strong>{historyEvidenceTitle(item)}</strong>
+                        {historyEvidenceMeta(item) && <span>{historyEvidenceMeta(item)}</span>}
+                        {item.snippet && <p>{item.snippet}</p>}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="history-source-empty history-source-empty--inline">历史库未找到可支撑证据。</div>
+                )}
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="history-source-empty">
+            {isScoringParseTab(activeParseTab?.key) || activeParseTab?.key === 'qualification'
+              ? '请点击“历史库核对”，或等待标准解析完成后的自动核对结果。'
+              : '历史数据库证据主要用于资格审查、技术评分、商务评分和其他评分页签。'}
+          </div>
+        )}
+      </section>
+    );
   };
 
   const controlAnalysisTask = async (action: 'pause' | 'resume' | 'stop') => {
@@ -1992,6 +2552,7 @@ const App = () => {
       setStreamText('');
       completeProgress('标准解析完成', taskVersion);
       setSuccess('标准解析完成，已生成项目、评分、风险和材料结构');
+      void runHistoryRequirementCheck(report, true);
     } catch (error: any) {
       if (analysisStoppedRef.current || error?.name === 'AbortError') {
         stopProgress('标准解析已停止，可重新开始解析', taskVersion);
@@ -2020,7 +2581,6 @@ const App = () => {
     setBusy('outline');
     const taskVersion = startProgress('目录生成', ['构建输入', '生成目录', '映射评分风险'], '正在准备目录生成上下文', 8);
     setStreamText('');
-    setOutlineLiveText('准备生成目录：正在整理项目概况、评分项、风险项和材料清单。');
     setOutlineDraftRows((state.analysisReport?.bid_structure || []).slice(0, 8).map((item, index) => ({
       id: item.id || `${index + 1}`,
       title: item.title || item.purpose || `候选章节 ${index + 1}`,
@@ -2029,7 +2589,6 @@ const App = () => {
     })));
     try {
       let raw = '';
-      let lastFinalNoticeLength = 0;
       advanceProgress('正在调用模型生成目录和映射关系', 16, 1, taskVersion);
       const response = await outlineApi.generateOutlineStream({
         overview: state.projectOverview,
@@ -2038,30 +2597,20 @@ const App = () => {
         analysis_report: state.analysisReport,
         bid_mode: normalizeBidMode(selectedBidMode),
         reference_bid_style_profile: activeReferenceProfile,
-        document_blocks_plan: activeDocumentBlocksPlan,
+        document_blocks_plan: displayDocumentBlocksPlan,
       });
       await consumeSseStream(response, (payload) => {
         if (payload.error) throw new Error(payload.message || '目录生成失败');
         if (payload.preview) {
           const preview = payload.preview as { message?: string; rows?: OutlineItem[] };
           const rows = flattenOutlineDraftRows(preview.rows || []);
-          setOutlineLiveText(prev => [
-            prev,
-            preview.message,
-            rows.length ? rows.slice(0, 12).map(row => `${'  '.repeat(row.level)}${row.id} ${row.title}`).join('\n') : '',
-          ].filter(Boolean).join('\n'));
           if (rows.length) setOutlineDraftRows(rows);
           return;
         }
         if (typeof payload.chunk === 'string') {
           raw += payload.chunk;
-          setStreamText(raw);
           const draftRows = parseOutlineDraftRows(raw);
           if (draftRows.length) setOutlineDraftRows(draftRows);
-          if (payload.chunk && raw.length - lastFinalNoticeLength >= 1024) {
-            lastFinalNoticeLength = raw.length;
-            setOutlineLiveText(prev => `${prev}\n正在接收最终目录 JSON：${raw.length.toLocaleString()} 字符`);
-          }
           advanceProgress('正在调用模型生成目录和映射关系', Math.min(92, 16 + Math.floor(raw.length / 220)), raw.length > 1000 ? 2 : 1, taskVersion);
         }
       });
@@ -2070,11 +2619,14 @@ const App = () => {
       try {
         outline = parseJsonPayload<OutlineData>(raw, '目录生成');
       } catch (parseError: any) {
+        if (!CLIENT_GENERATION_FALLBACKS_ENABLED) {
+          throw parseError;
+        }
         outline = buildClientFallbackOutline(
           state.analysisReport as AnalysisReport,
           normalizeBidMode(selectedBidMode),
           activeReferenceProfile,
-          activeDocumentBlocksPlan,
+          displayDocumentBlocksPlan,
         );
         setInfo(parseError.message || '模型返回不完整 JSON，已使用解析报告生成兜底目录');
       }
@@ -2089,7 +2641,8 @@ const App = () => {
         response_matrix: outline.response_matrix || state.analysisReport.response_matrix,
         coverage_summary: outline.coverage_summary || state.analysisReport.response_matrix?.coverage_summary,
         reference_bid_style_profile: outline.reference_bid_style_profile || activeReferenceProfile,
-        document_blocks_plan: outline.document_blocks_plan || activeDocumentBlocksPlan,
+        document_blocks_plan: outline.document_blocks_plan || displayDocumentBlocksPlan,
+        asset_library: outline.asset_library || effectiveOutline?.asset_library || { visual_assets: [] },
         bid_mode: normalizeBidMode(selectedBidMode),
       };
       if (nextOutline.document_blocks_plan) {
@@ -2101,7 +2654,6 @@ const App = () => {
       if (first) updateSelectedChapter(first.item.id);
       setStreamText('');
       setOutlineDraftRows(flattenOutlineDraftRows(nextOutline.outline));
-      setOutlineLiveText(prev => `${prev}\n目录生成完成：已写入 ${countNodes(nextOutline.outline)} 个节点，可点击父级展开查看三级标题。`);
       completeProgress('目录生成完成', taskVersion);
       setSuccess('目录映射完成，章节已关联评分、风险和材料项');
     } catch (error: any) {
@@ -2134,7 +2686,8 @@ const App = () => {
       response_matrix: effectiveOutline.response_matrix || activeReport.response_matrix,
       bid_mode: normalizeBidMode(effectiveOutline.bid_mode || selectedBidMode),
       reference_bid_style_profile: activeReferenceProfile,
-      document_blocks_plan: activeDocumentBlocksPlan,
+      document_blocks_plan: displayDocumentBlocksPlan,
+      asset_library: activeAssetLibrary,
       generated_summaries: entries
         .filter(item => item.item.id !== entry.item.id && item.item.content?.trim())
         .slice(-12)
@@ -2175,9 +2728,7 @@ const App = () => {
     setManualReviewConfirmed(false);
     setActiveDocId(entry.item.id);
     if (scroll) {
-      window.requestAnimationFrame(() => {
-        document.getElementById(docSectionId(entry.item.id))?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      });
+      scrollDocumentStageTo(entry.item.id);
     }
     return nextOutline;
   };
@@ -2209,6 +2760,7 @@ const App = () => {
       });
       advanceProgress('正在保存本章正文', 88, 2, taskVersion);
       saveGeneratedContent(selectedEntry, content);
+      await draftStorage.flushPendingSave();
       syncGenerationProgress('本章正文生成完成', 100, 2, '正文生成');
       setGenerationProgress(prev => prev ? { ...prev, status: 'success', percent: 100, detail: '本章正文生成完成' } : prev);
       completeProgress('本章正文生成完成', taskVersion);
@@ -2277,6 +2829,7 @@ const App = () => {
         batchOutlineRef.current = nextOutline;
         updateOutline(nextOutline);
       }
+      await draftStorage.flushPendingSave();
       syncGenerationProgress('批量正文生成完成', 100, 2, '批量生成');
       setGenerationProgress(prev => prev ? { ...prev, status: 'success', percent: 100, detail: '批量正文生成完成' } : prev);
       completeProgress('批量正文生成完成', taskVersion);
@@ -2318,7 +2871,7 @@ const App = () => {
         analysis_report: activeReport,
         response_matrix: effectiveOutline.response_matrix || activeReport?.response_matrix,
         reference_bid_style_profile: activeReferenceProfile,
-        document_blocks_plan: activeDocumentBlocksPlan,
+        document_blocks_plan: displayDocumentBlocksPlan,
         bid_mode: normalizeBidMode(effectiveOutline.bid_mode || selectedBidMode),
       });
       await consumeSseStream(response, (payload) => {
@@ -2366,9 +2919,11 @@ const App = () => {
           advanceProgress('正在生成图表、表格、图片和承诺书规划', Math.min(92, 12 + Math.floor(raw.length / 180)), raw.length > 800 ? 1 : 0, taskVersion);
         }
       });
-      const plan = parseJsonPayload<Record<string, unknown>>(raw, '图表素材规划');
+      const modelPlan = parseJsonPayload<Record<string, unknown>>(raw, '图表素材规划');
+      const plan = normalizeDocumentBlocksPlan(modelPlan, referenceImageSlots, effectiveOutline.outline);
       setDocumentBlocksPlan(plan);
-      updateOutline({ ...effectiveOutline, document_blocks_plan: plan, reference_bid_style_profile: activeReferenceProfile });
+      setVisualAssetResults({});
+      updateOutline({ ...effectiveOutline, document_blocks_plan: plan, asset_library: { visual_assets: [] }, reference_bid_style_profile: activeReferenceProfile });
       if (state.analysisReport) {
         updateAnalysisResults(state.projectOverview, state.techRequirements, {
           ...state.analysisReport,
@@ -2381,6 +2936,92 @@ const App = () => {
     } catch (error: any) {
       failProgress(error.message || '图表素材规划失败', undefined, taskVersion);
       setError(error.message || '图表素材规划失败');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const openAssetsWorkspace = () => {
+    if (!effectiveOutline || !activeReport) {
+      setError('请先完成标准解析并生成目录');
+      return;
+    }
+    goToPage('assets');
+  };
+
+  const runVisualAssetGeneration = async (
+    group: PlannedBlockGroup,
+    groupIndex: number,
+    block: PlannedBlock,
+    blockIndex: number,
+    assetKey: string,
+  ) => {
+    if (!effectiveOutline) {
+      setError('请先生成目录');
+      return;
+    }
+    setBusy(`asset:${assetKey}`);
+    setVisualAssetResults(prev => ({
+      ...prev,
+      [assetKey]: { status: 'running' },
+    }));
+    try {
+      const response = await documentApi.generateVisualAsset({
+        chapter_id: group.chapter_id,
+        chapter_title: group.chapter_title,
+        project_name: effectiveOutline.project_name || project?.name || '',
+        block,
+        reference_bid_style_profile: activeReferenceProfile,
+        size: '1536x1024',
+      });
+      const blockName = String(block.block_name || block.name || blockTypeLabel(block.block_type));
+      const generatedAt = new Date().toISOString();
+      const generatedAsset: GeneratedVisualAsset = {
+        asset_key: assetKey,
+        chapter_id: group.chapter_id,
+        chapter_title: group.chapter_title,
+        block_name: blockName,
+        block_type: String(block.block_type || ''),
+        image_url: response.data.image_url || '',
+        b64_json: response.data.b64_json || '',
+        prompt: response.data.prompt || '',
+        caption: `图 ${group.chapter_id}-${blockIndex + 1} ${blockName}`,
+        generated_at: generatedAt,
+      };
+      setVisualAssetResults(prev => ({
+        ...prev,
+        [assetKey]: {
+          status: 'success',
+          imageUrl: generatedAsset.image_url,
+          b64Json: generatedAsset.b64_json,
+          prompt: generatedAsset.prompt,
+          caption: generatedAsset.caption,
+          generatedAt,
+        },
+      }));
+      const nextPlan = attachGeneratedAssetToPlan(displayDocumentBlocksPlan as Record<string, unknown>, groupIndex, blockIndex, generatedAsset, block);
+      setDocumentBlocksPlan(nextPlan);
+      updateOutline({
+        ...effectiveOutline,
+        document_blocks_plan: nextPlan,
+        asset_library: { visual_assets: visualAssetsFromPlanGroups(plannedBlockGroups, { ...visualAssetResults, [assetKey]: {
+          status: 'success',
+          imageUrl: generatedAsset.image_url,
+          b64Json: generatedAsset.b64_json,
+          prompt: generatedAsset.prompt,
+          caption: generatedAsset.caption,
+          generatedAt,
+        } }) },
+      });
+      setManualReviewConfirmed(false);
+      setSuccess(`${block.block_name || blockTypeLabel(block.block_type)} 已生成`);
+    } catch (error: any) {
+      const message = apiErrorMessage(error, '图表素材生成失败');
+      setVisualAssetResults(prev => ({
+        ...prev,
+        [assetKey]: { status: 'error', error: message },
+      }));
+      setError(message);
     } finally {
       setBusy('');
     }
@@ -2402,7 +3043,7 @@ const App = () => {
         analysis_report: activeReport,
         response_matrix: effectiveOutline.response_matrix || activeReport.response_matrix,
         reference_bid_style_profile: activeReferenceProfile,
-        document_blocks_plan: activeDocumentBlocksPlan,
+        document_blocks_plan: displayDocumentBlocksPlan,
       });
       await consumeSseStream(response, (payload) => {
         if (payload.error) throw new Error(payload.message || '全文一致性修订失败');
@@ -2445,7 +3086,8 @@ const App = () => {
         analysis_report: activeReport,
         review_report: reviewReport,
         reference_bid_style_profile: activeReferenceProfile,
-        document_blocks_plan: activeDocumentBlocksPlan,
+        document_blocks_plan: displayDocumentBlocksPlan,
+        asset_library: activeAssetLibrary,
         manual_review_confirmed: manualReviewConfirmed,
         export_dir: targetExportDir || undefined,
       });
@@ -2536,10 +3178,6 @@ const App = () => {
     }
   };
 
-  const handleWorkflowAction = (item: typeof NAV_ITEMS[number]) => {
-    goToPage(item.key);
-  };
-
   const flowIndex = state.fileContent
     ? state.analysisReport
       ? state.outlineData
@@ -2552,42 +3190,22 @@ const App = () => {
       : 0
     : -1;
 
-  const analysisStepStatus = (index: number) => {
-    if (progress?.label === '标准解析' && progress.status === 'stopped') {
-      if (index < progress.stepIndex) return '已完成';
-      if (index === progress.stepIndex) return '已停止';
-      return '待执行';
-    }
-    if (progress?.label === '标准解析' && progress.status === 'paused') {
-      if (index < progress.stepIndex) return '已完成';
-      if (index === progress.stepIndex) return '已暂停';
-      return '待执行';
-    }
-    if (state.analysisReport && busy !== 'analysis') return '已完成';
-    if (progress?.label === '标准解析' && progress.status === 'error') {
-      if (index < progress.stepIndex) return '已完成';
-      if (index === progress.stepIndex) return '失败';
-      return '待执行';
-    }
-    if (busy === 'analysis') {
-      const current = progress?.stepIndex ?? 0;
-      if (index < current) return '已完成';
-      if (index === current) return '进行中';
-      return '待执行';
-    }
-    if (state.fileContent && index === 0) return '待执行';
-    return '未开始';
+  const handleWorkflowAction = (item: typeof NAV_ITEMS[number]) => {
+    goToPage(item.key);
   };
 
   const workflowStatus = (key: NavKey) => {
     if (busy === 'upload' && key === 'project') return `${progress?.percent ?? 0}%`;
     if (busy === 'analysis' && key === 'analysis') return `${progress?.percent ?? 0}%`;
     if (busy === 'outline' && key === 'outline') return `${progress?.percent ?? 0}%`;
+    if (busy === 'blocks' && key === 'assets') return `${progress?.percent ?? 0}%`;
+    if (busy.startsWith('asset:') && key === 'assets') return '生成中';
     if (busy.startsWith('chapter') && key === 'content') return `${progress?.percent ?? 0}%`;
     if (busy === 'review' && key === 'review') return `${progress?.percent ?? 0}%`;
     if (key === 'project') return state.fileContent ? '已上传' : '选择';
     if (key === 'analysis') return state.analysisReport ? '已完成' : state.fileContent ? '可执行' : '待上传';
     if (key === 'outline') return effectiveOutline ? '已生成' : state.analysisReport ? '可执行' : '待解析';
+    if (key === 'assets') return plannedBlocksCount ? `${generatedVisualCount}/${visualBlocksCount}` : effectiveOutline ? '可规划' : '待目录';
     if (key === 'content') return completedLeaves > 0 ? `${completedLeaves}/${entries.length}` : effectiveOutline ? '可执行' : '待目录';
     if (key === 'review') return reviewReport ? '已审校' : completedLeaves > 0 ? '可执行' : '待正文';
     return '设置';
@@ -2606,13 +3224,37 @@ const App = () => {
   const busyPercent = progress?.percent ?? 12;
   const currentPage = activeNav === 'config' ? 'project' : activeNav;
   const pageMeta = PAGE_META[currentPage];
+  const analysisTaskProgressVisible = currentPage === 'analysis' && (busy === 'analysis' || progress?.label === '标准解析');
+  const tenderRevealVisible = currentPage === 'analysis' && Boolean(activeReport) && !analysisTaskProgressVisible && analysisRevealPercent < 100;
+  const tenderParseProgress: ProgressState | null = analysisTaskProgressVisible
+    ? progress
+    : tenderRevealVisible
+      ? {
+          label: '解析归纳',
+          detail: '正在整理招标文件解析归纳',
+          percent: analysisRevealPercent,
+          stepIndex: Math.min(3, Math.floor(analysisRevealPercent / 34)),
+          steps: ['读取解析结果', '组织评审页签', '整理原文证据', '生成归纳视图'],
+          status: 'running',
+        }
+      : null;
+  const tenderParseReady = Boolean(activeReport && activeParseTab && activeParseSection && !analysisTaskProgressVisible && !tenderRevealVisible);
 
   return (
-    <div className="ops-app">
+    <div className={`ops-app ${navCollapsed ? 'ops-app--nav-collapsed' : ''}`}>
       <aside className="ops-nav">
         <div className="ops-brand">
           <span className="ops-brand__mark">A</span>
-          <span>华正ai标书系统</span>
+          <span className="ops-brand__text">华正ai标书系统</span>
+          <button
+            type="button"
+            className="ops-nav-toggle"
+            onClick={() => setNavCollapsed(value => !value)}
+            aria-label={navCollapsed ? '展开侧边栏' : '收起侧边栏'}
+            title={navCollapsed ? '展开' : '收起'}
+          >
+            {navCollapsed ? <ChevronRightIcon className="h-4 w-4" /> : <ChevronDownIcon className="h-4 w-4" />}
+          </button>
         </div>
         <nav className="ops-nav__list">
           {NAV_ITEMS.map((item) => {
@@ -2624,6 +3266,7 @@ const App = () => {
                 type="button"
                 className={`ops-nav__item ${active ? 'ops-nav__item--active' : ''}`}
                 onClick={() => handleWorkflowAction(item)}
+                title={navCollapsed ? item.label : undefined}
               >
                 <Icon className="h-4 w-4" />
                 <span className="ops-nav__copy">
@@ -2638,23 +3281,29 @@ const App = () => {
         <div className="history-panel">
           <div className="history-panel__head">
             <strong>项目数据库</strong>
-            <span>{historyRecords.length}</span>
+            <button type="button" className="text-link" onClick={toggleHistoryPanel}>
+              {historyOpen ? '收起' : '查看'}
+            </button>
           </div>
-          <div className="history-list">
-            {historyRecords.length ? historyRecords.slice(0, 4).map(record => (
-              <button
-                key={record.id}
-                type="button"
-                className="history-item"
-                onClick={() => restoreHistoryRecord(record)}
-              >
-                <strong>{record.title}</strong>
-                <span>{record.total ? `${record.completed}/${record.total} 章` : '待生成目录'} · {new Date(record.updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
-              </button>
-            )) : (
-              <div className="history-empty">项目会保存到后端数据库</div>
-            )}
-          </div>
+          {historyOpen ? (
+            <div className="history-list">
+              {historyRecords.length ? historyRecords.slice(0, 4).map(record => (
+                <button
+                  key={record.id}
+                  type="button"
+                  className="history-item"
+                  onClick={() => restoreHistoryRecord(record)}
+                >
+                  <strong>{record.title}</strong>
+                  <span>{record.total ? `${record.completed}/${record.total} 章` : '待生成目录'} · {new Date(record.updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                </button>
+              )) : (
+                <div className="history-empty">暂无项目记录</div>
+              )}
+            </div>
+          ) : (
+            <div className="history-empty">历史项目已隐藏，点击查看后加载。</div>
+          )}
         </div>
         <div className="ops-progress-card">
           <div className="ops-progress-card__ring">{coverage}%</div>
@@ -2683,18 +3332,18 @@ const App = () => {
           </div>
           <div className="ops-topbar__center">
             <span>生成模式：</span>
-            <div className="ops-segment">
+            <select
+              className="ops-mode-select"
+              value={selectedBidMode}
+              onChange={(event) => handleModeChange(event.target.value as BidMode)}
+              aria-label="生成模式"
+            >
               {BID_MODE_OPTIONS.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  className={selectedBidMode === option.value ? 'active' : ''}
-                  onClick={() => handleModeChange(option.value)}
-                >
+                <option key={option.value} value={option.value}>
                   {option.label}
-                </button>
+                </option>
               ))}
-            </div>
+            </select>
             <span>当前模型：</span>
             <strong>{state.config.model_name || '未选择模型'}</strong>
           </div>
@@ -2731,42 +3380,50 @@ const App = () => {
             </div>
 
             {currentPage === 'project' && (
-              <div className="ops-page-grid ops-page-grid--upload">
-                <div className="ops-panel">
-                  <h2>上传招标文件</h2>
-                  <button type="button" className="upload-zone upload-zone--large" onClick={() => fileInputRef.current?.click()}>
-                    <DocumentArrowUpIcon className="h-12 w-12" />
-                    <strong>点击选择 PDF 或 DOCX 招标文件</strong>
-                    <span>文件大小限制在 500MB 以下，上传后系统会读取全文并复用同一份解析结果。</span>
-                  </button>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    className="hidden"
-                    accept=".pdf,.docx"
-                    onChange={(event) => {
-                      const file = event.target.files?.[0];
-                      if (file) handleUpload(file);
-                    }}
-                  />
-                  <div className="file-pill">
-                    <DocumentTextIcon className="h-5 w-5 text-rose-600" />
-                    <div>
-                      <strong>{uploadedFileName || '等待上传招标文件'}</strong>
-                      <span>{state.fileContent ? '已上传并读取文本' : '待上传'}</span>
-                    </div>
-                    {state.fileContent && <CheckCircleIcon className="h-5 w-5 text-emerald-600" />}
-                  </div>
-                  <div className="page-action-row">
-                    <button type="button" className="solid-button" onClick={() => goToPage('analysis')} disabled={!state.fileContent}>
-                      去解析
+              <>
+                <div className="ops-page-grid ops-page-grid--upload">
+                  <div className="ops-panel">
+                    <h2>上传招标文件</h2>
+                    <button type="button" className="upload-zone upload-zone--large" onClick={() => fileInputRef.current?.click()}>
+                      <DocumentArrowUpIcon className="h-12 w-12" />
+                      <strong>点击选择 PDF 或 DOCX 招标文件</strong>
+                      <span>文件大小限制在 500MB 以下，上传后系统会读取全文并复用同一份解析结果。</span>
                     </button>
-                    <button type="button" onClick={() => fileInputRef.current?.click()}>重新选择</button>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      className="hidden"
+                      accept=".pdf,.docx"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) handleUpload(file);
+                      }}
+                    />
+                    <div className="file-pill">
+                      <DocumentTextIcon className="h-5 w-5 text-rose-600" />
+                      <div>
+                        <strong>{uploadedFileName || '等待上传招标文件'}</strong>
+                        <span>{state.fileContent ? '已上传并读取文本' : '待上传'}</span>
+                      </div>
+                      {state.fileContent && <CheckCircleIcon className="h-5 w-5 text-emerald-600" />}
+                    </div>
+                    <div className="page-action-row">
+                      <button type="button" onClick={() => fileInputRef.current?.click()}>重新选择</button>
+                    </div>
                   </div>
-                </div>
 
                 <div className="ops-panel">
                   <h2>上传成熟样例</h2>
+                  <button
+                    type="button"
+                    className="upload-zone"
+                    onClick={runHistoryReferenceMatch}
+                    disabled={!state.fileContent || busy === 'reference-match' || busy === 'reference'}
+                  >
+                    <SparklesIcon className="h-8 w-8" />
+                    <strong>自动匹配历史案例库</strong>
+                    <span>根据当前招标文件，从 157 个历史项目和 251 份标书中召回候选，用 LLM 选择最合适案例并生成成熟样例模板。</span>
+                  </button>
                   <button type="button" className="upload-zone" onClick={() => referenceInputRef.current?.click()}>
                     <DocumentArrowUpIcon className="h-8 w-8" />
                     <strong>选择 PDF 或 DOCX 样例标书</strong>
@@ -2788,13 +3445,17 @@ const App = () => {
                     <div>
                       <strong>{referenceFileName || '未接入写作模板'}</strong>
                       <span>
-                        {busy === 'reference'
-                          ? '样例解析中'
+                        {busy === 'reference-match'
+                          ? '历史案例匹配中'
+                          : busy === 'reference'
+                            ? '样例解析中'
                           : hasReferenceProfile
-                            ? '样例写作模板已生成'
+                            ? matchedHistoryCase
+                              ? `已匹配：${matchedHistoryCase.primary_domain || '历史案例'}`
+                              : '样例写作模板已生成'
                             : referenceFile
                               ? '已选择，待解析'
-                              : '可选，建议上传成熟目标文件'}
+                              : '可自动匹配，也可手动上传成熟目标文件'}
                       </span>
                     </div>
                     {hasReferenceProfile ? <CheckCircleIcon className="h-5 w-5 text-emerald-600" /> : null}
@@ -2804,6 +3465,9 @@ const App = () => {
                       {busy === 'reference' ? '解析中' : hasReferenceProfile ? '重新解析' : '去解析'}
                     </button>
                     <button type="button" onClick={() => referenceInputRef.current?.click()} disabled={busy === 'reference'}>重新选择</button>
+                    <button type="button" onClick={runHistoryReferenceMatch} disabled={!state.fileContent || busy === 'reference-match'}>
+                      {busy === 'reference-match' ? '匹配中' : '自动匹配'}
+                    </button>
                   </div>
                 </div>
 
@@ -2824,6 +3488,12 @@ const App = () => {
                         <span>{String(activeReferenceRecord.recommended_use_case || '用于后续目录、正文、表格和审校模板复用。')}</span>
                       </div>
                       <div className="info-row"><span>样例范围</span><strong>{String(activeReferenceRecord.document_scope || 'unknown')}</strong></div>
+                      {matchedHistoryCase ? (
+                        <>
+                          <div className="info-row"><span>历史案例</span><strong>{String(matchedHistoryCase.project_title || '已匹配')}</strong></div>
+                          <div className="info-row"><span>匹配领域</span><strong>{String(matchedHistoryCase.primary_domain || '未标明')}</strong></div>
+                        </>
+                      ) : null}
                       {referenceProfileStats.map(([label, value]) => (
                         <div key={label} className="info-row"><span>{label}</span><strong>{value}</strong></div>
                       ))}
@@ -2867,19 +3537,49 @@ const App = () => {
                     </div>
                   )}
                 </div>
-              </div>
+                </div>
+
+                <div className="upload-final-action">
+                  <div>
+                    <strong>进入标准解析</strong>
+                    <span>确认招标文件、成熟样例和资料状态后，再进入条款识别与评分项抽取。</span>
+                  </div>
+                  <button type="button" className="solid-button" onClick={() => goToPage('analysis')} disabled={!state.fileContent}>
+                    去解析
+                  </button>
+                </div>
+              </>
             )}
 
             {currentPage === 'analysis' && (
               <div className="ops-page-grid ops-page-grid--analysis">
-                <div className="ops-panel">
+                <div className="ops-panel tender-parse-panel">
                   <div className="ops-panel__head">
-                    <h2>解析状态</h2>
-                    <button type="button" className="text-link" onClick={runAnalysis} disabled={!state.fileContent || busy === 'analysis'}>
-                      {busy === 'analysis' ? '解析中' : '开始解析'}
-                    </button>
+                    <h2>招标文件解析归纳</h2>
+                    <div className="panel-head-actions">
+                      <span>
+                        {checkingHistoryRequirements
+                          ? '历史库核对中'
+                          : historyRequirementSummary
+                            ? `历史库 ${historyRequirementSummary.satisfied}/${historyRequirementSummary.total}`
+                            : activeReport ? '按评审页签组织' : '待解析'}
+                      </span>
+                      {activeReport && (
+                        <button
+                          type="button"
+                          className="text-link"
+                          onClick={() => runHistoryRequirementCheck(activeReport)}
+                          disabled={checkingHistoryRequirements}
+                        >
+                          {checkingHistoryRequirements ? '核对中' : '历史库核对'}
+                        </button>
+                      )}
+                      <button type="button" className="text-link" onClick={runAnalysis} disabled={!state.fileContent || busy === 'analysis'}>
+                        {busy === 'analysis' ? '解析中' : activeReport ? '重新解析' : '开始解析'}
+                      </button>
+                    </div>
                   </div>
-                  {(busy === 'analysis' || progress?.label === '标准解析') && <TaskProgress progress={progress} onRetry={runAnalysis} />}
+                  {tenderParseProgress && <TaskProgress progress={tenderParseProgress} onRetry={runAnalysis} />}
                   {(busy === 'analysis' || analysisControl === 'paused') && (
                     <div className="analysis-control-row">
                       <button
@@ -2906,57 +3606,8 @@ const App = () => {
                       </button>
                     </div>
                   )}
-                  <div className={`parser-status parser-status--${currentParserStatus.tone}`}>
-                    <strong>{currentParserStatus.label}</strong>
-                    <span>{currentParserStatus.detail}</span>
-                  </div>
-                  {ANALYSIS_STEPS.map((item, index) => {
-                    const status = analysisStepStatus(index);
-                    return (
-                      <div key={item} className={`check-row check-row--${status === '失败' || status === '已停止' ? 'error' : status === '进行中' || status === '已暂停' ? 'active' : status === '已完成' ? 'done' : 'idle'}`}>
-                        <CheckCircleIcon className={`h-4 w-4 ${status === '已完成' ? 'text-emerald-600' : status === '失败' || status === '已停止' ? 'text-rose-600' : status === '进行中' || status === '已暂停' ? 'text-amber-500' : 'text-slate-300'}`} />
-                        <span>{item}</span>
-                        <strong>
-                          {(status === '进行中' || status === '已暂停') && <i className="status-pulse" />}
-                          {status}
-                        </strong>
-                      </div>
-                    );
-                  })}
                   {streamText && <pre className="stream-box stream-box--large">{streamText}</pre>}
-                  <div className="page-action-row">
-                    <button type="button" className="solid-button" onClick={runAnalysis} disabled={!state.fileContent || busy === 'analysis'}>
-                      {state.analysisReport ? '重新解析' : '开始解析'}
-                    </button>
-                    <button type="button" onClick={() => goToPage('outline')} disabled={!state.analysisReport}>去生成目录</button>
-                  </div>
-                </div>
-
-                <div className="ops-panel project-info">
-                  <div className="ops-panel__head">
-                    <h2>解析结果摘要</h2>
-                    <span>{activeReport ? (project?.__fallback ? '已补全关键字段' : bidModeLabel(selectedBidMode)) : '待解析'}</span>
-                  </div>
-                  {activeReport && project?.__fallback && (
-                    <div className="field-hint">部分基础信息来自解析文本兜底提取，后续审校时仍建议核对原文。</div>
-                  )}
-                  {[
-                    ['项目编号', project?.number],
-                    ['采购人', project?.purchaser],
-                    ['服务期限', project?.service_period],
-                    ['预算金额', project?.budget],
-                    ['提交截止时间', project?.bid_deadline],
-                  ].map(([label, value]) => (
-                    <div key={label} className="info-row"><span>{label}</span><strong>{isMeaningfulValue(value) ? value : '未识别到'}</strong></div>
-                  ))}
-                </div>
-
-                <div className="ops-panel tender-parse-panel">
-                  <div className="ops-panel__head">
-                    <h2>招标文件解析归纳</h2>
-                    <span>{activeReport ? '按评审页签组织' : '待解析'}</span>
-                  </div>
-                  {activeReport && activeParseTab && activeParseSection ? (
+                  {tenderParseReady ? (
                     <>
                       <div className="tender-parse-tabs">
                         {tenderParseTabs.map(tab => (
@@ -2966,7 +3617,7 @@ const App = () => {
                             className={tab.key === activeParseTab.key ? 'active' : ''}
                             onClick={() => {
                               setActiveParseTabKey(tab.key);
-                              setActiveParseSectionId(tab.sections[0]?.id || '');
+                              selectParseSection(tab.sections[0]?.id || '');
                             }}
                           >
                             <CheckCircleIcon className="h-4 w-4" />
@@ -2975,14 +3626,17 @@ const App = () => {
                           </button>
                         ))}
                       </div>
-                      {isScoringParseTab(activeParseTab.key) ? (
-                        <div className="tender-score-table-wrap">
+                      <div className="tender-parse-layout">
+                        <div className="tender-parse-main">
+                          {isScoringParseTab(activeParseTab.key) ? (
+                            <div className="tender-score-table-wrap">
                           <table className="tender-score-table">
                             <thead>
                               <tr>
                                 <th>评分项</th>
                                 <th>分值</th>
                                 <th>得分要求</th>
+                                <th>历史库</th>
                               </tr>
                             </thead>
                             <tbody>
@@ -2993,21 +3647,40 @@ const App = () => {
                                   <td>
                                     <div className="score-requirement">
                                       {(row.subitems.length ? row.subitems : [row.requirement]).map((subitem, index) => (
-                                        <p key={`${row.id}-subitem-${index}`}>{subitem}</p>
+                                        <button
+                                          key={`${row.id}-subitem-${index}`}
+                                          type="button"
+                                          className="source-jump-item source-jump-item--compact"
+                                          onClick={() => locateSourceItem(`${row.item} · 要求 ${index + 1}`, subitem)}
+                                          title="定位到右侧原文"
+                                        >
+                                          <span>{subitem}</span>
+                                          <em>定位</em>
+                                        </button>
                                       ))}
                                       {row.evidence.length > 0 && (
                                         <div className="score-evidence">
                                           {row.evidence.slice(0, 2).map((line, index) => (
-                                            <span key={`${row.id}-evidence-${index}`}>{line}</span>
+                                            <button
+                                              key={`${row.id}-evidence-${index}`}
+                                              type="button"
+                                              className="source-jump-item source-jump-item--evidence"
+                                              onClick={() => locateSourceItem(`${row.item} · 证据 ${index + 1}`, line)}
+                                              title="定位到右侧原文"
+                                            >
+                                              <span>{line}</span>
+                                              <em>定位</em>
+                                            </button>
                                           ))}
                                         </div>
                                       )}
                                     </div>
                                   </td>
+                                  <td>{renderHistoryRequirementBadge(historyRequirementChecks[row.id])}</td>
                                 </tr>
                               )) : (
                                 <tr>
-                                  <td colSpan={3}>当前解析报告未返回该类评分表，建议重新解析或人工核对评分办法章节。</td>
+                                  <td colSpan={4}>当前解析报告未返回该类评分表，建议重新解析或人工核对评分办法章节。</td>
                                 </tr>
                               )}
                             </tbody>
@@ -3021,7 +3694,7 @@ const App = () => {
                                 key={section.id}
                                 type="button"
                                 className={section.id === activeParseSection.id ? 'active' : ''}
-                                onClick={() => setActiveParseSectionId(section.id)}
+                                onClick={() => selectParseSection(section.id)}
                               >
                                 <span>{section.title}</span>
                                 <em>{section.count ? `${section.count} 项` : '待核对'}</em>
@@ -3035,24 +3708,104 @@ const App = () => {
                             </div>
                             <div className="tender-parse-content">
                               {activeParseSection.content.map((line, index) => (
-                                <p key={`${activeParseSection.id}-content-${index}`}>{line}</p>
+                                <button
+                                  key={`${activeParseSection.id}-content-${index}`}
+                                  type="button"
+                                  className="source-jump-item"
+                                  onClick={() => locateSourceItem(`${activeParseSection.title} · 第 ${index + 1} 项`, line)}
+                                  title="定位到右侧原文"
+                                >
+                                  <span>{line}</span>
+                                  <em>定位</em>
+                                </button>
                               ))}
                             </div>
-                            <div className="tender-parse-evidence">
-                              <strong>原文证据</strong>
-                              {activeParseSection.evidence.length ? (
-                                activeParseSection.evidence.map((line, index) => (
-                                  <span key={`${activeParseSection.id}-evidence-${index}`}>{line}</span>
-                                ))
-                              ) : (
-                                <span>当前条目未返回可定位原文，建议重新解析或人工核对源文件。</span>
-                              )}
-                            </div>
+                            {activeParseTab.key === 'qualification' && activeQualificationHistoryChecks.length > 0 && (
+                              <div className="history-check-panel">
+                                <div className="history-check-panel__head">
+                                  <strong>历史库资质核对</strong>
+                                  <span>
+                                    {activeQualificationHistoryChecks.filter(check => check.satisfied).length}/{activeQualificationHistoryChecks.length} 项满足
+                                  </span>
+                                </div>
+                                <div className="history-check-list">
+                                  {activeQualificationHistoryChecks.map(check => (
+                                    <div key={check.item_id} className="history-check-row">
+                                      <span>{check.label}</span>
+                                      {renderHistoryRequirementBadge(check)}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
                           </article>
                         </div>
                       )}
+                        </div>
+                        <aside
+                          ref={evidencePanelRef}
+                          className={`tender-source-panel ${evidenceHighlighted ? 'tender-source-panel--highlight' : ''}`}
+                          aria-live="polite"
+                        >
+                          <div className="tender-source-panel__head">
+                            <strong>上传文档原文</strong>
+                            <span>{activeSourceLineIndex >= 0 ? `已定位：${activeSourceLabel || activeParseSection.title}` : `全文：${activeSourceLabel || activeParseSection.title}`}</span>
+                          </div>
+                          {renderActiveHistoryEvidencePanel()}
+                          <div className="tender-source-word" role="document" aria-label="上传文档原文预览">
+                            {state.sourcePreviewHtml ? (
+                              <div className="tender-source-docx-stage">
+                                <section
+                                  className="tender-source-docx-page"
+                                  dangerouslySetInnerHTML={{ __html: state.sourcePreviewHtml }}
+                                />
+                              </div>
+                            ) : sourcePreviewPages.length ? sourcePreviewPages.map(page => (
+                              <section
+                                key={`source-page-${page.pageNumber}`}
+                                className="tender-source-page"
+                                aria-label={`第 ${page.pageNumber} 页 / 共 ${sourcePreviewPages.length} 页`}
+                              >
+                                <div className="tender-source-page__crop tender-source-page__crop--tl" aria-hidden="true" />
+                                <div className="tender-source-page__crop tender-source-page__crop--tr" aria-hidden="true" />
+                                <div className="tender-source-page__body">
+                                  {page.blocks.map(block => (
+                                    block.type === 'blank' ? (
+                                      <div
+                                        id={`source-line-${block.sourceIndex}`}
+                                        key={`source-line-${block.sourceIndex}`}
+                                        className={`tender-source-block tender-source-block--blank ${block.sourceIndex === activeSourceLineIndex ? 'tender-source-block--active' : ''}`}
+                                        aria-hidden="true"
+                                      />
+                                    ) : (
+                                      <p
+                                        id={`source-line-${block.sourceIndex}`}
+                                        key={`source-line-${block.sourceIndex}`}
+                                        className={`tender-source-block tender-source-block--${block.type} ${block.sourceIndex === activeSourceLineIndex ? 'tender-source-block--active' : ''}`}
+                                      >
+                                        {block.text}
+                                      </p>
+                                    )
+                                  ))}
+                                </div>
+                                <div className="tender-source-page__footer">第 {page.pageNumber} 页 / 共 {sourcePreviewPages.length} 页</div>
+                                <div className="tender-source-page__crop tender-source-page__crop--bl" aria-hidden="true" />
+                                <div className="tender-source-page__crop tender-source-page__crop--br" aria-hidden="true" />
+                              </section>
+                            )) : (
+                              <section className="tender-source-page">
+                                <div className="tender-source-page__body">
+                                  <p className="tender-source-block tender-source-block--active">
+                                    未读取到上传文件原文，请重新上传招标文件。
+                                  </p>
+                                </div>
+                              </section>
+                            )}
+                          </div>
+                        </aside>
+                      </div>
                     </>
-                  ) : (
+                  ) : tenderParseProgress ? null : (
                     <div className="empty-state empty-state--compact">
                       <strong>等待标准解析</strong>
                       <span>完成后会按基础信息、资格审查、技术评分、废标项、投标文件要求等页签展示，并保留每项原文证据。</span>
@@ -3060,50 +3813,6 @@ const App = () => {
                   )}
                 </div>
 
-                <div className="ops-panel response-matrix-panel">
-                  <div className="ops-panel__head">
-                    <h2>响应矩阵</h2>
-                    <div className="panel-head-actions">
-                      <span>{activeResponseMatrix ? `${responseMatrixItems.length} 项` : '待生成'}</span>
-                      {activeResponseMatrix && responseMatrixItems.length > 5 && (
-                        <button type="button" className="text-link" onClick={() => setMatrixExpanded(prev => !prev)}>
-                          {matrixExpanded ? '收起' : '展开全部'}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  {activeResponseMatrix ? (
-                    <>
-                      <div className="review-metrics review-metrics--compact">
-                        <Metric label="矩阵项" value={`${responseMatrixItems.length}`} tone="green" />
-                        <Metric label="高风险" value={`${highRiskMatrixCount}`} tone="red" />
-                        <Metric label="待覆盖" value={`${uncoveredMatrixCount}`} tone="amber" />
-                      </div>
-                      <div className="matrix-mini-list">
-                        {visibleMatrixItems.map(item => (
-                          <div key={item.id} className="matrix-mini-row">
-                            <strong>{item.id}</strong>
-                            <span>{item.requirement_summary || item.source_item_id}</span>
-                            <em>{item.priority === 'high' || item.blocking ? '高优先级' : item.source_type}</em>
-                            {matrixExpanded && (
-                              <div className="matrix-mini-detail">
-                                <span>策略：{item.response_strategy || '待目录阶段映射'}</span>
-                                <span>目标章节：{item.target_chapter_ids?.length ? item.target_chapter_ids.join('、') : '待生成目录后确定'}</span>
-                                <span>材料：{item.required_material_ids?.length ? item.required_material_ids.join('、') : '无明确材料'}</span>
-                                <span>风险：{item.risk_ids?.length ? item.risk_ids.join('、') : '无关联风险'}</span>
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </>
-                  ) : (
-                    <div className="empty-state empty-state--compact">
-                      <strong>等待标准解析</strong>
-                      <span>解析完成后会生成“要求-章节-材料-风险”的响应矩阵，后续目录、正文和审校都会复用它。</span>
-                    </div>
-                  )}
-                </div>
               </div>
             )}
 
@@ -3126,25 +3835,22 @@ const App = () => {
                     </div>
                     <div className="outline-actions">
                       {effectiveOutline && <button type="button" className="solid-button" onClick={() => goToPage('content')}>去生成正文</button>}
-                      <button type="button" onClick={runDocumentBlocksPlan} disabled={!effectiveOutline || !state.analysisReport || busy === 'blocks'}>
+                      <button type="button" onClick={openAssetsWorkspace} disabled={!effectiveOutline || !state.analysisReport}>
                         {busy === 'blocks' ? '规划中' : '图表素材规划'}
                       </button>
                       <button type="button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>智能建议</button>
                       <button type="button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>{effectiveOutline ? '重新生成' : '生成目录'}</button>
                     </div>
                   </div>
-                  {Object.keys(activeDocumentBlocksPlan || {}).length ? (
+                  {Object.keys(displayDocumentBlocksPlan || {}).length ? (
                     <div className="field-hint">
-                      文档块规划已接入：{((activeDocumentBlocksPlan as any).document_blocks || []).length || 0} 个表格/图片/承诺书块，
+                      文档块规划已接入：{((displayDocumentBlocksPlan as any).document_blocks || []).length || 0} 个表格/图片/承诺书块，
                       导出 Word 时会生成可替换占位。
                     </div>
                   ) : (
                     <div className="field-hint">目录生成后可单独执行图表素材规划，补齐表格、流程图、组织架构图、图片和承诺书位置。</div>
                   )}
                   {busy === 'outline' && <TaskProgress progress={progress} />}
-                  {(busy === 'outline' || outlineLiveText) && (
-                    <LiveStreamPanel title="目录生成过程" text={outlineLiveText || streamText} />
-                  )}
                   {activeResponseMatrix && (
                     <div className="matrix-strip">
                       <strong>响应矩阵</strong>
@@ -3213,7 +3919,7 @@ const App = () => {
                     </div>
                   ) : (
                     busy === 'outline' ? (
-                      <OutlineDraftPreview rows={outlineDraftRows} raw={outlineLiveText || streamText} />
+                      <OutlineDraftPreview rows={outlineDraftRows} />
                     ) : (
                       <div className="empty-state">
                         <strong>目录还没有生成</strong>
@@ -3222,6 +3928,149 @@ const App = () => {
                       </div>
                     )
                   )}
+                </div>
+              </div>
+            )}
+
+            {currentPage === 'assets' && (
+              <div className="asset-workspace">
+                <div className="asset-hero ops-panel">
+                  <div>
+                    <p className="workspace-kicker">Visual Assets</p>
+                    <h2>图表素材规划与生成</h2>
+                    <span>把目录中的组织图、流程图、方案信息图和证明材料位集中管理，生成后可作为 Word 正文插图素材。</span>
+                  </div>
+                  <div className="asset-actions">
+                    <button type="button" className="solid-button" onClick={runDocumentBlocksPlan} disabled={!effectiveOutline || !activeReport || busy === 'blocks'}>
+                      <SparklesIcon className="h-4 w-4" /> {plannedBlocksCount ? '重新规划' : '生成规划'}
+                    </button>
+                    <button type="button" onClick={() => goToPage('content')} disabled={!effectiveOutline}>去生成正文</button>
+                  </div>
+                </div>
+
+                {busy === 'blocks' && <TaskProgress progress={progress} />}
+
+                <div className="asset-metrics">
+                  <div><span>规划章节</span><strong>{plannedBlockGroups.length}</strong></div>
+                  <div><span>素材块</span><strong>{plannedBlocksCount}</strong></div>
+                  <div><span>可生成图形</span><strong>{visualBlocksCount}</strong></div>
+                  <div><span>已生成</span><strong>{generatedVisualCount}</strong></div>
+                </div>
+
+                <div className="asset-layout">
+                  <section className="asset-panel">
+                    {selectedReferenceSlot && (
+                      <ReferenceSlotShowcase slot={selectedReferenceSlot} />
+                    )}
+                    <div className="ops-panel__head">
+                      <div>
+                        <h2>图表素材清单</h2>
+                        <span>{plannedBlocksCount ? '按章节展示规划出的图表、表格、图片和承诺书' : '等待生成素材规划'}</span>
+                      </div>
+                    </div>
+
+                    {plannedBlockGroups.length ? plannedBlockGroups.map((group, groupIndex) => (
+                      <div key={`${group.chapter_id}-${groupIndex}`} className="asset-group">
+                        <div className="asset-group__head">
+                          <strong>{group.chapter_id} {group.chapter_title || '未命名章节'}</strong>
+                          <span>{group.blocks.length} 个素材块</span>
+                        </div>
+                        <div className="asset-block-list">
+                          {group.blocks.map((block, blockIndex) => {
+                            const assetKey = blockAssetKey(group.chapter_id, groupIndex, blockIndex, block);
+                            const result = visualAssetResults[assetKey] || visualAssetResultFromBlock(block);
+                            const src = result?.imageUrl || (result?.b64Json ? (result.b64Json.startsWith('data:image') ? result.b64Json : `data:image/png;base64,${result.b64Json}`) : '');
+                            const visual = isVisualBlockType(block.block_type);
+                            const columns = Array.isArray(block.table_schema?.columns) ? block.table_schema.columns : [];
+                            const nodes = Array.isArray(block.chart_schema?.nodes) ? block.chart_schema.nodes : [];
+                            const edges = Array.isArray(block.chart_schema?.edges) ? block.chart_schema.edges : [];
+                            return (
+                              <article key={assetKey} className={`asset-block ${visual ? 'asset-block--visual' : ''}`}>
+                                <div className="asset-block__top">
+                                  <span>{blockTypeLabel(block.block_type)}</span>
+                                  <strong>{block.block_name || block.name || '未命名素材'}</strong>
+                                  {block.required && <em>必需</em>}
+                                </div>
+                                <p>{block.placeholder || block.fallback_placeholder || block.data_source || '按当前目录与解析结果生成素材占位。'}</p>
+                                {columns.length > 0 && (
+                                  <div className="asset-chip-row">
+                                    {columns.slice(0, 8).map((column: unknown, index: number) => <span key={`${assetKey}-col-${index}`}>{String(column)}</span>)}
+                                  </div>
+                                )}
+                                {(nodes.length > 0 || edges.length > 0) && (
+                                  <div className="asset-schema-note">结构：{nodes.length} 个节点 / {edges.length} 条连接</div>
+                                )}
+                                {visual && (
+                                  <div className="asset-block__actions">
+                                    <button
+                                      type="button"
+                                      className="solid-button"
+                                      onClick={() => runVisualAssetGeneration(group, groupIndex, block, blockIndex, assetKey)}
+                                      disabled={busy.startsWith('asset:') || busy === 'blocks'}
+                                    >
+                                      <SparklesIcon className="h-4 w-4" />
+                                      {result?.status === 'running' ? '生成中' : src ? '重新生成图' : '生成图'}
+                                    </button>
+                                    {src && <span className="asset-inline-status">已接入正文和导出</span>}
+                                  </div>
+                                )}
+                                {result?.status === 'error' && <div className="asset-error">{result.error}</div>}
+                                {src && (
+                                  <div className="asset-image-card">
+                                    <img src={src} alt={`${block.block_name || blockTypeLabel(block.block_type)} 生成图`} />
+                                    {result?.prompt && (
+                                      <details>
+                                        <summary>查看生成提示词</summary>
+                                        <pre>{result.prompt}</pre>
+                                      </details>
+                                    )}
+                                  </div>
+                                )}
+                              </article>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )) : (
+                      <div className="empty-state">
+                        <strong>还没有图表素材规划</strong>
+                        <span>点击“生成规划”，系统会根据目录、响应矩阵和成熟样例中的表格/图片位生成素材清单。</span>
+                        <button type="button" className="solid-button" onClick={runDocumentBlocksPlan} disabled={!effectiveOutline || !activeReport || busy === 'blocks'}>
+                          生成图表素材规划
+                        </button>
+                      </div>
+                    )}
+                  </section>
+
+                  <aside className="asset-panel asset-panel--side">
+                    <div className="ops-panel__head">
+                      <div>
+                        <h2>样例风格依据</h2>
+                        <span>来自成熟样例解析出的图片位和表格模型</span>
+                      </div>
+                    </div>
+                    <div className="asset-reference-list">
+                      {referenceImageSlots.slice(0, 8).map((item: any, index: number) => (
+                        <button
+                          type="button"
+                          key={`image-slot-${index}`}
+                          className={`asset-reference-item ${index === activeReferenceSlotIndex ? 'asset-reference-item--active' : ''}`}
+                          onClick={() => setActiveReferenceSlotIndex(index)}
+                        >
+                          <strong>{item.name || item.slot_name || `图片位 ${index + 1}`}</strong>
+                          <span>{item.purpose || item.description || item.position || item.fallback_placeholder || '样例中的图片/素材位置'}</span>
+                        </button>
+                      ))}
+                      {!listCount(activeReferenceRecord.image_slots) && <span className="asset-muted">当前成熟样例未解析出明确图片位；系统会优先按目录 expected_blocks 和图表规划生成。</span>}
+                    </div>
+                    {selectedReferenceSlot && (
+                      <ReferenceSlotPreview slot={selectedReferenceSlot} />
+                    )}
+                    <div className="asset-prompt-note">
+                      <strong>提示词策略</strong>
+                      <span>按联网资料采用正式商务图表、组织架构图、流程图和投标文件图表模板的组合约束：白底、扁平矢量、清晰中文标签、少色、适合 A4 Word 正文。</span>
+                    </div>
+                  </aside>
                 </div>
               </div>
             )}
@@ -3296,12 +4145,7 @@ const App = () => {
                       <TaskProgress progress={generationProgress} />
                     </div>
                   )}
-                  {(busy.startsWith('chapter') || busy === 'batch' || contentStreamText) && (
-                    <div className="content-progress-strip">
-                      <LiveStreamPanel title="正文实时生成" text={contentStreamText || '等待模型返回正文内容...'} />
-                    </div>
-                  )}
-                  <div className="word-document-stage">
+                  <div ref={docStageRef} className="word-document-stage">
                     <div className="word-ruler" aria-hidden="true">
                       <span />
                       <i />
@@ -3324,6 +4168,7 @@ const App = () => {
                               activeId={activeDocId || selectedEntry?.item.id}
                               streamingId={streamingChapterId}
                               onSelect={scrollToDocumentNode}
+                              visualBlocksByChapter={visualBlocksByChapter}
                             />
                           ))}
                         </>
@@ -3643,7 +4488,7 @@ const OutlineRows = ({ item, report, selectedId, editingId, level = 0, onSelect,
   );
 };
 
-const OutlineDraftPreview = ({ rows, raw }: { rows: DraftOutlineRow[]; raw: string }) => (
+const OutlineDraftPreview = ({ rows }: { rows: DraftOutlineRow[] }) => (
   <div className="outline-draft">
     <div className="outline-draft__head">
       <SparklesIcon className="h-4 w-4" />
@@ -3661,18 +4506,6 @@ const OutlineDraftPreview = ({ rows, raw }: { rows: DraftOutlineRow[]; raw: stri
         Array.from({ length: 5 }).map((_, index) => <div key={index} className="outline-draft-skeleton" />)
       )}
     </div>
-    {raw && <pre className="stream-box">{raw}</pre>}
-  </div>
-);
-
-const LiveStreamPanel = ({ title, text }: { title: string; text: string }) => (
-  <div className="live-stream-panel">
-    <div className="live-stream-panel__head">
-      <SparklesIcon className="h-4 w-4" />
-      <strong>{title}</strong>
-      <span>{text.length.toLocaleString()} 字符</span>
-    </div>
-    <pre>{text}</pre>
   </div>
 );
 
@@ -3719,14 +4552,129 @@ interface DocumentPreviewNodeProps {
   activeId?: string;
   streamingId?: string;
   onSelect: (item: OutlineItem) => void;
+  visualBlocksByChapter?: Record<string, PlannedBlock[]>;
 }
 
-const DocumentPreviewNode = ({ item, level, activeId, streamingId, onSelect }: DocumentPreviewNodeProps) => {
+const ReferenceSlotPreview = ({ slot }: { slot: Record<string, any> }) => {
+  const title = referenceSlotTitle(slot);
+  const assetType = String(slot.asset_type || 'other');
+  const typeLabel = referenceSlotTypeLabel(assetType);
+
+  return (
+    <div className="asset-reference-preview">
+      <div className="asset-reference-preview__head">
+        <strong>{title}</strong>
+        <span>{typeLabel}</span>
+      </div>
+      <ReferenceSlotGraphic slot={slot} compact />
+      <p>{slot.fallback_placeholder || slot.source_ref || '点击左侧图片位查看对应样例图；重新上传样例后，MinerU 提取到的原图会优先显示。'}</p>
+    </div>
+  );
+};
+
+const ReferenceSlotShowcase = ({ slot }: { slot: Record<string, any> }) => {
+  const title = referenceSlotTitle(slot);
+  const assetType = String(slot.asset_type || 'other');
+  return (
+    <div className="asset-reference-showcase">
+      <div className="asset-reference-showcase__copy">
+        <span>样例图预览</span>
+        <strong>{title}</strong>
+        <p>{slot.fallback_placeholder || slot.description || slot.position || '根据成熟样例图片位生成的图表预览，正式生成后会写回正文和 Word 导出。'}</p>
+      </div>
+      <ReferenceSlotGraphic slot={slot} />
+      <div className="asset-reference-showcase__meta">
+        <span>{referenceSlotTypeLabel(assetType)}</span>
+        <span>{referenceSlotImageSrc(slot) ? '样例原图' : '结构预览'}</span>
+      </div>
+    </div>
+  );
+};
+
+const ReferenceSlotGraphic = ({ slot, compact = false }: { slot: Record<string, any>; compact?: boolean }) => {
+  const src = referenceSlotImageSrc(slot);
+  const title = referenceSlotTitle(slot);
+  const assetType = String(slot.asset_type || 'other');
+  if (src) {
+    return <img className={compact ? 'asset-slot-image asset-slot-image--compact' : 'asset-slot-image'} src={src} alt={title} />;
+  }
+  if (assetType === 'org_chart') {
+    return (
+      <div className={`asset-slot-graphic asset-slot-graphic--org ${compact ? 'asset-slot-graphic--compact' : ''}`}>
+        <strong>{title}</strong>
+        <div><span>项目负责人</span></div>
+        <div><span>技术负责人</span><span>质量负责人</span><span>资料负责人</span></div>
+        <div><span>设计专业组</span><span>校审组</span><span>交付组</span></div>
+      </div>
+    );
+  }
+  if (assetType === 'workflow_chart') {
+    return (
+      <div className={`asset-slot-graphic asset-slot-graphic--flow ${compact ? 'asset-slot-graphic--compact' : ''}`}>
+        <strong>{title}</strong>
+        {['任务接收', '方案编制', '内部校审', '成果提交', '归档复盘'].map(step => <span key={step}>{step}</span>)}
+      </div>
+    );
+  }
+  if (assetType === 'software_screenshot') {
+    return (
+      <div className={`asset-slot-graphic asset-slot-graphic--screen ${compact ? 'asset-slot-graphic--compact' : ''}`}>
+        <strong>{title}</strong>
+        <section><i /><i /><i /><i /></section>
+      </div>
+    );
+  }
+  if (assetType === 'certificate_image') {
+    return (
+      <div className={`asset-slot-graphic asset-slot-graphic--cert ${compact ? 'asset-slot-graphic--compact' : ''}`}>
+        <strong>{title}</strong>
+        <section><span>证书</span><i /><i /><i /></section>
+      </div>
+    );
+  }
+  if (assetType === 'project_rendering') {
+    return (
+      <div className={`asset-slot-graphic asset-slot-graphic--render ${compact ? 'asset-slot-graphic--compact' : ''}`}>
+        <strong>{title}</strong>
+        <section><i /><i /><i /></section>
+      </div>
+    );
+  }
+  return (
+    <div className={`asset-slot-graphic asset-slot-graphic--image ${compact ? 'asset-slot-graphic--compact' : ''}`}>
+      <strong>{title}</strong>
+      <section><span>图片素材</span><i /><i /></section>
+    </div>
+  );
+};
+
+const WordAssetFigures = ({ blocks }: { blocks: PlannedBlock[] }) => {
+  if (!blocks.length) return null;
+  return (
+    <div className="word-asset-figures">
+      {blocks.map((block, index) => {
+        const asset = generatedAssetFromBlock(block);
+        const src = visualAssetImageSrc(asset);
+        if (!src) return null;
+        const caption = asset?.caption || `图表 ${index + 1} ${block.block_name || block.name || blockTypeLabel(block.block_type)}`;
+        return (
+          <figure key={`${asset?.asset_key || block.block_name || index}`} className="word-asset-figure">
+            <img src={src} alt={caption} />
+            <figcaption>{caption}</figcaption>
+          </figure>
+        );
+      })}
+    </div>
+  );
+};
+
+const DocumentPreviewNode = ({ item, level, activeId, streamingId, onSelect, visualBlocksByChapter = {} }: DocumentPreviewNodeProps) => {
   const hasChildren = Boolean(item.children?.length);
   const active = item.id === activeId;
   const streaming = item.id === streamingId;
   const headingLevel = Math.min(level, 4);
   const headingClass = `word-heading word-heading--${headingLevel}`;
+  const visualBlocks = visualBlocksByChapter[item.id] || [];
 
   return (
     <section
@@ -3745,6 +4693,7 @@ const DocumentPreviewNode = ({ item, level, activeId, streamingId, onSelect }: D
           <div className={`word-section__placeholder ${streaming ? 'word-section__placeholder--streaming' : ''}`}>请输入或智能编写...</div>
         )
       )}
+      <WordAssetFigures blocks={visualBlocks} />
       {item.children?.map(child => (
         <DocumentPreviewNode
           key={child.id}
@@ -3753,6 +4702,7 @@ const DocumentPreviewNode = ({ item, level, activeId, streamingId, onSelect }: D
           activeId={activeId}
           streamingId={streamingId}
           onSelect={onSelect}
+          visualBlocksByChapter={visualBlocksByChapter}
         />
       ))}
     </section>

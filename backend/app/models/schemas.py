@@ -58,6 +58,7 @@ class FileUploadResponse(BaseModel):
     success: bool
     message: str
     file_content: Optional[str] = None
+    source_preview_html: Optional[str] = Field(None, description="上传源文件的样式化 HTML 预览片段")
     old_outline: Optional[str] = None
     parser_info: Dict[str, Any] = Field(default_factory=dict, description="文档解析器、输出格式和降级信息")
     reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="样例投标文件风格剖面")
@@ -806,6 +807,25 @@ class DocumentBlocksPlanRequest(BaseModel):
     asset_library: Dict[str, Any] = Field(default_factory=dict, description="素材库")
 
 
+class VisualAssetGenerationRequest(BaseModel):
+    """图表素材图片生成请求"""
+    chapter_id: str = Field("", description="章节编号")
+    chapter_title: str = Field("", description="章节标题")
+    project_name: str = Field("", description="项目名称")
+    block: Dict[str, Any] = Field(default_factory=dict, description="图表素材规划块")
+    reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟样例风格剖面")
+    size: str = Field("1536x1024", description="图片尺寸")
+
+
+class VisualAssetGenerationResponse(BaseModel):
+    """图表素材图片生成响应"""
+    success: bool
+    message: str
+    prompt: str = ""
+    image_url: str = ""
+    b64_json: str = ""
+
+
 class ConsistencyRevisionRequest(BaseModel):
     """全文一致性修订请求"""
     full_bid_draft: List[OutlineItem] = Field(..., description="包含正文内容的目录结构")
@@ -830,5 +850,6 @@ class WordExportRequest(BaseModel):
     review_report: Optional[ReviewReport] = Field(None, description="导出前审校报告")
     reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="成熟样例写作模板和 Word 样式")
     document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="图表、承诺书、图片、附件等文档块规划")
+    asset_library: Dict[str, Any] = Field(default_factory=dict, description="已生成或已上传的图片素材库")
     manual_review_confirmed: bool = Field(False, description="是否已完成人工复核确认")
     export_dir: Optional[str] = Field(None, description="可选：由本地后端直接保存 Word 的目录")

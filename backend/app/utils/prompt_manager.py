@@ -18,6 +18,12 @@ def _json(data: Any, *, indent: int | None = None) -> str:
     return json.dumps(data, ensure_ascii=False, indent=indent, separators=None if indent else (",", ":"))
 
 
+def _schema_contract(schema_name: str, schema_json: str, include_schema: bool) -> str:
+    if include_schema:
+        return f"JSON schema：\n{schema_json}"
+    return f"输出必须符合 {schema_name} 结构；结构由 API response_format/json_schema 约束。"
+
+
 def get_full_bid_rulebook() -> str:
     """跨行业标书风控规则，供所有阶段复用。"""
     return """标书生成通用规则：
@@ -287,6 +293,9 @@ def get_reference_bid_style_profile_schema() -> Dict[str, Any]:
                 "slot_name": "",
                 "asset_type": "org_chart | workflow_chart | software_screenshot | product_image | project_rendering | certificate_image | other",
                 "asset_required": True,
+                "image_url": "",
+                "image_alt": "",
+                "source_ref": "",
                 "fallback_placeholder": "〖插入图片：图片名称〗",
             }
         ],
@@ -555,7 +564,7 @@ def get_consistency_revision_schema() -> Dict[str, Any]:
     }
 
 
-def generate_reference_bid_style_profile_prompt(reference_bid_text: str) -> Tuple[str, str]:
+def generate_reference_bid_style_profile_prompt(reference_bid_text: str, *, include_schema_in_prompt: bool = True) -> Tuple[str, str]:
     schema_json = _json(get_reference_bid_style_profile_schema(), indent=2)
     system_prompt = f"""你是投标文件样例模板工程师。你的任务不是总结样例内容，而是把成熟投标文件反向建模为“可执行写作模板”，让后续招标文件解析结果可以套用它来生成目录、正文、表格、承诺书和素材占位。
 
@@ -578,6 +587,7 @@ def generate_reference_bid_style_profile_prompt(reference_bid_text: str) -> Tupl
 5. 对“应由招标文件决定”的内容写入 tender_fact_slots 或 template_intent.must_map_from_tender，不得用样例值填充。
 6. 对“应由企业资料提供”的内容标记 enterprise_required=true，并写入 enterprise_fact_slots 或 enterprise_data_requirements。
 7. 对“应由图片/附件素材库提供”的内容标记 asset_required=true，并写入 image_slots 或 assets_to_insert。
+   - 如果图片标记是 `![...](...)`，必须把括号里的 URL 原样写入 image_slots.image_url，把 alt/title 写入 image_alt 或 source_ref，便于前端点击查看样例原图。
 8. 如果样例中存在历史项目残留、日期不一致、投标人名称不一致、错别字、行业错配、承诺时限不可泛化、人员/证书/业绩敏感内容，写入 quality_risks，后续生成时应替换、占位或人工确认。
 9. 不得把样例所在行业固化为所有项目的默认行业；只提取适用条件和可迁移写作方法。
 10. 每个 chapter_blueprints.recommended_structure 应像写作提纲，不是目录标题堆砌；每个 paragraph_blueprint 要说明“这一段写什么、从哪里取数、缺失时怎么占位”。
@@ -585,10 +595,10 @@ def generate_reference_bid_style_profile_prompt(reference_bid_text: str) -> Tupl
 12. word_style_profile 不得空泛写“按原文”，必须给出可用于前端预览和 Word 导出的具体 CSS/Word 值，例如 2.7cm、10.5pt、1.5、宋体、黑体。
 13. 数组保持高信号但要克制：outline_template 保留 6-12 项；chapter_blueprints 保留 4-8 项；table_models、image_slots、enterprise_data_requirements 可为空，但如果证据中有表格/图片/企业资料必须提取。
 14. 不要输出长段正文。每个字符串尽量 80 字以内，paragraph_blueprint 每章 1-2 条即可，避免超时和截断。
-15. 失败是不允许的：如果证据不足，也必须基于标题、表格列名和段落样本生成可执行模板；不得输出“无法判断”“空模板”“仅按通用规则”。
+15. 证据不足时必须采用保守模板策略：基于标题、表格列名和段落样本生成最低可用模板，同时在 quality_risks 中标记“证据不足/需人工复核”，并将不确定字段写为低置信度或人工确认项。
+16. 不得为了补齐模板而编造样例中没有的版式、事实、表格、图片、承诺时限或企业能力；确实无法判断的字段应留空、占位或写入 quality_risks，而不是伪装成确定结论。
 
-JSON schema：
-{schema_json}
+{_schema_contract("ReferenceBidStyleProfile JSON", schema_json, include_schema_in_prompt)}
 """
     user_prompt = f"""请解析以下成熟投标文件样例，生成可作为写作模板使用的 ReferenceBidStyleProfile JSON。
 
@@ -600,7 +610,7 @@ JSON schema：
     return system_prompt, user_prompt
 
 
-def generate_analysis_report_prompt(file_content: str) -> Tuple[str, str]:
+def generate_analysis_report_prompt(file_content: str, *, include_schema_in_prompt: bool = True) -> Tuple[str, str]:
     schema_json = _json(get_analysis_report_schema(), indent=2)
     rulebook = get_full_bid_rulebook()
     system_prompt = f"""你是资深招标文件解析专家。你的任务是把招标文件解析为可供后续目录生成、正文生成、图表素材规划和合规审校复用的 AnalysisReport JSON。
@@ -646,8 +656,7 @@ def generate_analysis_report_prompt(file_content: str) -> Tuple[str, str]:
 
 {rulebook}
 
-JSON schema：
-{schema_json}
+{_schema_contract("AnalysisReport JSON", schema_json, include_schema_in_prompt)}
 """
     user_prompt = f"""请解析以下招标文件内容，输出 AnalysisReport JSON。
 
@@ -659,7 +668,12 @@ JSON schema：
     return system_prompt, user_prompt
 
 
-def generate_response_matrix_prompt(analysis_report: Dict[str, Any], reference_bid_style_profile: Dict[str, Any] | None = None) -> Tuple[str, str]:
+def generate_response_matrix_prompt(
+    analysis_report: Dict[str, Any],
+    reference_bid_style_profile: Dict[str, Any] | None = None,
+    *,
+    include_schema_in_prompt: bool = True,
+) -> Tuple[str, str]:
     schema_json = _json(get_response_matrix_schema(), indent=2)
     rulebook = get_full_bid_rulebook()
     system_prompt = f"""你是投标响应矩阵规划专家。你的任务是把 AnalysisReport 转换为 ResponseMatrix JSON，并在有样例风格时吸收其结构习惯。
@@ -683,8 +697,7 @@ def generate_response_matrix_prompt(analysis_report: Dict[str, Any], reference_b
 
 {rulebook}
 
-JSON schema：
-{schema_json}
+{_schema_contract("ResponseMatrix JSON", schema_json, include_schema_in_prompt)}
 """
     user_prompt = f"""请基于以下 AnalysisReport 和 ReferenceBidStyleProfile 生成 ResponseMatrix。
 
@@ -708,6 +721,7 @@ def generate_level1_outline_prompt(
     schema_json: str,
     reference_bid_style_profile: Dict[str, Any] | None = None,
     document_blocks_plan: Dict[str, Any] | None = None,
+    include_schema_in_prompt: bool = True,
 ) -> Tuple[str, str]:
     report = analysis_report or {}
     response_matrix = report.get("response_matrix") or {}
@@ -744,8 +758,7 @@ def generate_level1_outline_prompt(
 
 {rulebook}
 
-输出 JSON schema：
-{schema_json}
+{_schema_contract("一级目录 JSON", schema_json, include_schema_in_prompt)}
 """
     user_prompt = f"""请生成一级目录 JSON。允许每个一级目录直接携带 children；如果有成熟样例目录，请在符合招标文件的前提下吸收其结构。
 
@@ -771,39 +784,43 @@ def generate_level23_outline_prompt(
     response_matrix: Dict[str, Any] | None,
     reference_bid_style_profile: Dict[str, Any] | None = None,
     document_blocks_plan: Dict[str, Any] | None = None,
+    include_schema_in_prompt: bool = True,
 ) -> Tuple[str, str]:
     schema_json = _json(current_outline_json, indent=2)
     rulebook = get_full_bid_rulebook()
-    system_prompt = f"""你是标书二三级目录设计专家。当前阶段只补全当前一级章节的 children、description、映射字段和预期内容块，不生成正文。
+    system_prompt = f"""你是标书二级目录设计专家。当前阶段只补全当前一级章节的 children、description、映射字段和预期内容块，不生成正文，也不生成三级目录。
 
 硬性要求：
 1. 禁止修改当前一级章节 id、title、volume_id、chapter_type。
 2. 不得新增 AnalysisReport 和 ResponseMatrix 中不存在的强制条款 ID。
-3. 如果当前一级章节在 selected_generation_target.base_outline_items、bid_document_requirements.composition 或 scheme_or_technical_outline_requirements 中有对应要求，二三级目录必须覆盖这些要求；不得因为样例目录不同而漏项。
-4. 如果当前一级章节能匹配成熟样例的 chapter_blueprints，应优先吸收其 applies_when、writing_function、recommended_structure、tables_to_insert 和 assets_to_insert；但必须修正行业错配、历史项目残留和与招标文件冲突的内容。
-5. 价格敏感内容只能出现在允许价格的卷册；暗标章节不得设计暴露投标人身份的标题或素材位。
-6. 证明材料类章节应设计“材料清单、证明用途、核验要点、页码索引”。
-7. 技术/服务/实施方案类章节应按评分标准拆成“理解、方法、流程、组织、进度、质量、安全、风险、成果、保障”中最合适的结构。
-8. 固定格式表单类章节只能设计填报项和核验项，不得改动表头、列名和固定文字。
-9. 对招标文件写明“应包括但不限于”的方案纲要，必须逐项拆出二级或三级节点，或在 description 中说明由哪个节点覆盖；如果 selected_generation_target.base_outline_items 已经提供标题，必须保留标题语义和顺序。
-10. 三级目录生成必须先做“语义拆解”，再生成标题，不能使用预设固定模板，也不能根据少量关键词机械套用固定组合。
-11. 对每一个二级标题，先判断真实写作对象：服务范围、工作内容、工作目标、组织机构、岗位职责、服务方案、人员投入、沟通方法、质量承诺、进度保障、风险控制、成果交付、售后服务、资料管理、固定格式、证明材料或其他对象。
-12. 再判断该二级标题在投标文件中的功能：说明范围边界、回应评分标准、证明企业能力、承诺服务结果、说明流程方法、控制质量/进度/风险、对应固定格式或签章材料、支撑验收交付或后续服务。
-13. 再从以下内容维度中选择最符合当前二级标题的 2-4 个维度生成三级标题：工作内容/任务清单、工作流程/阶段安排、责任主体/岗位分工、资源投入/人员设备、标准规范/质量要求、成果文件/交付物、响应时限/服务方式、检查复核/过程控制、风险预防/应急处置、支撑材料/原文证据。
-14. 三级标题必须带有当前二级标题的具体语义，不得跨二级复用同一套标题；禁止多个二级标题下出现完全相同或高度相似的三级标题组合。
-15. 禁止使用这些通用套话作为三级标题：“依据/措施/佐证”“目标/措施/保障”“响应要点/实施措施/支撑材料”“工作内容/工作流程/保障措施”。
-16. 如果当前二级标题缺少足够依据，宁可只生成 1-2 个准确三级标题，也不要为了凑数量复制模板。
-17. 每个三级标题必须能回答“这一节具体写什么”，不能只表达抽象维度。
-18. 每个三级节点 description 必须说明写作内容、对应评分项或招标要求、需要的表格/流程图/承诺/证明材料/占位，以及不能编造的内容。
-19. 可参考真实服务类标书常见拆解方式，但不得直接照抄：服务范围类关注工作内容、服务边界、成果文件、标准要求、管理配合；服务目标类关注目标分解、责任分工、达成路径、考核/验收口径；组织机构类关注组织架构、岗位职责、接口关系、汇报机制；人员投入类关注人员配置、资格能力、到岗安排、培训考核、替换机制；服务方案类关注阶段流程、关键环节、技术方法、资源投入、异常处理；沟通协调类关注沟通对象、沟通频次、会议/报告机制、问题闭环；质量承诺类关注质量标准、过程复核、成果审查、整改改进、承诺边界；后续服务类关注服务时限、服务方式、责任主体、技术支持、成果修改。
-20. 如果 ReferenceBidStyleProfile.chapter_blueprints 提供了 paragraph_blueprint，不要把段落骨架直接写进目录标题；应转化为 description、expected_depth、tables_required、image_slots、material_ids 或 blocks，供正文阶段使用。
+3. 如果当前一级章节在 selected_generation_target.base_outline_items、bid_document_requirements.composition 或 scheme_or_technical_outline_requirements 中有对应要求，二级目录必须覆盖这些要求；不得因为样例目录不同而漏项。
+4. 如果 current_level1_node.children 中已经存在带标题的子节点，这些子节点是系统根据一级标题拆分结果或评分项提炼出的二级标题种子。必须优先保留这些子节点的语义、顺序和覆盖范围；可以润色为更专业的标书标题，但不得删掉后换成泛化模板标题。
+5. 生成二级标题时必须先判断当前一级标题本身是否可拆分：如果标题中包含并列概念、多个事项、多个工作对象、多个管理内容，或出现“及、和、与、或、及其、以及、包括”、顿号、逗号、括号说明等结构，应优先把这些元素拆成二级标题。
+6. 对拆分得到的二级标题，不要求逐字照搬一级标题中的原词，但必须保持原始含义一致，并使用更适合标书表达的专业标题。例如“服务机构设置（框图）、岗位职责”可转化为“项目管理机构图”“岗位职责、工作范围及其相互关系”。
+7. 只有在一级标题本身无法直接拆分时，才以评分项、技术要求、响应要求和评审关注点作为二级标题的首要来源；评分项优先级高于通用目录模板、历史样例和泛化章节结构。
+8. 当评分项明确出现得分对象或必须响应对象时，应直接把这些对象转化为二级标题，例如项目负责人、项目组成员、证书资格、同类业绩、服务流程、进度安排、质量措施、风险应对、资源协同等。
+9. 技术/服务/实施方案类章节在无法直接拆分时，应优先围绕评分项组织为“总体思路、实施流程、进度安排、资源配置与协同、质量控制、风险应对”等最贴合评分标准的二级结构，而不是先套用通用模板。
+10. 如果当前一级章节能匹配成熟样例的 chapter_blueprints，应优先吸收其 applies_when、writing_function、recommended_structure、tables_to_insert 和 assets_to_insert；但必须修正行业错配、历史项目残留和与招标文件冲突的内容，并服从前面的拆分/评分优先级。
+11. 价格敏感内容只能出现在允许价格的卷册；暗标章节不得设计暴露投标人身份的标题或素材位。
+12. 证明材料类章节应设计“材料清单、证明用途、核验要点、页码索引”。
+13. 固定格式表单类章节只能设计填报项和核验项，不得改动表头、列名和固定文字。
+14. 对招标文件写明“应包括但不限于”的方案纲要，必须逐项拆出二级节点，或在 description 中说明由哪个二级节点覆盖；如果 selected_generation_target.base_outline_items 已经提供标题，必须保留标题语义和顺序。
+15. 只生成二级标题，禁止生成三级目录；每个二级节点的 children 必须保持为空数组。
+16. 对每一个二级标题，先判断真实写作对象：服务范围、工作内容、组织机构、岗位职责、服务方案、人员投入、沟通方法、质量控制、进度保障、风险控制、成果交付、售后服务、资料管理、固定格式、证明材料或其他对象。
+17. 再判断该二级标题在投标文件中的功能：说明范围边界、回应评分标准、证明企业能力、承诺服务结果、说明流程方法、控制质量/进度/风险、对应固定格式或签章材料、支撑验收交付或后续服务。
+18. 每个二级节点 description 必须说明该节应写什么、对应哪些评分项或招标要求、需要什么表格/流程图/承诺/证明材料占位，以及哪些内容不得编造。
+19. 二级标题必须简明、言简意赅，优先使用短语型标题，一般控制在 4-12 个字；除非招标文件或评分项明确要求，不要生成“全过程设计服务实施目标”“设计周期与进度响应目标”“资源配置与协同配合目标”这类冗长抽象标题。
+20. 二级标题要避免空泛、套话化和无评分支撑的表达。除非一级标题或评分项明确要求，否则不要优先生成“工作目标”“工作原则”“组织保障”“管理制度”“服务承诺”“综合说明”“其他内容”这类标题。
+21. 禁止把当前一级标题原样复制、简单改写后再作为本章二级标题；如果一级标题不可拆分，就必须根据评分项提炼更具体的二级标题。
+22. 不要为了凑数量生成重复或高度重叠的标题；如果“服务质量保障措施”“质量保证措施”“质量控制体系”“质量管理措施”等含义接近，应合并为更清晰的标题，例如“质量控制与保障措施”。
+23. 可参考真实服务类标书常见拆解方式，但不得直接照抄：服务范围类关注工作内容、服务边界、成果文件、标准要求、管理配合；组织机构类关注组织架构、岗位职责、接口关系、汇报机制；人员投入类关注人员配置、资格能力、到岗安排、培训考核、替换机制；服务方案类关注阶段流程、关键环节、技术方法、资源投入、异常处理；沟通协调类关注沟通对象、沟通频次、会议/报告机制、问题闭环；质量控制类关注质量标准、过程复核、成果审查、整改改进、承诺边界；后续服务类关注服务时限、服务方式、责任主体、技术支持、成果修改。
+24. 如果 ReferenceBidStyleProfile.chapter_blueprints 提供了 paragraph_blueprint，不要把段落骨架直接写进目录标题；应转化为 description、expected_depth、tables_required、image_slots、material_ids 或 blocks，供正文阶段使用。
 
 {rulebook}
 
-输出 JSON schema：
-{schema_json}
+{_schema_contract("二级目录 JSON", schema_json, include_schema_in_prompt)}
 """
-    user_prompt = f"""请补全当前一级章节的二级、三级目录。
+    user_prompt = f"""请补全当前一级章节的二级目录。不要生成三级目录，所有二级节点的 children 都必须为空数组。
 
 <current_level1_node>{_json(current_outline_json, indent=2)}</current_level1_node>
 <other_outline>{other_outline}</other_outline>
@@ -826,6 +843,7 @@ def generate_document_blocks_prompt(
     reference_bid_style_profile: Dict[str, Any] | None = None,
     enterprise_materials: List[Dict[str, Any]] | None = None,
     asset_library: List[Dict[str, Any]] | Dict[str, Any] | None = None,
+    include_schema_in_prompt: bool = True,
 ) -> Tuple[str, str]:
     schema_json = _json(get_document_blocks_schema(), indent=2)
     system_prompt = f"""你是技术标图表与素材规划专家。你的任务是根据目录、响应矩阵和样例风格，规划每个章节应插入的表格、流程图、组织架构图、图片、承诺书、证明材料或页码占位。
@@ -840,8 +858,7 @@ def generate_document_blocks_prompt(
 7. 组织机构图、流程图可以输出结构化 nodes/edges，由后端渲染或人工替换。
 8. Word 目录页码不得由模型生成，应由 Word 自动更新。
 
-JSON schema：
-{schema_json}
+{_schema_contract("DocumentBlocksPlan JSON", schema_json, include_schema_in_prompt)}
 """
     user_prompt = f"""请输出图表与素材规划 JSON。
 
@@ -903,10 +920,11 @@ def generate_chapter_content_prompt(
 22. 如果 ReferenceBidStyleProfile.writing_style.sentence_blueprints 适用，只可使用其句式骨架并替换变量，不得照抄样例原句。
 
 写作风格：
-1. 使用“目标—措施—流程—保障—承诺”的结构。
-2. 多用 1）、2）、3）；a）、b）、c）分点结构。
-3. 内容要具体，避免只写口号。
-4. 高分章节、阻塞风险章节、证据链章节写得更细；低风险说明性章节简洁准确。
+1. 当 current_chapter.chapter_type 属于 technical、service_plan、construction_plan、goods_supply、design_plan、implementation_plan，或 expected_blocks 以 paragraph/workflow_chart/org_chart/table 为主时，优先使用“目标—措施—流程—保障—承诺”的方案类结构。
+2. 当 current_chapter.chapter_type 属于 form、fixed_form、commitment、deviation_table、price、qualification、material、material_attachment、review，或 expected_blocks 包含 material_attachment、commitment_letter、page_break 时，不使用方案类套话结构；应按固定格式、材料清单、填报项、核验要点、签章/附件要求或占位说明输出。
+3. 多用 1）、2）、3）；a）、b）、c）分点结构，但固定表格、函件、材料索引和附件说明应服从原格式，不强行拆成方案段落。
+4. 内容要具体，避免只写口号。
+5. 高分章节、阻塞风险章节、证据链章节写得更细；低风险说明性章节简洁准确。
 
 {rulebook}
 """
@@ -949,6 +967,7 @@ def generate_compliance_review_prompt(
     response_matrix: Dict[str, Any] | None = None,
     reference_bid_style_profile: Dict[str, Any] | None = None,
     document_blocks_plan: Dict[str, Any] | None = None,
+    include_schema_in_prompt: bool = True,
 ) -> Tuple[str, str]:
     schema_json = _json(get_review_report_schema(), indent=2)
     rulebook = get_full_bid_rulebook()
@@ -973,8 +992,7 @@ def generate_compliance_review_prompt(
 
 {rulebook}
 
-JSON schema：
-{schema_json}
+{_schema_contract("ReviewReport JSON", schema_json, include_schema_in_prompt)}
 """
     user_prompt = f"""请对以下标书内容进行导出前合规审校。
 
@@ -995,6 +1013,7 @@ def generate_consistency_revision_prompt(
     response_matrix: Dict[str, Any] | None = None,
     reference_bid_style_profile: Dict[str, Any] | None = None,
     document_blocks_plan: Dict[str, Any] | None = None,
+    include_schema_in_prompt: bool = True,
 ) -> Tuple[str, str]:
     schema_json = _json(get_consistency_revision_schema(), indent=2)
     system_prompt = f"""你是投标文件全文一致性修订专家。你的任务是在 Word 导出前检查全文一致性，只输出问题和修订建议，不直接改写全文。
@@ -1010,8 +1029,7 @@ def generate_consistency_revision_prompt(
 6. 发现企业资料虚构，severity=blocking。
 7. 发现输出范围是技术/服务方案却出现报价、保证金、投标函正文，severity=high 或 blocking。
 
-JSON schema：
-{schema_json}
+{_schema_contract("ConsistencyRevisionReport JSON", schema_json, include_schema_in_prompt)}
 """
     user_prompt = f"""请输出全文一致性修订报告。
 

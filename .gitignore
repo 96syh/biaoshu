@@ -9,6 +9,7 @@ config.json
 uploads/
 backend/data/
 *.docx
+*.doc
 *.pdf
 
 # 构建和打包相关
