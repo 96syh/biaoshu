@@ -4,6 +4,7 @@ import io
 import json
 import re
 import urllib.request
+from copy import deepcopy
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -183,6 +184,51 @@ def export_heading_text(number: str, title: str) -> str:
     return f"{number} {clean_title}".strip()
 
 
+def build_header_project_title(project_name: str | None) -> str:
+    text = re.sub(r"\s+", " ", str(project_name or "")).strip()
+    text = re.sub(r"\.docx$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^\s*华正\s*[-_－—]\s*", "", text).strip()
+    text = re.sub(r"^\s*(?:技术标|商务标|投标文件)\s*[-_－—]?\s*", "", text).strip()
+    if not text:
+        return ""
+    if re.search(r"(?:技术文件|商务文件|投标文件)\s*$", text):
+        return text
+    return f"{text}-技术文件"
+
+
+def _paragraph_text_nodes(paragraph: docx.text.paragraph.Paragraph) -> list:
+    return list(paragraph._p.findall(".//" + qn("w:t")))
+
+
+def _replace_paragraph_text_preserve_objects(paragraph: docx.text.paragraph.Paragraph, replacement: str) -> bool:
+    text_nodes = _paragraph_text_nodes(paragraph)
+    if not text_nodes:
+        return False
+    text_nodes[0].text = replacement
+    for node in text_nodes[1:]:
+        node.text = ""
+    return True
+
+
+def update_inherited_header_project_title(doc: docx.Document, project_name: str | None) -> None:
+    """Keep the inherited header logo/borders and replace only the right-side project title text."""
+    replacement = build_header_project_title(project_name)
+    if not replacement:
+        return
+    seen_parts: set[int] = set()
+    target_pattern = re.compile(r"(技术文件|商务文件|投标文件|项目)")
+    for section in doc.sections:
+        for header in (section.header, section.first_page_header, section.even_page_header):
+            part_id = id(header.part)
+            if part_id in seen_parts:
+                continue
+            seen_parts.add(part_id)
+            for paragraph in header.paragraphs:
+                current_text = "".join(node.text or "" for node in _paragraph_text_nodes(paragraph)).strip()
+                if current_text and target_pattern.search(current_text):
+                    _replace_paragraph_text_preserve_objects(paragraph, replacement)
+
+
 def strip_duplicate_export_content_heading(content: str, *, title: str, display_number: str, source_id: str = "") -> str:
     """Drop a generated first line that repeats the rendered chapter heading."""
     lines = str(content or "").splitlines()
@@ -211,16 +257,75 @@ def strip_duplicate_export_content_heading(content: str, *, title: str, display_
     return "\n".join(lines).strip()
 
 
-def clear_document_body_keep_section(doc: docx.Document) -> None:
-    """Clear template body while preserving styles, section settings, headers and footers."""
+def _section_reference_elements(sect_pr, tag_name: str) -> list:
+    return list(sect_pr.findall(qn(f"w:{tag_name}"))) if sect_pr is not None else []
+
+
+def _remove_section_references(sect_pr) -> None:
+    for tag_name in ("headerReference", "footerReference"):
+        for ref in _section_reference_elements(sect_pr, tag_name):
+            sect_pr.remove(ref)
+
+
+def _effective_template_section_properties(doc: docx.Document):
+    """Pick a reusable template section and make inherited header/footer refs explicit."""
     body = doc._element.body
-    sect_pr = body.sectPr
+    sect_prs = list(body.iter(qn("w:sectPr")))
+    if not sect_prs:
+        return None
+
+    effective_refs: dict[str, dict[str, object]] = {"headerReference": {}, "footerReference": {}}
+    candidates = []
+    for index, sect_pr in enumerate(sect_prs):
+        current_refs = {
+            "headerReference": dict(effective_refs["headerReference"]),
+            "footerReference": dict(effective_refs["footerReference"]),
+        }
+        for tag_name in ("headerReference", "footerReference"):
+            for ref in _section_reference_elements(sect_pr, tag_name):
+                ref_type = ref.get(qn("w:type")) or "default"
+                current_refs[tag_name][ref_type] = deepcopy(ref)
+
+        pg_sz = sect_pr.find(qn("w:pgSz"))
+        pg_num_type = sect_pr.find(qn("w:pgNumType"))
+        is_landscape = pg_sz is not None and pg_sz.get(qn("w:orient")) == "landscape"
+        score = 0
+        if current_refs["headerReference"].get("default") is not None:
+            score += 10
+        if current_refs["footerReference"].get("default") is not None:
+            score += 10
+        if pg_num_type is not None and (pg_num_type.get(qn("w:fmt")) or "decimal") == "decimal":
+            score += 5
+        if pg_num_type is not None and pg_num_type.get(qn("w:start")) == "1":
+            score += 3
+        if not is_landscape:
+            score += 2
+        if index > 0:
+            score += 1
+        candidates.append((score, index, sect_pr, current_refs))
+        effective_refs = current_refs
+
+    _, _, selected_sect_pr, selected_refs = max(candidates, key=lambda item: (item[0], -item[1]))
+    cloned = deepcopy(selected_sect_pr)
+    _remove_section_references(cloned)
+    insert_at = 0
+    for tag_name in ("headerReference", "footerReference"):
+        for ref_type in ("first", "even", "default"):
+            ref = selected_refs[tag_name].get(ref_type)
+            if ref is not None:
+                cloned.insert(insert_at, deepcopy(ref))
+                insert_at += 1
+    return cloned
+
+
+def clear_document_body_keep_section(doc: docx.Document) -> None:
+    """Clear template body while preserving styles and usable section/header/footer settings."""
+    reusable_sect_pr = _effective_template_section_properties(doc)
+    body = doc._element.body
     for child in list(body):
-        if sect_pr is not None and child is sect_pr:
-            continue
         body.remove(child)
-    if sect_pr is not None and sect_pr.getparent() is None:
-        body.append(sect_pr)
+    if reusable_sect_pr is not None:
+        body.append(reusable_sect_pr)
 
 
 def iter_outline_items(items) -> list:
@@ -277,6 +382,8 @@ async def create_word_export_response(request: WordExportRequest):
         doc, inherited_template_path = create_export_document(request)
         _INHERITED_TEMPLATE_MODE = bool(inherited_template_path)
         enable_update_fields_on_open(doc)
+        if inherited_template_path:
+            update_inherited_header_project_title(doc, request.project_name)
         if not inherited_template_path:
             configure_word_style(doc, request.reference_bid_style_profile)
 
@@ -310,14 +417,15 @@ async def create_word_export_response(request: WordExportRequest):
         set_run_font_simsun(run)
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        footer_p = doc.sections[0].footer.paragraphs[0]
-        footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        footer_p.add_run("第 ")
-        add_field(footer_p, "PAGE")
-        footer_p.add_run(" 页 / 共 ")
-        add_field(footer_p, "NUMPAGES")
-        footer_p.add_run(" 页")
-        set_paragraph_font_simsun(footer_p)
+        if not inherited_template_path:
+            footer_p = doc.sections[0].footer.paragraphs[0]
+            footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            footer_p.add_run("第 ")
+            add_field(footer_p, "PAGE")
+            footer_p.add_run(" 页 / 共 ")
+            add_field(footer_p, "NUMPAGES")
+            footer_p.add_run(" 页")
+            set_paragraph_font_simsun(footer_p)
 
         # 文档标题
         title = request.project_name or "投标技术文件"
@@ -331,11 +439,30 @@ async def create_word_export_response(request: WordExportRequest):
         title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
         # 可更新目录。python-docx 不能计算最终页码，但可以生成 Word 域。
-        toc_heading = doc.add_heading("目录", level=1)
-        set_paragraph_font_simsun(toc_heading)
+        if inherited_template_path:
+            toc_heading = doc.add_paragraph()
+            toc_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            toc_heading.add_run("目  录")
+            set_paragraph_font_simsun(toc_heading)
+            toc_instruction = r'TOC \o "1-2" \h \u'
+        else:
+            toc_heading = doc.add_heading("目录", level=1)
+            set_paragraph_font_simsun(toc_heading)
+            toc_instruction = r'TOC \o "1-3" \h \z \u'
         toc_p = doc.add_paragraph()
-        add_field(toc_p, r'TOC \o "1-3" \h \z \u')
+        add_field(toc_p, toc_instruction)
         doc.add_page_break()
+
+        def add_non_toc_section_title(text: str) -> docx.text.paragraph.Paragraph:
+            para = doc.add_paragraph()
+            run = para.add_run(text)
+            run.bold = True
+            if not _INHERITED_TEMPLATE_MODE:
+                run.font.size = Pt(14)
+            set_run_font_simsun(run)
+            para.paragraph_format.space_before = Pt(12)
+            para.paragraph_format.space_after = Pt(6)
+            return para
 
         def add_export_checklist() -> None:
             """Add a visible finalization checklist for manual Word work."""
@@ -354,8 +481,7 @@ async def create_word_export_response(request: WordExportRequest):
             blocking_count = ((review.get("summary") or {}).get("blocking_issues_count")
                               or (review.get("summary") or {}).get("blocking_issues") or 0)
 
-            heading = doc.add_heading("导出后 Word 处理清单", level=1)
-            set_paragraph_font_simsun(heading)
+            add_non_toc_section_title("导出后 Word 处理清单")
             lines = [
                 "更新目录域和页码域：打开 Word 后全选并更新域，确认目录层级和页码正确。",
                 "复核版式：按招标文件检查页边距、字体、行距、标题层级、表格跨页和页眉页脚。",
@@ -387,9 +513,7 @@ async def create_word_export_response(request: WordExportRequest):
 
         # 项目概述
         if request.project_overview:
-            heading = doc.add_heading("项目概述", level=1)
-            heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            set_paragraph_font_simsun(heading)
+            add_non_toc_section_title("项目概述")
             overview_p = doc.add_paragraph(request.project_overview)
             set_paragraph_font_simsun(overview_p)
             overview_p_format = overview_p.paragraph_format

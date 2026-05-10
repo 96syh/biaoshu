@@ -772,6 +772,145 @@ class BackendContractImportTests(unittest.TestCase):
             self.assertAlmostEqual(int(doc.sections[0].left_margin), int(Cm(3.3)), delta=200)
             self.assertNotIn("旧正文", "\n".join(paragraph.text for paragraph in doc.paragraphs))
 
+    def test_word_export_reuses_history_header_footer_without_overwriting(self):
+        import docx
+        from docx.enum.section import WD_SECTION
+        from backend.app.models.schemas import OutlineItem, WordExportRequest
+        from backend.app.services.word_export_service import create_word_export_response
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "template.docx"
+            template = docx.Document()
+            template.add_paragraph("封面正文")
+            main_section = template.add_section(WD_SECTION.NEW_PAGE)
+            main_section.header.is_linked_to_previous = False
+            main_section.header.paragraphs[0].text = "历史页眉-技术文件"
+            main_section.footer.is_linked_to_previous = False
+            main_section.footer.paragraphs[0].text = "历史页脚-PAGE"
+            template.add_paragraph("历史正文")
+            template.save(template_path)
+
+            request = WordExportRequest(
+                project_name="测试导出",
+                manual_review_confirmed=True,
+                export_dir=temp_dir,
+                outline=[
+                    OutlineItem(
+                        id="1",
+                        title="服务范围",
+                        description="",
+                        content="本节说明服务范围。",
+                        history_reference={"source_paths": {"source_docx_path": str(template_path)}},
+                    )
+                ],
+            )
+
+            response = asyncio.run(create_word_export_response(request))
+            payload = json.loads(response.body.decode("utf-8"))
+            exported = docx.Document(payload["file_path"])
+            header_text = "\n".join(p.text for p in exported.sections[0].header.paragraphs)
+            footer_text = "\n".join(p.text for p in exported.sections[0].footer.paragraphs)
+
+            self.assertIn("测试导出-技术文件", header_text)
+            self.assertNotIn("历史页眉-技术文件", header_text)
+            self.assertIn("历史页脚-PAGE", footer_text)
+            self.assertNotIn("第 ", footer_text)
+            self.assertNotIn("共 ", footer_text)
+
+    def test_word_export_template_toc_uses_history_like_depth_two(self):
+        import docx
+        import zipfile
+        from backend.app.models.schemas import OutlineItem, WordExportRequest
+        from backend.app.services.word_export_service import create_word_export_response
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "template.docx"
+            template = docx.Document()
+            template.sections[0].header.paragraphs[0].text = "历史页眉"
+            template.sections[0].footer.paragraphs[0].text = "历史页脚"
+            template.add_paragraph("历史正文")
+            template.save(template_path)
+
+            request = WordExportRequest(
+                project_name="测试导出",
+                manual_review_confirmed=True,
+                export_dir=temp_dir,
+                outline=[
+                    OutlineItem(
+                        id="1",
+                        title="服务范围、服务内容",
+                        description="",
+                        history_reference={"source_paths": {"source_docx_path": str(template_path)}},
+                        children=[
+                            OutlineItem(id="1.1", title="服务范围", description="", content="本节说明服务范围。")
+                        ],
+                    )
+                ],
+            )
+
+            response = asyncio.run(create_word_export_response(request))
+            payload = json.loads(response.body.decode("utf-8"))
+            exported = docx.Document(payload["file_path"])
+            heading_texts = [
+                paragraph.text
+                for paragraph in exported.paragraphs
+                if getattr(paragraph.style, "name", "").startswith("Heading")
+            ]
+            with zipfile.ZipFile(payload["file_path"]) as package:
+                document_xml = package.read("word/document.xml").decode("utf-8")
+
+            self.assertIn("目  录", "\n".join(paragraph.text for paragraph in exported.paragraphs))
+            self.assertIn('TOC \\o "1-2" \\h \\u', document_xml)
+            self.assertNotIn("目  录", heading_texts)
+
+    def test_word_export_updates_history_header_project_title(self):
+        import docx
+        import zipfile
+        from backend.app.models.schemas import OutlineItem, WordExportRequest
+        from backend.app.services.word_export_service import create_word_export_response
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "template.docx"
+            template = docx.Document()
+            header = template.sections[0].header
+            header.paragraphs[0].add_run("2025-2027 年工程设计服务框架项目投标文件-技术文件")
+            pict = header.paragraphs[0]._p.add_r()
+            pict.append(docx.oxml.parse_xml(
+                '<w:pict xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
+            ))
+            template.add_paragraph("历史正文")
+            template.save(template_path)
+
+            request = WordExportRequest(
+                project_name="中国石油辽宁销售公司2026年油库、加油站等工程设计服务项目",
+                manual_review_confirmed=True,
+                export_dir=temp_dir,
+                outline=[
+                    OutlineItem(
+                        id="1",
+                        title="服务范围",
+                        description="",
+                        content="本节说明服务范围。",
+                        history_reference={"source_paths": {"source_docx_path": str(template_path)}},
+                    )
+                ],
+            )
+
+            response = asyncio.run(create_word_export_response(request))
+            payload = json.loads(response.body.decode("utf-8"))
+            exported = docx.Document(payload["file_path"])
+            header_text = "\n".join(p.text for p in exported.sections[0].header.paragraphs)
+            with zipfile.ZipFile(payload["file_path"]) as package:
+                header_xml = "".join(
+                    package.read(name).decode("utf-8")
+                    for name in package.namelist()
+                    if name.startswith("word/header")
+                )
+
+            self.assertIn("中国石油辽宁销售公司2026年油库、加油站等工程设计服务项目-技术文件", header_text)
+            self.assertNotIn("2025-2027 年工程设计服务框架项目投标文件-技术文件", header_text)
+            self.assertIn("<w:pict", header_xml)
+
     def test_word_export_renumbers_outline_and_removes_duplicate_content_heading(self):
         import docx
         from backend.app.models.schemas import OutlineItem, WordExportRequest
