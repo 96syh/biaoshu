@@ -85,6 +85,7 @@ async def generate_chapter_content(request: ChapterContentRequest):
         ):
             content += chunk
         render = getattr(openai_service, "_last_chapter_render", {}) or {}
+        content = openai_service._strip_generated_markdown_headings(content)
         return {"success": True, "content": content, **render}
         
     except HTTPException:
@@ -138,15 +139,16 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
                     ],
                 ):
                     full_content += chunk
+                    safe_full_content = openai_service._strip_generated_markdown_headings(full_content)
                     # 实时发送内容片段
-                    yield f"data: {json.dumps({'status': 'streaming', 'content': chunk, 'full_content': full_content}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'status': 'streaming', 'content': chunk, 'full_content': safe_full_content}, ensure_ascii=False)}\n\n"
 
                 if not full_content.strip():
                     raise Exception("模型返回空内容，可能是配额限制、内容拦截或兼容模式异常")
                 
                 # 发送完成信号
                 render = getattr(openai_service, "_last_chapter_render", {}) or {}
-                payload = {'status': 'completed', 'content': full_content, **render}
+                payload = {'status': 'completed', 'content': openai_service._strip_generated_markdown_headings(full_content), **render}
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 
             except Exception as e:

@@ -1,4 +1,6 @@
 import importlib
+import asyncio
+import json
 import os
 import sqlite3
 import sys
@@ -292,6 +294,30 @@ class BackendContractImportTests(unittest.TestCase):
         self.assertTrue(inventory["has_image"])
         self.assertTrue(inventory["has_table"])
 
+    def test_markdown_fallback_reference_keeps_only_text_before_content_generation(self):
+        from backend.app.services.history_case_service import HistoryCaseService
+
+        reference = (
+            "质量保证措施如下：\n\n"
+            "![组织架构图](assets/org.png)\n\n"
+            "| 序号 | 措施 |\n"
+            "| --- | --- |\n"
+            "| 1 | 校审复核 |\n\n"
+            "<figure><img src=\"assets/process.png\" /></figure>\n\n"
+            "<table><tr><td>资料</td></tr></table>\n\n"
+            "项目组将建立问题闭环机制。\n"
+        )
+
+        stripped = HistoryCaseService._strip_non_text_markdown_from_reference(reference)
+
+        self.assertIn("质量保证措施如下", stripped)
+        self.assertIn("项目组将建立问题闭环机制", stripped)
+        self.assertNotIn("![组织架构图](assets/org.png)", stripped)
+        self.assertNotIn("| 序号 | 措施 |", stripped)
+        self.assertNotIn("| 1 | 校审复核 |", stripped)
+        self.assertNotIn("<figure>", stripped)
+        self.assertNotIn("<table>", stripped)
+
     def test_chapter_content_prompt_carries_history_rewrite_rules(self):
         from backend.app.utils import prompt_manager
 
@@ -415,6 +441,40 @@ class BackendContractImportTests(unittest.TestCase):
         self.assertIn("<td>服务期限</td>", html)
         self.assertNotIn("| 序号 |", html)
 
+    def test_history_patch_output_drops_all_section_headings(self):
+        from backend.app.services.openai_service import OpenAIService
+
+        blocks = [
+            {"id": "h-1", "type": "heading", "text": "总体实施路径与资源协同安排", "markdown": "## 总体实施路径与资源协同安排", "html": '<h2 data-history-block-id="h-1">总体实施路径与资源协同安排</h2>'},
+            {"id": "p-1", "type": "paragraph", "text": "本节围绕资源配置展开。", "markdown": "本节围绕资源配置展开。", "html": '<p data-history-block-id="p-1">本节围绕资源配置展开。</p>'},
+            {"id": "h-2", "type": "heading", "text": "设计服务流程图", "markdown": "### 设计服务流程图", "html": '<h3 data-history-block-id="h-2">设计服务流程图</h3>'},
+            {"id": "p-2", "type": "paragraph", "text": "流程说明。", "markdown": "流程说明。", "html": '<p data-history-block-id="p-2">流程说明。</p>'},
+        ]
+
+        stripped = OpenAIService._strip_history_heading_blocks_from_content(blocks)
+        markdown = "\n".join(str(block.get("markdown") or "") for block in stripped)
+
+        self.assertEqual([block["id"] for block in stripped], ["p-1", "p-2"])
+        self.assertNotIn("总体实施路径与资源协同安排", markdown)
+        self.assertNotIn("设计服务流程图", markdown)
+
+        compact = OpenAIService._compact_history_reference_draft_for_model({"matched_blocks": blocks})
+        self.assertNotIn("总体实施路径与资源协同安排", compact["reference_text"])
+        self.assertNotIn("设计服务流程图", compact["reference_text"])
+        self.assertEqual([block["id"] for block in compact["preserved_word_blocks"]], ["p-1", "p-2"])
+
+    def test_generated_markdown_heading_lines_are_removed(self):
+        from backend.app.services.openai_service import OpenAIService
+
+        content = "## 设计服务流程图\n本节说明流程。\n\n### 专业协同与接口管理\n协同内容。"
+
+        stripped = OpenAIService._strip_generated_markdown_headings(content)
+
+        self.assertNotIn("## 设计服务流程图", stripped)
+        self.assertNotIn("### 专业协同与接口管理", stripped)
+        self.assertIn("本节说明流程。", stripped)
+        self.assertIn("协同内容。", stripped)
+
     def test_primary_history_draft_requires_word_heading_blocks(self):
         from backend.app.services.openai_service import OpenAIService
 
@@ -427,6 +487,73 @@ class BackendContractImportTests(unittest.TestCase):
         self.assertIsNone(OpenAIService._select_primary_history_draft([
             {"match_level": "high", "matched_blocks": [], "reference_source": "markdown_fallback"},
         ]))
+
+    def test_history_reference_prompt_payload_omits_heavy_word_blocks(self):
+        from backend.app.services.openai_service import OpenAIService
+
+        draft = {
+            "match_level": "high",
+            "score": 0.8,
+            "reference_source": "word_heading_blocks",
+            "matched_blocks": [
+                {
+                    "id": "b-1",
+                    "type": "paragraph",
+                    "text": "历史项目服务范围",
+                    "markdown": "历史项目服务范围",
+                    "html": '<p data-history-block-id="b-1">历史项目服务范围</p>',
+                    "docx_xml": "<w:p>very-heavy-word-xml</w:p>",
+                },
+                {
+                    "id": "b-2",
+                    "type": "table",
+                    "text": "序号 | 姓名 | 证书编号",
+                    "markdown": "| 序号 | 姓名 | 证书编号 |\n| --- | --- | --- |\n| 1 | 张三 | A001 |",
+                    "html": "<table>very-heavy-table-html</table>",
+                    "docx_xml": "<w:tbl>very-heavy-table-xml</w:tbl>",
+                    "rows": [["序号", "姓名", "证书编号"], ["1", "张三", "A001"]],
+                },
+                {
+                    "id": "b-3",
+                    "type": "paragraph",
+                    "text": "",
+                    "markdown": "![组织架构](assets/org.png)",
+                    "html": '<figure><img src="data:image/png;base64,abcdef" /></figure>',
+                    "asset_ids": ["img-1"],
+                },
+            ],
+        }
+
+        compact = OpenAIService._compact_history_reference_draft_for_model(draft)
+        payload = json.dumps(compact, ensure_ascii=False)
+
+        self.assertIn("历史项目服务范围", compact["reference_text"])
+        self.assertIn("Word表格已从prompt省略", payload)
+        self.assertIn("Word图片已从prompt省略", payload)
+        self.assertNotIn("very-heavy-word-xml", payload)
+        self.assertNotIn("very-heavy-table-html", payload)
+        self.assertNotIn("base64,abcdef", payload)
+        self.assertNotIn("| 序号 | 姓名 |", compact["reference_text"])
+
+    def test_history_word_blocks_reuse_media_except_blind_bid_sensitive_blocks(self):
+        from backend.app.services.openai_service import OpenAIService
+
+        blocks = [
+            {"id": "b-1", "type": "paragraph", "text": "服务说明", "markdown": "服务说明", "html": '<p data-history-block-id="b-1">服务说明</p>'},
+            {"id": "b-2", "type": "table", "text": "序号 | 姓名 | 联系方式", "markdown": "| 序号 | 姓名 | 联系方式 |", "html": '<table data-history-block-id="b-2"></table>'},
+            {"id": "b-3", "type": "paragraph", "text": "", "markdown": "![组织架构](assets/org.png)", "html": '<figure><img src="assets/org.png" /></figure>', "asset_ids": ["img-1"]},
+        ]
+
+        reused = OpenAIService._prepare_history_blocks_for_reuse(blocks, chapter={"title": "组织机构"})
+        blind_reused = OpenAIService._prepare_history_blocks_for_reuse(
+            blocks,
+            chapter={"title": "暗标组织机构", "description": "不得出现人员姓名、联系方式、Logo"},
+        )
+
+        self.assertEqual([block["id"] for block in reused], ["b-1", "b-2", "b-3"])
+        self.assertIn("待人工复核", blind_reused[1]["markdown"])
+        self.assertIn("待人工复核", blind_reused[2]["markdown"])
+        self.assertNotIn("assets/org.png", "\n".join(str(block.get("markdown") or "") for block in blind_reused))
 
     def test_history_blocks_convert_to_markdown_and_html(self):
         from backend.app.services.history_case_service import HistoryCaseService
@@ -644,6 +771,44 @@ class BackendContractImportTests(unittest.TestCase):
             self.assertEqual(inherited_path, template_path)
             self.assertAlmostEqual(int(doc.sections[0].left_margin), int(Cm(3.3)), delta=200)
             self.assertNotIn("旧正文", "\n".join(paragraph.text for paragraph in doc.paragraphs))
+
+    def test_word_export_renumbers_outline_and_removes_duplicate_content_heading(self):
+        import docx
+        from backend.app.models.schemas import OutlineItem, WordExportRequest
+        from backend.app.services.word_export_service import create_word_export_response
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            request = WordExportRequest(
+                project_name="测试导出",
+                manual_review_confirmed=True,
+                export_dir=temp_dir,
+                outline=[
+                    OutlineItem(
+                        id="4",
+                        title="1 服务范围、服务内容",
+                        description="",
+                        children=[
+                            OutlineItem(
+                                id="4.1.1",
+                                title="服务范围",
+                                description="",
+                                content="4.1.1服务范围\n本节说明服务范围。",
+                            )
+                        ],
+                    )
+                ],
+            )
+
+            response = asyncio.run(create_word_export_response(request))
+            payload = json.loads(response.body.decode("utf-8"))
+            exported = docx.Document(payload["file_path"])
+            text = "\n".join(paragraph.text for paragraph in exported.paragraphs)
+
+            self.assertIn("1 服务范围、服务内容", text)
+            self.assertIn("1.1 服务范围", text)
+            self.assertIn("本节说明服务范围。", text)
+            self.assertNotIn("4 1 服务范围、服务内容", text)
+            self.assertNotIn("4.1.1服务范围", text)
 
     def test_history_case_match_terms_prioritize_specific_project_terms(self):
         from backend.app.services.history_case_service import HistoryCaseService

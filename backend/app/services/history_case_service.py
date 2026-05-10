@@ -620,6 +620,8 @@ class HistoryCaseService:
                     and cls._has_excluded_history_topic(reference_text)
                 ):
                     continue
+                if not has_word_heading_match:
+                    reference_text = cls._strip_non_text_markdown_from_reference(reference_text)
                 if not reference_text.strip():
                     reference_text = cls._blocks_to_markdown(matched_blocks)
                 if not reference_text.strip():
@@ -1279,6 +1281,69 @@ class HistoryCaseService:
         if len(cleaned) <= max_chars:
             return cleaned
         return f"{cleaned[:max_chars].rstrip()}\n……"
+
+    @classmethod
+    def _strip_non_text_markdown_from_reference(cls, text: str) -> str:
+        """Keep only text Markdown from fallback references before generation."""
+        lines = str(text or "").splitlines()
+        output: list[str] = []
+        table_buffer: list[str] = []
+        in_html_block = False
+
+        def is_table_row(line: str) -> bool:
+            stripped = line.strip()
+            if "|" not in stripped:
+                return False
+            normalized = stripped.strip("|")
+            cells = [cell.strip() for cell in normalized.split("|")]
+            return len(cells) >= 2 and len([cell for cell in cells if cell]) >= 2
+
+        def is_divider(line: str) -> bool:
+            return bool(re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line or ""))
+
+        def is_image_line(line: str) -> bool:
+            stripped = line.strip()
+            return bool(
+                re.fullmatch(r"!\[[^\]]*\]\([^)]+\)", stripped)
+                or re.fullmatch(r"<img\b[^>]*>", stripped, flags=re.IGNORECASE)
+            )
+
+        def html_block_tag(line: str) -> str:
+            match = re.match(r"^\s*<(?P<tag>table|figure|svg|canvas|iframe|object|embed)\b", line or "", flags=re.IGNORECASE)
+            return match.group("tag").lower() if match else ""
+
+        def flush_table_buffer() -> None:
+            nonlocal table_buffer
+            if not table_buffer:
+                return
+            should_strip = any(is_divider(line) for line in table_buffer) or len(table_buffer) >= 2
+            if not should_strip:
+                output.extend(table_buffer)
+            table_buffer = []
+
+        for line in lines:
+            if in_html_block:
+                if re.search(r"</(?:table|figure|svg|canvas|iframe|object|embed)>\s*$", line, flags=re.IGNORECASE):
+                    in_html_block = False
+                continue
+            tag = html_block_tag(line)
+            if tag:
+                if not re.search(rf"</{tag}>\s*$", line, flags=re.IGNORECASE):
+                    in_html_block = True
+                flush_table_buffer()
+                continue
+            if is_image_line(line):
+                flush_table_buffer()
+                continue
+            if is_table_row(line) or is_divider(line):
+                table_buffer.append(line)
+                continue
+            flush_table_buffer()
+            output.append(line)
+        flush_table_buffer()
+
+        cleaned = "\n".join(output).strip()
+        return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
     @staticmethod
     def _reference_block_inventory(text: str) -> Dict[str, Any]:

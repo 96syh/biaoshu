@@ -146,6 +146,71 @@ def configure_word_style(doc: docx.Document, reference_profile: dict | None = No
     set_style_font("Heading 3", heading_font, _pt_value(_style_value(style_profile, "heading_3_size", "12pt"), 12), True)
 
 
+def remove_heading_style_numbering(doc: docx.Document) -> None:
+    """Template heading styles may carry historical automatic numbering; export numbers are deterministic."""
+    heading_style_names = {"Heading 1", "Heading 2", "Heading 3", "标题 1", "标题 2", "标题 3"}
+    heading_style_ids = {"Heading1", "Heading2", "Heading3", "1", "2", "3"}
+    for style in doc.styles:
+        style_name = str(getattr(style, "name", "") or "")
+        style_id = str(getattr(style, "style_id", "") or "")
+        if style_name not in heading_style_names and style_id not in heading_style_ids:
+            continue
+        ppr = style._element.pPr
+        if ppr is None:
+            continue
+        for num_pr in list(ppr.findall(qn("w:numPr"))):
+            ppr.remove(num_pr)
+
+
+def clean_export_heading_title(title: str) -> str:
+    """Strip numbering already embedded in outline titles before adding export numbering."""
+    text = re.sub(r"\s+", " ", str(title or "")).strip()
+    for _ in range(3):
+        cleaned = re.sub(
+            r"^\s*(?:第\s*)?(?:[一二三四五六七八九十百]+|\d{1,3}(?:\.\d{1,3})*)\s*(?:[章节]|[、.．)]|\s)\s*",
+            "",
+            text,
+        ).strip()
+        cleaned = re.sub(r"^\s*[（(]\s*(?:[一二三四五六七八九十百]+|\d{1,3})\s*[）)]\s*", "", cleaned).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    return text
+
+
+def export_heading_text(number: str, title: str) -> str:
+    clean_title = clean_export_heading_title(title)
+    return f"{number} {clean_title}".strip()
+
+
+def strip_duplicate_export_content_heading(content: str, *, title: str, display_number: str, source_id: str = "") -> str:
+    """Drop a generated first line that repeats the rendered chapter heading."""
+    lines = str(content or "").splitlines()
+    target_title = re.sub(r"\s+", "", clean_export_heading_title(title))
+    if not target_title:
+        return str(content or "")
+    known_numbers = [value for value in (display_number, source_id) if value]
+
+    def normalized_line(value: str) -> str:
+        text = re.sub(r"^\s{0,3}#{1,6}\s*", "", str(value or "").strip())
+        for number in sorted(known_numbers, key=len, reverse=True):
+            text = re.sub(rf"^\s*{re.escape(number)}\s*[、.．]?\s*", "", text)
+        text = clean_export_heading_title(text)
+        return re.sub(r"\s+", "", text)
+
+    removed = 0
+    while lines and removed < 2:
+        if not lines[0].strip():
+            lines.pop(0)
+            continue
+        if normalized_line(lines[0]) == target_title:
+            lines.pop(0)
+            removed += 1
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
 def clear_document_body_keep_section(doc: docx.Document) -> None:
     """Clear template body while preserving styles, section settings, headers and footers."""
     body = doc._element.body
@@ -193,8 +258,11 @@ def create_export_document(request: WordExportRequest) -> tuple[docx.Document, P
     if template_path:
         doc = docx.Document(str(template_path))
         clear_document_body_keep_section(doc)
+        remove_heading_style_numbering(doc)
         return doc, template_path
-    return docx.Document(), None
+    doc = docx.Document()
+    remove_heading_style_numbering(doc)
+    return doc, None
 
 
 
@@ -774,12 +842,14 @@ async def create_word_export_response(request: WordExportRequest):
                 title = str(getattr(item, "title", "") or "")
                 matched_blocks = HistoryCaseService._extract_matching_blocks(all_blocks, title)
             matched_blocks = remove_duplicate_history_section_heading(matched_blocks, item)
+            matched_blocks = ContentGenerationMixin._strip_history_heading_blocks_from_content(matched_blocks)
             if not matched_blocks:
                 return []
             operations = getattr(item, "patch_operations", None) or []
             if not isinstance(operations, list):
                 operations = []
-            return ContentGenerationMixin._apply_history_patch_to_blocks(matched_blocks, operations)
+            patched_blocks = ContentGenerationMixin._apply_history_patch_to_blocks(matched_blocks, operations)
+            return ContentGenerationMixin._strip_history_heading_blocks_from_content(patched_blocks)
 
         def add_history_word_blocks_if_possible(item) -> bool:
             if not inherited_template_path:
@@ -966,11 +1036,13 @@ async def create_word_export_response(request: WordExportRequest):
                         add_markdown_paragraph(f"- {item}")
 
         # 递归构建文档内容（章节和内容）
-        def add_outline_items(items, level: int = 1):
-            for item in items:
+        def add_outline_items(items, level: int = 1, number_prefix: str = ""):
+            for index, item in enumerate(items, start=1):
+                display_number = f"{number_prefix}.{index}" if number_prefix else str(index)
+                heading_text = export_heading_text(display_number, item.title)
                 # 章节标题
                 if level <= 3:
-                    heading = doc.add_heading(f"{item.id} {item.title}", level=level)
+                    heading = doc.add_heading(heading_text, level=level)
                     heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     if not _INHERITED_TEMPLATE_MODE:
                         for hr in heading.runs:
@@ -980,7 +1052,7 @@ async def create_word_export_response(request: WordExportRequest):
                                 rr.rFonts.set(qn("w:eastAsia"), "宋体")
                 else:
                     para = doc.add_paragraph()
-                    run = para.add_run(f"{item.id} {item.title}")
+                    run = para.add_run(heading_text)
                     if not _INHERITED_TEMPLATE_MODE:
                         run.bold = True
                         run.font.name = "宋体"
@@ -992,7 +1064,12 @@ async def create_word_export_response(request: WordExportRequest):
 
                 # 叶子节点内容
                 if not item.children:
-                    content = item.content or ""
+                    content = strip_duplicate_export_content_heading(
+                        item.content or "",
+                        title=item.title,
+                        display_number=display_number,
+                        source_id=str(item.id or ""),
+                    )
                     if add_history_word_blocks_if_possible(item):
                         pass
                     elif content.strip():
@@ -1000,7 +1077,7 @@ async def create_word_export_response(request: WordExportRequest):
                     add_planned_blocks(item.id)
                 else:
                     add_planned_blocks(item.id)
-                    add_outline_items(item.children, level + 1)
+                    add_outline_items(item.children, level + 1, display_number)
 
         add_outline_items(request.outline)
 

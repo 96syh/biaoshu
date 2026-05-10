@@ -173,6 +173,12 @@ class ContentGenerationMixin:
                 except Exception as exc:
                     print(f"历史 Word patch 生成失败，回退为正文生成：{exc}")
                     self._last_chapter_render = {}
+            model_history_reference_drafts = self._compact_history_reference_drafts_for_model(
+                effective_history_reference_drafts,
+                chapter=chapter,
+                analysis_report=analysis_report or {},
+                response_matrix=effective_response_matrix,
+            )
             system_prompt, user_prompt = prompt_manager.generate_chapter_content_prompt(
                 chapter=chapter,
                 parent_chapters=parent_chapters or [],
@@ -186,7 +192,7 @@ class ContentGenerationMixin:
                 response_matrix=effective_response_matrix,
                 reference_bid_style_profile=reference_bid_style_profile or (analysis_report or {}).get("reference_bid_style_profile"),
                 document_blocks_plan=document_blocks_plan or (analysis_report or {}).get("document_blocks_plan"),
-                history_reference_drafts=effective_history_reference_drafts,
+                history_reference_drafts=model_history_reference_drafts,
             )
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -222,6 +228,221 @@ class ContentGenerationMixin:
                 return draft
         return None
 
+    @classmethod
+    def _compact_history_reference_drafts_for_model(
+        cls,
+        drafts: list | None,
+        *,
+        chapter: dict | None = None,
+        analysis_report: Dict[str, Any] | None = None,
+        response_matrix: Dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        return [
+            cls._compact_history_reference_draft_for_model(
+                draft,
+                chapter=chapter,
+                analysis_report=analysis_report,
+                response_matrix=response_matrix,
+            )
+            for draft in drafts or []
+            if isinstance(draft, dict)
+        ]
+
+    @classmethod
+    def _compact_history_reference_draft_for_model(
+        cls,
+        draft: Dict[str, Any],
+        *,
+        chapter: dict | None = None,
+        analysis_report: Dict[str, Any] | None = None,
+        response_matrix: Dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build a small prompt payload; full Word blocks stay server-side."""
+        matched_blocks = draft.get("matched_blocks") if isinstance(draft.get("matched_blocks"), list) else []
+        text_reference = (
+            cls._history_text_reference_from_blocks(matched_blocks)
+            if matched_blocks
+            else HistoryCaseService._strip_non_text_markdown_from_reference(
+                str(draft.get("markdown_text") or draft.get("reference_text") or "")
+            )
+        )
+        compact_blocks = [
+            cls._compact_history_block_for_model(block)
+            for block in matched_blocks
+            if isinstance(block, dict) and str(block.get("type") or "") != "heading"
+        ]
+        return {
+            "match_level": draft.get("match_level"),
+            "score": draft.get("score"),
+            "reuse_rule": draft.get("reuse_rule"),
+            "project_title": draft.get("project_title"),
+            "result": draft.get("result"),
+            "file_name": draft.get("file_name"),
+            "document_id": draft.get("document_id"),
+            "matched_term": draft.get("matched_term"),
+            "match_reasons": draft.get("match_reasons") or [],
+            "reference_source": draft.get("reference_source"),
+            "reference_text": text_reference,
+            "markdown_text": text_reference,
+            "reference_char_count": len(text_reference),
+            "block_inventory": draft.get("block_inventory") or HistoryCaseService._reference_block_inventory(text_reference),
+            "model_input_policy": {
+                "prompt_payload": "text_only_with_lightweight_word_block_inventory",
+                "omitted_from_prompt": ["docx_xml", "html", "html_fragment", "table_rows", "image_binary", "base64_assets"],
+                "full_word_blocks_reused_by_backend": bool(matched_blocks),
+                "blind_bid_media_isolation": cls._is_blind_bid_context(chapter or {}, analysis_report or {}, response_matrix or {}),
+            },
+            "preserved_word_blocks": compact_blocks,
+        }
+
+    @classmethod
+    def _compact_history_block_for_model(cls, block: dict[str, Any]) -> dict[str, Any]:
+        block_id = str(block.get("id") or "")
+        block_type = str(block.get("type") or "paragraph")
+        level = int(block.get("level") or 0)
+        text = cls._compact_text(str(block.get("text") or ""), 700)
+        has_image = cls._history_block_has_image(block)
+        if block_type == "table":
+            return {
+                "id": block_id,
+                "type": "table",
+                "level": level,
+                "summary": "Word表格已从prompt省略，后端将按原位置复用；如需补充说明，请引用本block_id插入文字。",
+                "has_sensitive_fields": cls._history_table_has_sensitive_fields(block),
+            }
+        if has_image and not text:
+            return {
+                "id": block_id,
+                "type": "image",
+                "level": level,
+                "summary": "Word图片已从prompt省略，后端将按原位置复用；必要时只允许通过update_caption修改图注。",
+                "asset_count": len(block.get("asset_ids") or []),
+                "caption_text": cls._compact_text(str(block.get("caption_text") or ""), 160),
+            }
+        payload = {
+            "id": block_id,
+            "type": block_type,
+            "level": level,
+            "text": text,
+        }
+        if block_type == "heading" and text:
+            payload["markdown"] = f"{'#' * max(1, min(level, 6))} {text}" if level else text
+        if has_image:
+            payload["preserved_image"] = "image omitted from prompt and reused by backend"
+            if block.get("caption_text"):
+                payload["caption_text"] = cls._compact_text(str(block.get("caption_text") or ""), 160)
+        return payload
+
+    @classmethod
+    def _history_text_reference_from_blocks(cls, blocks: list) -> str:
+        parts: list[str] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "")
+            if block_type == "heading":
+                continue
+            if block_type == "table" or cls._history_block_has_image(block):
+                text = str(block.get("text") or "").strip()
+                if text and block_type != "table":
+                    parts.append(text)
+                continue
+            markdown = str(block.get("markdown") or "").strip()
+            text = str(block.get("text") or "").strip()
+            if markdown and not cls._history_markdown_has_non_text(markdown):
+                parts.append(markdown)
+            elif text:
+                parts.append(text)
+        cleaned = "\n\n".join(parts).strip()
+        return cls._compact_text(re.sub(r"\n{3,}", "\n\n", cleaned), 8000)
+
+    @staticmethod
+    def _compact_text(value: str, max_chars: int) -> str:
+        text = re.sub(r"\n{3,}", "\n\n", str(value or "").strip())
+        if len(text) <= max_chars:
+            return text
+        return f"{text[:max_chars].rstrip()}\n……"
+
+    @staticmethod
+    def _history_markdown_has_non_text(markdown: str) -> bool:
+        return bool(
+            re.search(r"!\[[^\]]*\]\([^)]+\)", markdown or "")
+            or re.search(r"<(?:img|table|figure|svg|canvas|iframe|object|embed)\b", markdown or "", flags=re.IGNORECASE)
+            or re.search(r"^\s*\|.+\|\s*$", markdown or "", flags=re.MULTILINE)
+        )
+
+    @classmethod
+    def _history_block_has_image(cls, block: dict[str, Any]) -> bool:
+        return bool(
+            block.get("asset_ids")
+            or re.search(r"!\[[^\]]*\]\([^)]+\)", str(block.get("markdown") or ""))
+            or re.search(r"<img\b|<figure\b", str(block.get("html") or ""), flags=re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _history_table_has_sensitive_fields(block: dict[str, Any]) -> bool:
+        value = "\n".join(
+            str(part or "")
+            for part in (
+                block.get("text"),
+                block.get("markdown"),
+                json.dumps(block.get("rows") or [], ensure_ascii=False),
+            )
+        )
+        return bool(re.search(r"姓名|人员|联系方式|联系电话|手机|电话|证书编号|身份证|投标人|公司名称|单位名称|Logo|商标", value, flags=re.IGNORECASE))
+
+    @classmethod
+    def _is_blind_bid_context(
+        cls,
+        chapter: dict | None,
+        analysis_report: Dict[str, Any] | None,
+        response_matrix: Dict[str, Any] | None,
+    ) -> bool:
+        parts = [
+            json.dumps(chapter or {}, ensure_ascii=False),
+            json.dumps((analysis_report or {}).get("bid_document_requirements") or {}, ensure_ascii=False),
+            json.dumps((analysis_report or {}).get("risk_items") or [], ensure_ascii=False),
+            json.dumps(response_matrix or {}, ensure_ascii=False),
+        ]
+        text = "\n".join(parts)
+        return bool(re.search(r"暗标|匿名|隐藏投标人|不得出现投标人|不得出现.*(?:姓名|联系方式|Logo|商标)|技术标.*不得.*单位", text, flags=re.IGNORECASE))
+
+    @classmethod
+    def _prepare_history_blocks_for_reuse(
+        cls,
+        blocks: list,
+        *,
+        chapter: dict | None = None,
+        analysis_report: Dict[str, Any] | None = None,
+        response_matrix: Dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        reusable = json.loads(json.dumps([block for block in blocks if isinstance(block, dict)], ensure_ascii=False))
+        if not cls._is_blind_bid_context(chapter or {}, analysis_report or {}, response_matrix or {}):
+            return reusable
+        prepared: list[dict[str, Any]] = []
+        for block in reusable:
+            if cls._history_block_has_image(block):
+                prepared.append(cls._history_placeholder_block(block, "暗标章节已隔离历史图片/Logo/截图，需人工确认是否可匿名复用。"))
+                continue
+            if str(block.get("type") or "") == "table" and cls._history_table_has_sensitive_fields(block):
+                prepared.append(cls._history_placeholder_block(block, "暗标章节已隔离历史人员/联系方式/证书表格，需改为匿名岗位或人工复核。"))
+                continue
+            prepared.append(block)
+        return prepared
+
+    @classmethod
+    def _history_placeholder_block(cls, block: dict[str, Any], text: str) -> dict[str, Any]:
+        block_id = str(block.get("id") or "history")
+        return {
+            "id": block_id,
+            "type": "paragraph",
+            "level": 0,
+            "text": f"〖待人工复核：{text}〗",
+            "markdown": f"〖待人工复核：{text}〗",
+            "html": cls._history_markdown_to_basic_html(f"〖待人工复核：{text}〗", wrap=False, block_id=block_id),
+            "asset_ids": [],
+        }
+
     async def _generate_patch_based_chapter_content(
         self,
         chapter: dict,
@@ -244,7 +465,12 @@ class ContentGenerationMixin:
             project_overview=project_overview,
             analysis_report=analysis_report,
             response_matrix=response_matrix,
-            history_reference_draft=history_reference_draft,
+            history_reference_draft=self._compact_history_reference_draft_for_model(
+                history_reference_draft,
+                chapter=chapter,
+                analysis_report=analysis_report,
+                response_matrix=response_matrix,
+            ),
             generated_summaries=generated_summaries,
         )
         raw_patch = await self._collect_stream_text(
@@ -258,13 +484,22 @@ class ContentGenerationMixin:
             operations = []
         matched_blocks = history_reference_draft.get("matched_blocks")
         if isinstance(matched_blocks, list) and matched_blocks:
-            patched_blocks = self._apply_history_patch_to_blocks(matched_blocks, operations)
+            reusable_blocks = self._prepare_history_blocks_for_reuse(
+                matched_blocks,
+                chapter=chapter,
+                analysis_report=analysis_report,
+                response_matrix=response_matrix,
+            )
+            patched_blocks = self._apply_history_patch_to_blocks(reusable_blocks, operations)
+            patched_blocks = self._strip_history_heading_blocks_from_content(patched_blocks)
             markdown = HistoryCaseService._blocks_to_markdown(patched_blocks)
             html_content = HistoryCaseService._blocks_to_html(patched_blocks)
         else:
             markdown = self._apply_history_patch_operations(source_markdown, operations, html_mode=False)
+            markdown = self._strip_generated_markdown_headings(markdown)
             html_content = source_html or self._history_markdown_to_basic_html(source_markdown)
             html_content = self._apply_history_patch_operations(html_content, operations, html_mode=True)
+            html_content = self._strip_html_heading_elements(html_content)
         return markdown or source_markdown, html_content, [op for op in operations if isinstance(op, dict)]
 
     @classmethod
@@ -295,6 +530,35 @@ class ContentGenerationMixin:
                 elif kind == "update_caption":
                     cls._update_history_caption(block, op)
         return patched
+
+    @staticmethod
+    def _strip_history_heading_blocks_from_content(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop historical heading blocks; the outline already owns chapter structure."""
+        return [
+            block
+            for block in blocks or []
+            if isinstance(block, dict) and str(block.get("type") or "") != "heading"
+        ]
+
+    @staticmethod
+    def _strip_generated_markdown_headings(content: str) -> str:
+        """Remove Markdown heading lines from leaf chapter body text."""
+        if not content:
+            return ""
+        lines = []
+        for line in str(content).splitlines():
+            if re.match(r"^\s{0,3}#{1,6}\s+\S", line):
+                continue
+            if re.match(r"^\s*(?:[-=]){3,}\s*$", line) and lines:
+                continue
+            lines.append(line)
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+    @staticmethod
+    def _strip_html_heading_elements(content: str) -> str:
+        if not content:
+            return ""
+        return re.sub(r"<h[1-6]\b[^>]*>.*?</h[1-6]>\s*", "", str(content), flags=re.IGNORECASE | re.DOTALL).strip()
 
     @staticmethod
     def _normalize_history_patch_operation(operation: Any) -> dict[str, Any]:
