@@ -1043,6 +1043,29 @@
     font-size: var(--word-table-size, 9pt);
   }
 
+  .word-markdown-table-wrap {
+    width: 100%;
+    margin: 8pt 0 10pt;
+    overflow-x: auto;
+  }
+
+  .word-section__content .word-markdown-table {
+    margin: 0;
+    table-layout: fixed;
+  }
+
+  .word-html-fragment table {
+    width: 100%;
+    table-layout: fixed;
+  }
+
+  .word-html-fragment img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 8pt auto;
+  }
+
   .word-section__content th,
   .word-section__content td {
     border: 1px solid #000;

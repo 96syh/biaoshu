@@ -197,7 +197,6 @@ async def match_reference_case(request: ReferenceMatchRequest):
         "primary_domain": selected.get("primary_domain"),
         "pageindex_tree_path": selected.get("pageindex_tree_path"),
     })
-
     result = {
         "success": True,
         "message": f"已自动匹配历史案例：{selected.get('project_title')}",

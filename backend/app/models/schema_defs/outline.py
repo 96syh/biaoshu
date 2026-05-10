@@ -28,6 +28,9 @@ class OutlineItem(BaseModel):
     response_matrix_ids: List[str] = Field(default_factory=list, description="关联响应矩阵ID列表")
     children: Optional[List['OutlineItem']] = None
     content: Optional[str] = None
+    content_html: Optional[str] = None
+    patch_operations: List[Dict[str, Any]] = Field(default_factory=list)
+    history_reference: Dict[str, Any] = Field(default_factory=dict)
 
 
 

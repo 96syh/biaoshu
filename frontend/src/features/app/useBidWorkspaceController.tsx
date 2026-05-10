@@ -177,6 +177,12 @@ const contentConcurrencyLimit = () => {
   if (!Number.isFinite(raw)) return 2;
   return Math.max(1, Math.min(4, Math.floor(raw)));
 };
+
+const chapterGenerationRetryLimit = () => {
+  const raw = Number((process.env.REACT_APP_YIBIAO_CHAPTER_RETRIES || '2').trim());
+  if (!Number.isFinite(raw)) return 2;
+  return Math.max(1, Math.min(4, Math.floor(raw)));
+};
 type TenderScoringRow = {
   id: string;
   item: string;
@@ -394,6 +400,11 @@ const apiErrorMessage = (error: any, fallback: string) => {
   }
   return error?.message || fallback;
 };
+
+const isGenerationAbortError = (error: any) => error?.name === 'AbortError' || /abort|已停止生成/i.test(String(error?.message || ''));
+
+const waitBeforeChapterRetry = (attempt: number) =>
+  new Promise(resolve => window.setTimeout(resolve, Math.min(1600, 450 * attempt)));
 
 const updateOutlineItem = (items: OutlineItem[], id: string, patch: Partial<OutlineItem>): OutlineItem[] =>
   items.map((item) => {
@@ -2844,7 +2855,7 @@ export const useBidWorkspaceController = () => {
       onContent?: (content: string) => void;
       onProgress?: (content: string) => void;
     },
-  ) => {
+  ): Promise<Pick<OutlineItem, 'content' | 'content_html' | 'patch_operations' | 'history_reference'>> => {
     if (!effectiveOutline) throw new Error('缺少目录数据');
     if (!activeReport) throw new Error('缺少结构化解析结果，请先完成标准解析');
     const siblingItems = entry.parents.length
@@ -2871,6 +2882,9 @@ export const useBidWorkspaceController = () => {
     };
     const response = await contentApi.generateChapterContentStream(request, options?.signal);
     let content = '';
+    let contentHtml = '';
+    let patchOperations: Record<string, unknown>[] = [];
+    let historyReference: Record<string, unknown> = {};
     await consumeSseStream(response, (payload) => {
       if (payload.status === 'error') throw new Error(payload.message || '正文生成失败');
       if (payload.status === 'streaming' && payload.full_content) {
@@ -2880,6 +2894,9 @@ export const useBidWorkspaceController = () => {
       }
       if (payload.status === 'completed' && payload.content) {
         content = payload.content;
+        contentHtml = typeof payload.content_html === 'string' ? payload.content_html : '';
+        patchOperations = Array.isArray(payload.patch_operations) ? payload.patch_operations : [];
+        historyReference = payload.history_reference && typeof payload.history_reference === 'object' ? payload.history_reference : {};
         options?.onContent?.(content);
         options?.onProgress?.(content);
       }
@@ -2888,14 +2905,48 @@ export const useBidWorkspaceController = () => {
       isStopped: () => generationStoppedRef.current,
     });
     if (!content.trim()) throw new Error('模型返回空内容');
-    return content;
+    return { content, content_html: contentHtml, patch_operations: patchOperations, history_reference: historyReference };
   };
 
-  const saveGeneratedContent = (entry: ChapterEntry, content: string, scroll = true, outlineSource = effectiveOutline) => {
+  const generateChapterWithRetry = async (
+    entry: ChapterEntry,
+    options?: {
+      signal?: AbortSignal;
+      onContent?: (content: string) => void;
+      onProgress?: (content: string) => void;
+      onRetry?: (attempt: number, error: any) => void;
+    },
+  ): Promise<Pick<OutlineItem, 'content' | 'content_html' | 'patch_operations' | 'history_reference'>> => {
+    const maxAttempts = chapterGenerationRetryLimit();
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await waitIfGenerationPaused();
+        return await generateChapter(entry, options);
+      } catch (error: any) {
+        lastError = error;
+        if (generationStoppedRef.current || options?.signal?.aborted || isGenerationAbortError(error)) {
+          throw error;
+        }
+        if (attempt >= maxAttempts) break;
+        options?.onRetry?.(attempt + 1, error);
+        await waitBeforeChapterRetry(attempt);
+      }
+    }
+    throw lastError || new Error('正文生成失败');
+  };
+
+  const saveGeneratedContent = (
+    entry: ChapterEntry,
+    contentPatch: string | Pick<OutlineItem, 'content' | 'content_html' | 'patch_operations' | 'history_reference'>,
+    scroll = true,
+    outlineSource = effectiveOutline,
+  ) => {
     if (!outlineSource) return outlineSource;
+    const patch = typeof contentPatch === 'string' ? { content: contentPatch } : contentPatch;
     const nextOutline = {
       ...outlineSource,
-      outline: updateOutlineItem(outlineSource.outline, entry.item.id, { content }),
+      outline: updateOutlineItem(outlineSource.outline, entry.item.id, patch),
     };
     updateOutline(nextOutline);
     setManualReviewConfirmed(false);
@@ -2919,7 +2970,7 @@ export const useBidWorkspaceController = () => {
     const taskVersion = startProgress('正文生成', ['准备章节', '模型写入', '保存正文'], `正在生成 ${selectedEntry.item.id} ${selectedEntry.item.title}`, 12);
     syncGenerationProgress(`正在生成 ${selectedEntry.item.id} ${selectedEntry.item.title}`, 12, 1, '正文生成');
     try {
-      const content = await generateChapter(selectedEntry, {
+      const generated = await generateChapterWithRetry(selectedEntry, {
         signal: controller.signal,
         onContent: (partial) => {
           setContentStreamText(partial);
@@ -2930,16 +2981,21 @@ export const useBidWorkspaceController = () => {
           advanceProgress(`正在写入 ${selectedEntry.item.id} ${selectedEntry.item.title}`, percent, 1, taskVersion);
           syncGenerationProgress(`正在写入 ${selectedEntry.item.id} ${selectedEntry.item.title}`, percent, 1, '正文生成');
         },
+        onRetry: (attempt, error) => {
+          const message = apiErrorMessage(error, '模型返回中断');
+          advanceProgress(`第 ${attempt} 次重试 ${selectedEntry.item.id} ${selectedEntry.item.title}：${message}`, 28, 1, taskVersion);
+          syncGenerationProgress(`第 ${attempt} 次重试 ${selectedEntry.item.id} ${selectedEntry.item.title}`, 28, 1, '正文生成');
+        },
       });
       advanceProgress('正在保存本章正文', 88, 2, taskVersion);
-      saveGeneratedContent(selectedEntry, content);
+      saveGeneratedContent(selectedEntry, generated);
       await draftStorage.flushPendingSave();
       syncGenerationProgress('本章正文生成完成', 100, 2, '正文生成');
       setGenerationProgress(prev => prev ? { ...prev, status: 'success', percent: 100, detail: '本章正文生成完成' } : prev);
       completeProgress('本章正文生成完成', taskVersion);
       setSuccess(`已生成 ${selectedEntry.item.id} ${selectedEntry.item.title}`);
     } catch (error: any) {
-      if (error?.name === 'AbortError' || generationStoppedRef.current) {
+      if (isGenerationAbortError(error) || generationStoppedRef.current) {
         failProgress('已停止生成', undefined, taskVersion);
         setInfo('已停止生成，可继续生成当前或其他章节');
         return;
@@ -2972,10 +3028,9 @@ export const useBidWorkspaceController = () => {
       const pendingEntries = entries.filter(entry => !entry.item.content?.trim());
       const concurrency = Math.min(contentConcurrencyLimit(), Math.max(1, pendingEntries.length));
       let completedCount = 0;
-      let firstError: unknown = null;
+      const failedEntries: Array<{ entry: ChapterEntry; error: any }> = [];
       const runEntry = async (entry: ChapterEntry, index: number) => {
         await waitIfGenerationPaused();
-        if (firstError) return;
         if (entry.item.content?.trim()) return;
         setStreamingChapterId(entry.item.id);
         setActiveDocId(entry.item.id);
@@ -2983,7 +3038,7 @@ export const useBidWorkspaceController = () => {
         const basePercent = Math.min(92, 8 + Math.round((index / Math.max(pendingEntries.length, 1)) * 82));
         advanceProgress(`正在生成 ${entry.item.id} ${entry.item.title}`, basePercent, 1, taskVersion);
         syncGenerationProgress(`正在生成 ${entry.item.id} ${entry.item.title}`, basePercent, 1, '批量生成');
-        const content = await generateChapter(entry, {
+        const generated = await generateChapterWithRetry(entry, {
           signal: controller.signal,
           onContent: (partial) => {
             setContentStreamText(`# ${entry.item.id} ${entry.item.title}\n\n${partial}`);
@@ -2999,9 +3054,14 @@ export const useBidWorkspaceController = () => {
             advanceProgress(`正在写入 ${entry.item.id} ${entry.item.title}`, percent, 1, taskVersion);
             syncGenerationProgress(`正在写入 ${entry.item.id} ${entry.item.title}`, percent, 1, '批量生成');
           },
+          onRetry: (attempt, error) => {
+            const message = apiErrorMessage(error, '模型返回中断');
+            advanceProgress(`第 ${attempt} 次重试 ${entry.item.id} ${entry.item.title}：${message}`, basePercent, 1, taskVersion);
+            syncGenerationProgress(`第 ${attempt} 次重试 ${entry.item.id} ${entry.item.title}`, basePercent, 1, '批量生成');
+          },
         });
         nextOutline = batchOutlineRef.current || nextOutline;
-        nextOutline = { ...nextOutline, outline: updateOutlineItem(nextOutline.outline, entry.item.id, { content }) };
+        nextOutline = { ...nextOutline, outline: updateOutlineItem(nextOutline.outline, entry.item.id, generated) };
         batchOutlineRef.current = nextOutline;
         updateOutline(nextOutline);
         completedCount += 1;
@@ -3012,13 +3072,17 @@ export const useBidWorkspaceController = () => {
 
       const workers = Array.from({ length: concurrency }, async (_, workerIndex) => {
         for (let index = workerIndex; index < pendingEntries.length; index += concurrency) {
-          if (firstError) return;
           try {
             await runEntry(pendingEntries[index], index);
-          } catch (error) {
-            firstError = error;
-            controller.abort();
-            throw error;
+          } catch (error: any) {
+            if (generationStoppedRef.current || controller.signal.aborted || isGenerationAbortError(error)) {
+              throw error;
+            }
+            failedEntries.push({ entry: pendingEntries[index], error });
+            const message = apiErrorMessage(error, '正文生成失败');
+            const percent = Math.min(96, 8 + Math.round(((completedCount + failedEntries.length) / Math.max(pendingEntries.length, 1)) * 86));
+            advanceProgress(`跳过 ${pendingEntries[index].item.id} ${pendingEntries[index].item.title}：${message}`, percent, 1, taskVersion);
+            syncGenerationProgress(`已跳过 ${failedEntries.length} 个失败章节，继续生成后续章节`, percent, 1, '批量生成');
           }
         }
       });
@@ -3026,11 +3090,22 @@ export const useBidWorkspaceController = () => {
       await draftStorage.flushPendingSave();
       syncGenerationProgress('批量正文生成完成', 100, 2, '批量生成');
       setGenerationProgress(prev => prev ? { ...prev, status: 'success', percent: 100, detail: '批量正文生成完成' } : prev);
-      completeProgress('批量正文生成完成', taskVersion);
-      setSuccess('批量正文生成完成，正在执行一致性收口');
+      if (completedCount === 0 && failedEntries.length > 0) {
+        throw failedEntries[0].error || new Error('批量生成失败');
+      }
+      const failedSummary = failedEntries
+        .slice(0, 4)
+        .map(item => `${item.entry.item.id} ${item.entry.item.title}`)
+        .join('、');
+      completeProgress(failedEntries.length ? `批量生成完成，${failedEntries.length} 个章节待重试` : '批量正文生成完成', taskVersion);
+      if (failedEntries.length) {
+        setInfo(`批量生成已继续完成，${failedEntries.length} 个章节失败可单独重试：${failedSummary}${failedEntries.length > 4 ? '等' : ''}`);
+      } else {
+        setSuccess('批量正文生成完成，正在执行一致性收口');
+      }
       await runConsistencyRevision(nextOutline, true);
     } catch (error: any) {
-      if (error?.name === 'AbortError' || generationStoppedRef.current) {
+      if (isGenerationAbortError(error) || generationStoppedRef.current) {
         failProgress('已停止批量生成', undefined, taskVersion);
         setInfo('已停止批量生成，已保留已生成章节');
         return;

@@ -261,6 +261,7 @@ export interface ChapterContentRequest {
   bid_mode?: BidMode;
   reference_bid_style_profile?: Record<string, unknown>;
   document_blocks_plan?: Record<string, unknown>;
+  history_reference_drafts?: Record<string, unknown>[];
   asset_library?: Record<string, unknown>;
   generated_summaries?: GeneratedSummary[];
   enterprise_materials?: RequiredMaterial[];

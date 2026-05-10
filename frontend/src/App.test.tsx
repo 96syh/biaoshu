@@ -50,6 +50,7 @@ jest.mock('./services/api', () => {
 });
 
 const App = require('./App').default;
+const { parseDocumentPreviewBlocks, normalizeWordHtmlTables } = require('./features/content/DocumentPreviewNode');
 
 test('renders the local workspace shell', async () => {
   render(<App />);
@@ -57,4 +58,56 @@ test('renders the local workspace shell', async () => {
     expect(screen.getByText('本地工作台')).toBeInTheDocument();
     expect(screen.getByText('待上传文件')).toBeInTheDocument();
   });
+});
+
+test('parses generated markdown tables without gfm dependency', () => {
+  const blocks = parseDocumentPreviewBlocks([
+    '服务范围响应表',
+    '',
+    '| 序号 | 招标要求 | 响应范围 |',
+    '| 1 | 服务范围 | 完全响应 |',
+    '| 2 | 服务期限 | 按招标文件执行 |',
+  ].join('\n'));
+
+  expect(blocks).toEqual([
+    { type: 'markdown', content: '服务范围响应表' },
+    {
+      type: 'table',
+      rows: [
+        ['序号', '招标要求', '响应范围'],
+        ['1', '服务范围', '完全响应'],
+        ['2', '服务期限', '按招标文件执行'],
+      ],
+    },
+  ]);
+});
+
+test('parses inline markdown tables split from generated text', () => {
+  const blocks = parseDocumentPreviewBlocks(
+    '进度目标响应表 | 序号 | 进度事项 | 招标文件要求 | 本章响应目标 | 管控方式 | | 1 | 服务期限 | 自合同签订之日起至2026年12月31日 | 在服务期限内组织设计服务 | 建立任务台账 | | 2 | 初步设计 | 不超过5日 | 5日内完成 | 节点预警 |'
+  );
+
+  expect(blocks).toEqual([
+    { type: 'markdown', content: '进度目标响应表' },
+    {
+      type: 'table',
+      rows: [
+        ['序号', '进度事项', '招标文件要求', '本章响应目标', '管控方式'],
+        ['1', '服务期限', '自合同签订之日起至2026年12月31日', '在服务期限内组织设计服务', '建立任务台账'],
+        ['2', '初步设计', '不超过5日', '5日内完成', '节点预警'],
+      ],
+    },
+  ]);
+});
+
+test('normalizes saved html paragraphs that contain inline markdown tables', () => {
+  const html = normalizeWordHtmlTables(
+    '<p data-history-block-id="patch-1">进度目标响应表 | 序号 | 进度事项 | 招标文件要求 | | 1 | 服务期限 | 至2026年12月31日 |</p>'
+  );
+
+  expect(html).toContain('<p data-history-block-id="patch-1">进度目标响应表</p>');
+  expect(html).toContain('<table data-history-block-id="patch-1">');
+  expect(html).toContain('<th>序号</th>');
+  expect(html).toContain('<td>服务期限</td>');
+  expect(html).not.toContain('| 序号 |');
 });

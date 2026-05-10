@@ -380,6 +380,9 @@ export interface OutlineItem {
   asset_required?: boolean;
   children?: OutlineItem[];
   content?: string;
+  content_html?: string;
+  patch_operations?: Record<string, unknown>[];
+  history_reference?: Record<string, unknown>;
 }
 
 export interface OutlineData {

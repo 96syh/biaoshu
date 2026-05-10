@@ -1,7 +1,9 @@
 """本地历史标书案例库检索服务。"""
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import re
 import sqlite3
@@ -57,7 +59,24 @@ class HistoryCaseService:
     def _connect(cls) -> sqlite3.Connection:
         conn = sqlite3.connect(str(cls.DB_PATH))
         conn.row_factory = sqlite3.Row
+        cls._ensure_optional_document_columns(conn)
         return conn
+
+    @classmethod
+    def _ensure_optional_document_columns(cls, conn: sqlite3.Connection) -> None:
+        try:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(case_documents)").fetchall()}
+            optional_columns = {
+                "block_json_path": "TEXT NOT NULL DEFAULT ''",
+                "html_preview_path": "TEXT NOT NULL DEFAULT ''",
+                "asset_dir": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in optional_columns.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE case_documents ADD COLUMN {column} {definition}")
+            conn.commit()
+        except sqlite3.Error:
+            pass
 
     @classmethod
     def _resolve_history_artifact_path(cls, raw_path: str) -> Path:
@@ -279,6 +298,9 @@ class HistoryCaseService:
                         d.file_name,
                         d.source_path AS document_path,
                         d.markdown_path,
+                        d.block_json_path,
+                        d.html_preview_path,
+                        d.asset_dir,
                         d.pageindex_tree_path,
                         snippet(history_case_fts, 4, '[', ']', '...', 24) AS snippet
                     FROM history_case_fts
@@ -318,6 +340,9 @@ class HistoryCaseService:
                     d.file_name,
                     d.source_path AS document_path,
                     d.markdown_path,
+                    d.block_json_path,
+                    d.html_preview_path,
+                    d.asset_dir,
                     d.pageindex_tree_path,
                     history_case_fts.body AS body
                 FROM history_case_fts
@@ -393,6 +418,9 @@ class HistoryCaseService:
                 "best_file_name": row.get("file_name", ""),
                 "best_document_path": row.get("document_path", ""),
                 "markdown_path": cls._normalize_artifact_path_for_response(row.get("markdown_path", "")),
+                "block_json_path": cls._normalize_artifact_path_for_response(row.get("block_json_path", "")),
+                "html_preview_path": cls._normalize_artifact_path_for_response(row.get("html_preview_path", "")),
+                "asset_dir": cls._normalize_artifact_path_for_response(row.get("asset_dir", "")),
                 "pageindex_tree_path": cls._normalize_artifact_path_for_response(row.get("pageindex_tree_path", "")),
                 "snippet": row.get("snippet", ""),
                 "score": 0.0,
@@ -411,6 +439,9 @@ class HistoryCaseService:
                 record["best_file_name"] = row.get("file_name", "")
                 record["best_document_path"] = row.get("document_path", "")
                 record["markdown_path"] = cls._normalize_artifact_path_for_response(row.get("markdown_path", ""))
+                record["block_json_path"] = cls._normalize_artifact_path_for_response(row.get("block_json_path", ""))
+                record["html_preview_path"] = cls._normalize_artifact_path_for_response(row.get("html_preview_path", ""))
+                record["asset_dir"] = cls._normalize_artifact_path_for_response(row.get("asset_dir", ""))
                 record["pageindex_tree_path"] = cls._normalize_artifact_path_for_response(row.get("pageindex_tree_path", ""))
 
         for index, term in enumerate(query_terms[:10]):
@@ -438,6 +469,9 @@ class HistoryCaseService:
                         d.file_name,
                         d.source_path AS document_path,
                         d.markdown_path,
+                        d.block_json_path,
+                        d.html_preview_path,
+                        d.asset_dir,
                         d.pageindex_tree_path,
                         '' AS snippet
                     FROM case_projects p
@@ -504,6 +538,155 @@ class HistoryCaseService:
         if not path.exists() or not path.is_file():
             return ""
         return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+
+    @classmethod
+    def load_block_json(cls, block_json_path: str) -> Dict[str, Any]:
+        path = cls._resolve_history_artifact_path(block_json_path)
+        if not path.exists() or not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return {}
+
+    @classmethod
+    def load_html_preview(cls, html_preview_path: str, max_chars: int = 120000) -> str:
+        path = cls._resolve_history_artifact_path(html_preview_path)
+        if not path.exists() or not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+
+    @classmethod
+    def find_chapter_reference_drafts(
+        cls,
+        chapter: Dict[str, Any],
+        parent_chapters: List[Dict[str, Any]] | None = None,
+        sibling_chapters: List[Dict[str, Any]] | None = None,
+        analysis_report: Dict[str, Any] | None = None,
+        response_matrix: Dict[str, Any] | None = None,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Find reusable historical chapter drafts for the current outline node.
+
+        This is intentionally rule-based and read-only: it provides candidate text
+        for the model to rewrite, while the current tender analysis remains the
+        source of truth.
+        """
+        if limit <= 0:
+            return []
+        query_text = cls._chapter_reference_query_text(
+            chapter,
+            parent_chapters=parent_chapters,
+            analysis_report=analysis_report,
+            response_matrix=response_matrix,
+        )
+        title = cls._text((chapter or {}).get("title"))
+        terms = cls._chapter_reference_terms(title, query_text)
+        if not terms:
+            return []
+
+        candidates: list[dict[str, Any]] = []
+        seen_documents: set[str] = set()
+        for term in terms:
+            rows = cls.search(term, limit=max(limit * 3, 6))
+            for row in rows:
+                document_key = cls._first_text(
+                    row.get("document_id"),
+                    row.get("markdown_path"),
+                    row.get("document_path"),
+                    fallback=str(len(seen_documents)),
+                )
+                if document_key in seen_documents:
+                    continue
+                seen_documents.add(document_key)
+
+                markdown = cls.load_markdown(str(row.get("markdown_path") or ""), max_chars=90000)
+                block_payload = cls.load_block_json(str(row.get("block_json_path") or ""))
+                all_blocks = block_payload.get("blocks") if isinstance(block_payload, dict) else []
+                matched_blocks = cls._extract_matching_blocks(all_blocks if isinstance(all_blocks, list) else [], title)
+                has_word_heading_match = bool(matched_blocks)
+                reference_text = cls._blocks_to_markdown(matched_blocks) if matched_blocks else ""
+                if not reference_text:
+                    reference_text = cls._extract_markdown_section(
+                        markdown,
+                        title,
+                        fallback_snippet=str(row.get("snippet") or ""),
+                        search_term=term,
+                        max_chars=3600,
+                    )
+                if (
+                    not has_word_heading_match
+                    and cls._is_service_scope_title(title)
+                    and cls._has_excluded_history_topic(reference_text)
+                ):
+                    continue
+                if not reference_text.strip():
+                    reference_text = cls._blocks_to_markdown(matched_blocks)
+                if not reference_text.strip():
+                    continue
+                html_fragment = cls._blocks_to_html(matched_blocks) or cls._extract_html_fragment(
+                    cls.load_html_preview(str(row.get("html_preview_path") or "")),
+                    matched_blocks,
+                )
+                html_fragment = cls._inline_history_html_assets(html_fragment, str(row.get("asset_dir") or ""))
+
+                score, reasons = cls._chapter_reference_score(
+                    row,
+                    query_text=query_text,
+                    title=title,
+                    matched_term=term,
+                    reference_text=reference_text,
+                )
+                if not has_word_heading_match:
+                    score = min(score - 0.22, 0.36)
+                    reasons.append("未命中历史 Word 标题块，仅作语义参考")
+                if score < 0.18:
+                    continue
+
+                match_level = "high" if score >= 0.62 else "medium" if score >= 0.38 else "low"
+                block_inventory = cls._reference_block_inventory(reference_text)
+                candidates.append(
+                    {
+                        "match_level": match_level,
+                        "score": round(score, 3),
+                        "reuse_rule": "primary_draft" if match_level == "high" else "minimal_revision",
+                        "project_title": row.get("project_title") or row.get("subject") or "",
+                        "result": row.get("result") or "",
+                        "file_name": row.get("file_name") or "",
+                        "document_id": row.get("document_id") or "",
+                        "matched_term": term,
+                        "match_reasons": reasons,
+                        "snippet": row.get("snippet") or "",
+                        "reference_text": reference_text,
+                        "markdown_text": reference_text,
+                        "html_fragment": html_fragment,
+                        "matched_blocks": matched_blocks,
+                        "has_word_heading_match": has_word_heading_match,
+                        "reference_source": "word_heading_blocks" if has_word_heading_match else "markdown_fallback",
+                        "source_paths": {
+                            "markdown_path": cls._normalize_artifact_path_for_response(row.get("markdown_path", "")),
+                            "block_json_path": cls._normalize_artifact_path_for_response(row.get("block_json_path", "")),
+                            "html_preview_path": cls._normalize_artifact_path_for_response(row.get("html_preview_path", "")),
+                            "asset_dir": cls._normalize_artifact_path_for_response(row.get("asset_dir", "")),
+                            "source_docx_path": cls._normalize_artifact_path_for_response(row.get("document_path", "")),
+                        },
+                        "reference_char_count": len(reference_text),
+                        "block_inventory": block_inventory,
+                    }
+                )
+                if len(candidates) >= limit * 4:
+                    break
+            if len(candidates) >= limit * 4:
+                break
+
+        candidates.sort(
+            key=lambda item: (
+                1 if item.get("has_word_heading_match") else 0,
+                item.get("score") or 0,
+            ),
+            reverse=True,
+        )
+        return candidates[:limit]
 
     @classmethod
     def check_requirements(
@@ -836,6 +1019,531 @@ class HistoryCaseService:
         if not terms and normalized:
             terms.append(normalized[:24])
         return terms[:8]
+
+    @classmethod
+    def _chapter_reference_query_text(
+        cls,
+        chapter: Dict[str, Any],
+        parent_chapters: List[Dict[str, Any]] | None = None,
+        analysis_report: Dict[str, Any] | None = None,
+        response_matrix: Dict[str, Any] | None = None,
+    ) -> str:
+        report = analysis_report or {}
+        parts: list[str] = []
+        for item in [*(parent_chapters or []), chapter or {}]:
+            parts.extend(
+                cls._text(item.get(key))
+                for key in ("title", "description", "requirement", "response_suggestion", "source_ref")
+                if isinstance(item, dict)
+            )
+        project = report.get("project") if isinstance(report, dict) else None
+        if isinstance(project, dict):
+            parts.extend(
+                cls._text(project.get(key))
+                for key in (
+                    "name",
+                    "service_scope",
+                    "project_type",
+                    "service_location",
+                    "quality_requirements",
+                )
+            )
+
+        response_ids = set()
+        for key in ("response_matrix_ids", "mapped_response_ids", "scoring_item_ids", "requirement_ids"):
+            value = (chapter or {}).get(key)
+            if isinstance(value, list):
+                response_ids.update(cls._text(item) for item in value if cls._text(item))
+
+        matrix = response_matrix or report.get("response_matrix") or {}
+        matrix_items = matrix.get("items") if isinstance(matrix, dict) else None
+        if response_ids and isinstance(matrix_items, list):
+            for item in matrix_items:
+                if not isinstance(item, dict):
+                    continue
+                item_id = cls._first_text(item.get("id"), item.get("item_id"), item.get("requirement_id"))
+                if item_id in response_ids:
+                    parts.append(json.dumps(item, ensure_ascii=False)[:1200])
+
+        for key in ("technical_scoring_items", "business_scoring_items", "qualification_review_items"):
+            value = report.get(key) if isinstance(report, dict) else None
+            if isinstance(value, list):
+                for item in value[:40]:
+                    if isinstance(item, dict):
+                        item_text = json.dumps(item, ensure_ascii=False)
+                        if cls._text((chapter or {}).get("title")) and cls._text((chapter or {}).get("title")) in item_text:
+                            parts.append(item_text[:1000])
+
+        return "\n".join(part for part in parts if part)
+
+    @classmethod
+    def _chapter_reference_terms(cls, title: str, query_text: str) -> List[str]:
+        terms: list[str] = []
+
+        def add(term: str) -> None:
+            cleaned = re.sub(r"\s+", " ", str(term or "")).strip("：:，,。；; ")
+            if 2 <= len(cleaned) <= 48 and cleaned not in terms:
+                terms.append(cleaned)
+
+        add(title)
+        compact_title = re.sub(r"[\s　]+", "", title)
+        if compact_title != title:
+            add(compact_title)
+        combined = f"{title}\n{query_text}"
+        if cls._is_personnel_reference_title(combined):
+            for term in (
+                "拟投入人员",
+                "拟委任的主要人员",
+                "主要人员汇总表",
+                "项目团队情况",
+                "项目组成人员",
+                "项目负责人",
+                "技术负责人",
+                "专业负责人",
+                "人员资格",
+                "职称证书",
+                "执业资格证明",
+            ):
+                add(term)
+        if cls._is_equipment_reference_title(combined):
+            for term in (
+                "拟投入设备",
+                "主要仪器设备",
+                "软件设备清单",
+                "设备配置",
+                "资源配置",
+            ):
+                add(term)
+        for term in cls._requirement_search_terms(query_text):
+            add(term)
+        for hint in cls.MATCH_HINTS:
+            if hint in query_text:
+                add(f"{hint} {title}" if title else hint)
+        if not terms and query_text:
+            add(re.sub(r"\s+", "", query_text)[:28])
+        return terms[:10]
+
+    @classmethod
+    def _extract_markdown_section(
+        cls,
+        markdown: str,
+        title: str,
+        fallback_snippet: str = "",
+        search_term: str = "",
+        max_chars: int = 3600,
+    ) -> str:
+        if not markdown:
+            return cls._clean_history_snippet(fallback_snippet)[:max_chars]
+
+        title_tokens = cls._chapter_reference_semantic_tokens(title)
+        best: tuple[float, int, int] | None = None
+        lines = markdown.splitlines()
+        for index, line in enumerate(lines):
+            heading = cls._parse_markdown_heading(line)
+            if not heading:
+                continue
+            level, heading_title = heading
+            heading_tokens = cls._chapter_reference_tokens(heading_title)
+            if not title_tokens or not heading_tokens:
+                continue
+            overlap = title_tokens & heading_tokens
+            score = len(overlap) / max(len(title_tokens), 1)
+            if title and title in heading_title:
+                score += 0.45
+            if score >= 0.34 and (best is None or score > best[0]):
+                best = (score, index, level)
+
+        if best:
+            _, start, level = best
+            end = len(lines)
+            for index in range(start + 1, len(lines)):
+                heading = cls._parse_markdown_heading(lines[index])
+                if heading and heading[0] <= level:
+                    end = index
+                    break
+            section = "\n".join(lines[start:end]).strip()
+            return cls._trim_reference_text(section, max_chars=max_chars)
+
+        for needle in (search_term, cls._clean_history_snippet(fallback_snippet), title):
+            cleaned = re.sub(r"\[[^\]]+\]", "", str(needle or "")).strip()
+            if not cleaned:
+                continue
+            index = markdown.find(cleaned[:40])
+            if index < 0 and len(cleaned) > 6:
+                index = markdown.find(cleaned[:8])
+            if index >= 0:
+                start = max(0, index - max_chars // 3)
+                end = min(len(markdown), index + max_chars)
+                candidate = cls._trim_reference_text(markdown[start:end], max_chars=max_chars)
+                if cls._is_service_scope_title(title) and cls._has_excluded_history_topic(candidate):
+                    continue
+                return candidate
+
+        return ""
+
+    @staticmethod
+    def _parse_markdown_heading(line: str) -> tuple[int, str] | None:
+        markdown_match = re.match(r"^\s*(#{1,6})\s+(.+?)\s*$", line or "")
+        if markdown_match:
+            return len(markdown_match.group(1)), markdown_match.group(2).strip()
+        numbered_match = re.match(
+            r"^\s*((?:第[一二三四五六七八九十百]+[章节篇]|[一二三四五六七八九十]+[、.．]|[0-9]+(?:\.[0-9]+){0,2})\s+)([\u4e00-\u9fffA-Za-z][^\n]{2,48})\s*$",
+            line or "",
+        )
+        if numbered_match:
+            prefix = numbered_match.group(1) or ""
+            level = 2 + min(prefix.count(".") + prefix.count("．"), 3)
+            return level, numbered_match.group(2).strip()
+        return None
+
+    @classmethod
+    def _chapter_reference_score(
+        cls,
+        row: Dict[str, Any],
+        query_text: str,
+        title: str,
+        matched_term: str,
+        reference_text: str,
+    ) -> tuple[float, list[str]]:
+        reasons: list[str] = []
+        score = 0.18
+        candidate_text = " ".join(
+            cls._text(row.get(key))
+            for key in ("project_title", "subject", "primary_domain", "primary_subdomain", "domain_keywords", "file_name", "snippet")
+        )
+        query_groups = cls._object_groups(query_text)
+        candidate_groups = cls._object_groups(candidate_text)
+        common_groups = query_groups & candidate_groups
+        if common_groups:
+            score += min(0.18, 0.07 * len(common_groups))
+            reasons.append(f"核心对象匹配：{'、'.join(sorted(common_groups))}")
+
+        query_services = cls._service_groups(query_text)
+        candidate_services = cls._service_groups(candidate_text)
+        common_services = query_services & candidate_services
+        if common_services:
+            score += min(0.14, 0.07 * len(common_services))
+            reasons.append(f"服务类型匹配：{'、'.join(sorted(common_services))}")
+
+        title_tokens = cls._chapter_reference_semantic_tokens(title)
+        reference_tokens = cls._chapter_reference_tokens(reference_text[:1600])
+        if title_tokens:
+            overlap = title_tokens & reference_tokens
+            if overlap:
+                score += min(0.22, 0.08 * len(overlap))
+                reasons.append(f"章节关键词匹配：{'、'.join(sorted(overlap)[:4])}")
+
+        if matched_term and matched_term in reference_text:
+            score += 0.08
+            reasons.append("检索词命中正文")
+        result = cls._text(row.get("result"))
+        if "中标" in result and "未中" not in result:
+            score += 0.12
+            reasons.append("中标案例")
+        return min(score, 0.95), reasons or ["历史库章节检索命中"]
+
+    @staticmethod
+    def _chapter_reference_tokens(value: str) -> set[str]:
+        text = re.sub(r"\s+", "", str(value or ""))
+        raw_tokens = re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z0-9]{2,}", text)
+        stopwords = {
+            "项目",
+            "工程",
+            "服务",
+            "方案",
+            "措施",
+            "要求",
+            "内容",
+            "本章",
+            "投标",
+            "招标",
+        }
+        tokens: set[str] = set()
+        for token in raw_tokens:
+            if token in stopwords:
+                continue
+            tokens.add(token)
+            if len(token) >= 4:
+                for size in (2, 3):
+                    tokens.update(token[index:index + size] for index in range(0, len(token) - size + 1))
+        return {token for token in tokens if token and token not in stopwords}
+
+    @staticmethod
+    def _clean_history_snippet(snippet: str) -> str:
+        return re.sub(r"[\[\]]", "", str(snippet or "")).strip()
+
+    @classmethod
+    def _trim_reference_text(cls, text: str, max_chars: int = 3600) -> str:
+        cleaned = str(text or "").strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return f"{cleaned[:max_chars].rstrip()}\n……"
+
+    @staticmethod
+    def _reference_block_inventory(text: str) -> Dict[str, Any]:
+        lines = str(text or "").splitlines()
+        table_lines = [line for line in lines if "|" in line and re.search(r"\|.*\|", line)]
+        image_matches = re.findall(r"!\[[^\]]*\]\([^)]+\)|<img\b[^>]*>", str(text or ""), flags=re.IGNORECASE)
+        return {
+            "char_count": len(str(text or "")),
+            "image_count": len(image_matches),
+            "table_line_count": len(table_lines),
+            "has_table": bool(table_lines),
+            "has_image": bool(image_matches),
+        }
+
+    @classmethod
+    def _extract_matching_blocks(cls, blocks: list[dict[str, Any]], title: str, max_blocks: int = 160) -> list[dict[str, Any]]:
+        if not blocks:
+            return []
+        title_tokens = cls._chapter_reference_semantic_tokens(title)
+        if not title_tokens:
+            return []
+        best_index = -1
+        best_score = 0.0
+        for index, block in enumerate(blocks):
+            if not isinstance(block, dict) or block.get("type") != "heading":
+                continue
+            text = cls._text(block.get("text") or block.get("markdown"))
+            tokens = cls._chapter_reference_semantic_tokens(text)
+            if not tokens:
+                continue
+            score = len(title_tokens & tokens) / max(len(title_tokens), 1)
+            compact_title = re.sub(r"\s+", "", str(title or ""))
+            compact_text = re.sub(r"\s+", "", text)
+            if compact_title and compact_title in compact_text:
+                score += 0.65
+            level = int(block.get("level") or 0)
+            if level:
+                score += max(0.0, 0.08 - 0.01 * min(level, 6))
+            if cls._should_skip_history_heading_candidate(blocks, index, title):
+                score -= 0.65
+            if score > best_score:
+                best_index = index
+                best_score = score
+        if best_index < 0 or best_score < 0.34:
+            return []
+
+        anchor = blocks[best_index]
+        anchor_path = cls._heading_path_ids(anchor)
+        if anchor_path:
+            selected_by_path: list[dict[str, Any]] = []
+            for block in blocks[best_index:]:
+                path = cls._heading_path_ids(block)
+                if selected_by_path and path and not cls._heading_path_startswith(path, anchor_path):
+                    break
+                if not path and selected_by_path and block.get("type") == "heading":
+                    level = int(block.get("level") or 0)
+                    base_level = int(anchor.get("level") or 0)
+                    if base_level and level and level <= base_level:
+                        break
+                selected_by_path.append(block)
+                if len(selected_by_path) >= max_blocks:
+                    break
+            return selected_by_path
+
+        start = max(0, best_index)
+        base_level = int(blocks[best_index].get("level") or 0)
+        selected: list[dict[str, Any]] = []
+        for block in blocks[start:]:
+            if selected and block.get("type") == "heading":
+                level = int(block.get("level") or 0)
+                if base_level and level and level <= base_level:
+                    break
+            selected.append(block)
+            if len(selected) >= max_blocks:
+                break
+        return selected
+
+    @staticmethod
+    def _heading_path_ids(block: dict[str, Any]) -> list[str]:
+        path = block.get("heading_path")
+        if not isinstance(path, list):
+            return []
+        ids: list[str] = []
+        for item in path:
+            if isinstance(item, dict) and item.get("id"):
+                ids.append(str(item.get("id")))
+        return ids
+
+    @staticmethod
+    def _heading_path_startswith(path: list[str], prefix: list[str]) -> bool:
+        return bool(prefix) and len(path) >= len(prefix) and path[: len(prefix)] == prefix
+
+    @classmethod
+    def _should_skip_history_heading_candidate(cls, blocks: list[dict[str, Any]], index: int, title: str) -> bool:
+        if not cls._is_service_scope_title(title):
+            return False
+        section_text = cls._candidate_section_probe_text(blocks, index)
+        return cls._has_excluded_history_topic(section_text)
+
+    @staticmethod
+    def _has_excluded_history_topic(text: str) -> bool:
+        excluded_keywords = (
+            "业绩文件",
+            "项目法人",
+            "服务对象单位名称",
+            "近年完成",
+            "类似项目",
+            "拟投入人员",
+            "项目团队",
+            "主要人员",
+            "姓名",
+            "职称",
+            "证书",
+            "执业或职业资格证明",
+        )
+        return any(keyword in str(text or "") for keyword in excluded_keywords)
+
+    @staticmethod
+    def _is_service_scope_title(title: str) -> bool:
+        text = re.sub(r"\s+", "", str(title or ""))
+        return any(keyword in text for keyword in ("服务范围", "服务内容", "设计范围", "设计内容", "工作范围"))
+
+    @staticmethod
+    def _is_personnel_reference_title(title: str) -> bool:
+        text = re.sub(r"\s+", "", str(title or ""))
+        return any(
+            keyword in text
+            for keyword in (
+                "人员",
+                "团队",
+                "项目组",
+                "负责人",
+                "专业负责人",
+                "技术负责人",
+                "质量负责人",
+                "资源配置",
+                "证书",
+                "职称",
+                "执业资格",
+                "社保",
+                "劳动合同",
+            )
+        )
+
+    @staticmethod
+    def _is_equipment_reference_title(title: str) -> bool:
+        text = re.sub(r"\s+", "", str(title or ""))
+        return any(keyword in text for keyword in ("设备", "软件", "仪器", "资源配置", "工具"))
+
+    @classmethod
+    def _candidate_section_probe_text(cls, blocks: list[dict[str, Any]], index: int, max_chars: int = 900) -> str:
+        if index < 0 or index >= len(blocks):
+            return ""
+        anchor = blocks[index]
+        anchor_path = cls._heading_path_ids(anchor)
+        parts: list[str] = []
+        base_level = int(anchor.get("level") or 0)
+        for block in blocks[index:]:
+            if parts:
+                path = cls._heading_path_ids(block)
+                if anchor_path and path and not cls._heading_path_startswith(path, anchor_path):
+                    break
+                if not anchor_path and block.get("type") == "heading":
+                    level = int(block.get("level") or 0)
+                    if base_level and level and level <= base_level:
+                        break
+            parts.append(cls._text(block.get("text") or block.get("markdown")))
+            if sum(len(part) for part in parts) >= max_chars:
+                break
+        return "\n".join(parts)[:max_chars]
+
+    @classmethod
+    def _chapter_reference_semantic_tokens(cls, value: str) -> set[str]:
+        text = str(value or "")
+        variants = {text}
+        if "服务" in text:
+            variants.add(text.replace("服务", "设计"))
+        if "设计" in text:
+            variants.add(text.replace("设计", "服务"))
+        if any(keyword in text for keyword in ("拟投入人员", "投入人员", "人员配置")):
+            variants.update({"项目团队情况", "主要人员", "拟委任的主要人员", "项目团队"})
+        if any(keyword in text for keyword in ("项目团队", "主要人员", "拟委任")):
+            variants.update({"拟投入人员", "投入人员", "人员配置"})
+        if cls._is_personnel_reference_title(text):
+            variants.update(
+                {
+                    "拟投入人员",
+                    "拟委任的主要人员",
+                    "主要人员汇总表",
+                    "项目团队情况",
+                    "项目负责人",
+                    "技术负责人",
+                    "专业负责人",
+                    "人员资格",
+                    "职称证书",
+                    "执业资格证明",
+                }
+            )
+        if cls._is_equipment_reference_title(text):
+            variants.update({"拟投入设备", "主要仪器设备", "软件设备清单", "资源配置"})
+        tokens: set[str] = set()
+        for item in variants:
+            tokens.update(cls._chapter_reference_tokens(item))
+        return tokens
+
+    @staticmethod
+    def _blocks_to_markdown(blocks: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for block in blocks:
+            markdown = str(block.get("markdown") or "").strip()
+            if markdown:
+                parts.append(markdown)
+        return "\n\n".join(parts).strip()
+
+    @staticmethod
+    def _blocks_to_html(blocks: list[dict[str, Any]]) -> str:
+        parts = [str(block.get("html") or "").strip() for block in blocks if str(block.get("html") or "").strip()]
+        return "".join(parts)
+
+    @staticmethod
+    def _extract_html_fragment(html_preview: str, blocks: list[dict[str, Any]]) -> str:
+        if not html_preview or not blocks:
+            return ""
+        ids = [str(block.get("id") or "") for block in blocks if block.get("id")]
+        parts: list[str] = []
+        for block_id in ids:
+            match = re.search(
+                rf"<(?P<tag>[a-zA-Z0-9]+)[^>]*data-history-block-id=[\"']{re.escape(block_id)}[\"'][\s\S]*?</(?P=tag)>",
+                html_preview,
+            )
+            if match:
+                parts.append(match.group(0))
+        return "".join(parts)
+
+    @classmethod
+    def _inline_history_html_assets(cls, html_fragment: str, asset_dir: str) -> str:
+        if not html_fragment or not asset_dir:
+            return html_fragment
+        root = cls._resolve_history_artifact_path(asset_dir)
+        if not root.exists() or not root.is_dir():
+            return html_fragment
+
+        def replace_src(match: re.Match) -> str:
+            quote = match.group("quote")
+            src = match.group("src")
+            if src.startswith(("data:", "http://", "https://", "/")):
+                return match.group(0)
+            relative = src.replace("\\", "/")
+            if relative.startswith("assets/"):
+                relative = relative.split("/", 1)[1]
+            candidate = (root / relative).resolve()
+            try:
+                if root.resolve() not in candidate.parents or not candidate.exists() or not candidate.is_file():
+                    return match.group(0)
+                mime_type = mimetypes.guess_type(candidate.name)[0] or "image/png"
+                payload = base64.b64encode(candidate.read_bytes()).decode("ascii")
+                return f"src={quote}data:{mime_type};base64,{payload}{quote}"
+            except Exception:
+                return match.group(0)
+
+        return re.sub(
+            r"src=(?P<quote>[\"'])(?P<src>[^\"']+)(?P=quote)",
+            replace_src,
+            html_fragment,
+        )
 
     @staticmethod
     def _as_dict_items(value: Any) -> list[dict[str, Any]]:

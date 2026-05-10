@@ -1,6 +1,7 @@
 """内容相关API路由"""
 from fastapi import APIRouter, HTTPException
 from ..models.schemas import ContentGenerationRequest, ChapterContentRequest
+from ..services.history_case_service import HistoryCaseService
 from ..services.openai_service import OpenAIService
 from ..utils.config_manager import config_manager
 from ..utils.provider_registry import get_provider_auth_error
@@ -18,6 +19,31 @@ def request_analysis_report_with_enterprise_profile(request: ChapterContentReque
     return report
 
 
+def request_response_matrix(request: ChapterContentRequest):
+    return request.response_matrix.model_dump(mode="json") if request.response_matrix else None
+
+
+def request_history_reference_drafts(
+    request: ChapterContentRequest,
+    analysis_report,
+    response_matrix,
+):
+    if request.history_reference_drafts:
+        return request.history_reference_drafts
+    try:
+        return HistoryCaseService.find_chapter_reference_drafts(
+            chapter=request.chapter,
+            parent_chapters=request.parent_chapters or [],
+            sibling_chapters=request.sibling_chapters or [],
+            analysis_report=analysis_report or {},
+            response_matrix=response_matrix or {},
+            limit=3,
+        )
+    except Exception as exc:
+        print(f"历史章节参考检索失败，继续直接生成正文：{exc}")
+        return []
+
+
 @router.post("/generate-chapter")
 async def generate_chapter_content(request: ChapterContentRequest):
     """为单个章节生成内容"""
@@ -30,6 +56,9 @@ async def generate_chapter_content(request: ChapterContentRequest):
 
         # 创建OpenAI服务实例
         openai_service = OpenAIService()
+        analysis_report = request_analysis_report_with_enterprise_profile(request)
+        response_matrix = request_response_matrix(request)
+        history_reference_drafts = request_history_reference_drafts(request, analysis_report, response_matrix)
         
         # 生成单章节内容
         content = ""
@@ -38,16 +67,12 @@ async def generate_chapter_content(request: ChapterContentRequest):
             parent_chapters=request.parent_chapters,
             sibling_chapters=request.sibling_chapters,
             project_overview=request.project_overview,
-            analysis_report=(
-                request_analysis_report_with_enterprise_profile(request)
-            ),
-            response_matrix=(
-                request.response_matrix.model_dump(mode="json")
-                if request.response_matrix else None
-            ),
+            analysis_report=analysis_report,
+            response_matrix=response_matrix,
             bid_mode=request.bid_mode.value if request.bid_mode else None,
             reference_bid_style_profile=request.reference_bid_style_profile,
             document_blocks_plan=request.document_blocks_plan,
+            history_reference_drafts=history_reference_drafts,
             generated_summaries=[
                 item.model_dump(mode="json") for item in request.generated_summaries
             ],
@@ -59,8 +84,8 @@ async def generate_chapter_content(request: ChapterContentRequest):
             ],
         ):
             content += chunk
-        
-        return {"success": True, "content": content}
+        render = getattr(openai_service, "_last_chapter_render", {}) or {}
+        return {"success": True, "content": content, **render}
         
     except HTTPException:
         raise
@@ -80,6 +105,9 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
 
         # 创建OpenAI服务实例
         openai_service = OpenAIService()
+        analysis_report = request_analysis_report_with_enterprise_profile(request)
+        response_matrix = request_response_matrix(request)
+        history_reference_drafts = request_history_reference_drafts(request, analysis_report, response_matrix)
         
         async def generate():
             try:
@@ -93,16 +121,12 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
                     parent_chapters=request.parent_chapters,
                     sibling_chapters=request.sibling_chapters,
                     project_overview=request.project_overview,
-                    analysis_report=(
-                        request_analysis_report_with_enterprise_profile(request)
-                    ),
-                    response_matrix=(
-                        request.response_matrix.model_dump(mode="json")
-                        if request.response_matrix else None
-                    ),
+                    analysis_report=analysis_report,
+                    response_matrix=response_matrix,
                     bid_mode=request.bid_mode.value if request.bid_mode else None,
                     reference_bid_style_profile=request.reference_bid_style_profile,
                     document_blocks_plan=request.document_blocks_plan,
+                    history_reference_drafts=history_reference_drafts,
                     generated_summaries=[
                         item.model_dump(mode="json") for item in request.generated_summaries
                     ],
@@ -121,7 +145,9 @@ async def generate_chapter_content_stream(request: ChapterContentRequest):
                     raise Exception("模型返回空内容，可能是配额限制、内容拦截或兼容模式异常")
                 
                 # 发送完成信号
-                yield f"data: {json.dumps({'status': 'completed', 'content': full_content}, ensure_ascii=False)}\n\n"
+                render = getattr(openai_service, "_last_chapter_render", {}) or {}
+                payload = {'status': 'completed', 'content': full_content, **render}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 
             except Exception as e:
                 # 发送错误信息

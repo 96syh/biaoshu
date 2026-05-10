@@ -29,6 +29,7 @@ class ChapterContentRequest(BaseModel):
     bid_mode: Optional[BidMode] = Field(None, description="标书生成模式")
     reference_bid_style_profile: Dict[str, Any] = Field(default_factory=dict, description="可选：样例风格剖面")
     document_blocks_plan: Dict[str, Any] = Field(default_factory=dict, description="可选：图表与素材规划")
+    history_reference_drafts: List[Dict[str, Any]] = Field(default_factory=list, description="可选：历史标书相似章节参考草稿")
     generated_summaries: List[GeneratedSummary] = Field(default_factory=list, description="已生成章节摘要")
     enterprise_materials: List[RequiredMaterial] = Field(default_factory=list, description="已提供企业材料")
     enterprise_material_profile: EnterpriseMaterialProfile = Field(default_factory=EnterpriseMaterialProfile, description="独立企业资料解析画像")

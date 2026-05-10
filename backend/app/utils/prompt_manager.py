@@ -6,7 +6,7 @@ from .prompts.reference_profile import generate_reference_bid_style_profile_prom
 from .prompts.analysis import generate_analysis_report_prompt, generate_response_matrix_prompt
 from .prompts.outline import generate_level1_outline_prompt, generate_level23_outline_prompt
 from .prompts.document_blocks import generate_document_blocks_prompt
-from .prompts.content import generate_chapter_content_prompt
+from .prompts.content import generate_chapter_content_prompt, generate_chapter_patch_prompt
 from .prompts.review import generate_compliance_review_prompt, generate_consistency_revision_prompt
 from .prompts.legacy_outline import read_expand_outline_prompt, generate_outline_prompt, generate_outline_with_old_prompt
 
@@ -31,6 +31,7 @@ __all__ = [
     "generate_level23_outline_prompt",
     "generate_document_blocks_prompt",
     "generate_chapter_content_prompt",
+    "generate_chapter_patch_prompt",
     "generate_compliance_review_prompt",
     "generate_consistency_revision_prompt",
     "read_expand_outline_prompt",

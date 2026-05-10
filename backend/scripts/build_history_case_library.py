@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import re
 import sqlite3
@@ -20,6 +21,11 @@ from typing import Iterable
 
 import PyPDF2
 import docx
+from docx.document import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -223,6 +229,140 @@ def extract_docx_markdown(path: Path) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def iter_docx_blocks(document: DocxDocument):
+    for child in document.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, document)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, document)
+
+
+def extract_docx_media_assets(path: Path, asset_dir: Path) -> list[dict]:
+    document = docx.Document(str(path))
+    assets: list[dict] = []
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    for index, rel in enumerate(document.part.rels.values(), 1):
+        if not str(rel.reltype).endswith("/image") or not hasattr(rel.target_part, "blob"):
+            continue
+        content_type = getattr(rel.target_part, "content_type", "") or ""
+        ext = ".png"
+        if "jpeg" in content_type or "jpg" in content_type:
+            ext = ".jpg"
+        elif "gif" in content_type:
+            ext = ".gif"
+        elif "bmp" in content_type:
+            ext = ".bmp"
+        name = f"image-{index}{ext}"
+        target = asset_dir / name
+        target.write_bytes(rel.target_part.blob)
+        assets.append({
+            "id": f"img-{index}",
+            "name": name,
+            "path": str(target),
+            "relative_path": name,
+            "content_type": content_type,
+        })
+    return assets
+
+
+def extract_docx_blocks(path: Path, asset_dir: Path) -> dict:
+    document = docx.Document(str(path))
+    assets = extract_docx_media_assets(path, asset_dir)
+    blocks: list[dict] = []
+    markdown_lines: list[str] = [f"# {path.stem}", ""]
+    html_parts: list[str] = ['<div class="history-word-preview">']
+    pending_image_index = 0
+    heading_stack: list[dict] = []
+
+    def next_image_html() -> str:
+        nonlocal pending_image_index
+        if pending_image_index >= len(assets):
+            return ""
+        asset = assets[pending_image_index]
+        pending_image_index += 1
+        src = f"assets/{html.escape(asset['name'])}"
+        return f'<figure data-history-block-id="{asset["id"]}"><img src="{src}" alt="{html.escape(asset["name"])}" /></figure>'
+
+    for index, block in enumerate(iter_docx_blocks(document), 1):
+        block_id = f"b-{index}"
+        if isinstance(block, Paragraph):
+            text = block.text.strip()
+            has_image = bool(block._element.xpath(".//a:blip"))
+            if not text and not has_image:
+                continue
+            level = heading_level(block)
+            block_type = "heading" if level else "paragraph"
+            if level:
+                heading_stack = [item for item in heading_stack if int(item.get("level") or 0) < level]
+                heading_path = [*heading_stack, {"id": block_id, "level": level, "title": text}]
+                heading_stack = heading_path
+            else:
+                heading_path = list(heading_stack)
+            markdown_text = f"{'#' * level} {text}" if level and text else text
+            image_html = next_image_html() if has_image else ""
+            if markdown_text:
+                markdown_lines.extend([markdown_text, ""])
+            if has_image:
+                image_ref = assets[pending_image_index - 1] if pending_image_index else None
+                if image_ref:
+                    markdown_lines.extend([f"![{image_ref['name']}](assets/{image_ref['name']})", ""])
+            tag = f"h{min(level, 6)}" if level else "p"
+            html_text = f"<{tag} data-history-block-id=\"{block_id}\">{html.escape(text)}</{tag}>" if text else ""
+            html_parts.append(html_text + image_html)
+            blocks.append({
+                "id": block_id,
+                "type": block_type,
+                "level": level,
+                "text": text,
+                "markdown": markdown_text,
+                "html": html_text + image_html,
+                "docx_xml": block._element.xml,
+                "heading_path": heading_path,
+                "asset_ids": [assets[pending_image_index - 1]["id"]] if has_image and pending_image_index else [],
+            })
+        elif isinstance(block, Table):
+            rows = [[cell.text.strip().replace("\n", " ") for cell in row.cells] for row in block.rows]
+            rows = [row for row in rows if any(row)]
+            if not rows:
+                continue
+            markdown_lines.append("| " + " | ".join(rows[0]) + " |")
+            if len(rows) > 1:
+                markdown_lines.append("| " + " | ".join(["---"] * len(rows[0])) + " |")
+                for row in rows[1:]:
+                    markdown_lines.append("| " + " | ".join(row) + " |")
+            markdown_lines.append("")
+            html_rows = []
+            for row_index, row in enumerate(rows):
+                tag = "th" if row_index == 0 else "td"
+                cells = "".join(f"<{tag}>{html.escape(cell)}</{tag}>" for cell in row)
+                html_rows.append(f"<tr>{cells}</tr>")
+            table_html = (
+                f'<table data-history-block-id="{block_id}"><tbody>'
+                f'{"".join(html_rows)}</tbody></table>'
+            )
+            html_parts.append(table_html)
+            blocks.append({
+                "id": block_id,
+                "type": "table",
+                "level": 0,
+                "text": "\n".join(" | ".join(row) for row in rows),
+                "markdown": "\n".join(markdown_lines[-len(rows) - 2:]).strip(),
+                "html": table_html,
+                "docx_xml": block._element.xml,
+                "heading_path": list(heading_stack),
+                "rows": rows,
+                "asset_ids": [],
+            })
+
+    html_parts.append("</div>")
+    return {
+        "markdown": "\n".join(markdown_lines).strip() + "\n",
+        "blocks": blocks,
+        "html": "".join(html_parts),
+        "assets": assets,
+    }
+
+
 def extract_pdf_markdown(path: Path) -> str:
     lines: list[str] = [f"# {path.stem}", ""]
     with path.open("rb") as file:
@@ -378,6 +518,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             extension TEXT NOT NULL,
             source_path TEXT NOT NULL UNIQUE,
             markdown_path TEXT NOT NULL,
+            block_json_path TEXT NOT NULL DEFAULT '',
+            html_preview_path TEXT NOT NULL DEFAULT '',
+            asset_dir TEXT NOT NULL DEFAULT '',
             pageindex_tree_path TEXT NOT NULL,
             text_chars INTEGER NOT NULL DEFAULT 0,
             node_count INTEGER NOT NULL DEFAULT 0,
@@ -411,6 +554,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "case_projects", "primary_subdomain", "TEXT NOT NULL DEFAULT '未分类'")
     ensure_column(conn, "case_projects", "domain_confidence", "REAL NOT NULL DEFAULT 0")
     ensure_column(conn, "case_projects", "domain_keywords", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(conn, "case_documents", "block_json_path", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "case_documents", "html_preview_path", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "case_documents", "asset_dir", "TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
 
@@ -504,17 +650,32 @@ def import_document(conn: sqlite3.Connection, project: HistoricalProject, doc_pa
     doc_id = stable_id("doc", str(doc_path.resolve()))
     relative_base = Path(project.year) / project.batch / f"{project.sequence}-{doc_id.removeprefix('doc-')}"
     markdown_path = artifact_root / "markdown" / relative_base / f"{doc_path.stem}.md"
+    block_json_path = artifact_root / "blocks" / relative_base / f"{doc_path.stem}.json"
+    html_preview_path = artifact_root / "html" / relative_base / f"{doc_path.stem}.html"
+    asset_dir = artifact_root / "assets" / relative_base / doc_path.stem
     tree_path = artifact_root / "pageindex_trees" / relative_base / f"{doc_path.stem}.json"
     status = "indexed"
     error = ""
 
     try:
         if doc_path.suffix.lower() == ".docx":
-            markdown = extract_docx_markdown(doc_path)
+            docx_payload = extract_docx_blocks(doc_path, asset_dir)
+            markdown = docx_payload["markdown"]
+            write_json(block_json_path, {
+                "document_id": doc_id,
+                "source_path": str(doc_path),
+                "blocks": docx_payload["blocks"],
+                "assets": docx_payload["assets"],
+            })
+            write_text(html_preview_path, docx_payload["html"])
         elif doc_path.suffix.lower() == ".doc":
             markdown = extract_doc_markdown(doc_path)
+            write_json(block_json_path, {"document_id": doc_id, "source_path": str(doc_path), "blocks": [], "assets": []})
+            write_text(html_preview_path, "")
         elif doc_path.suffix.lower() == ".pdf":
             markdown = extract_pdf_markdown(doc_path)
+            write_json(block_json_path, {"document_id": doc_id, "source_path": str(doc_path), "blocks": [], "assets": []})
+            write_text(html_preview_path, "")
         else:
             raise ValueError(f"unsupported extension: {doc_path.suffix}")
 
@@ -524,6 +685,8 @@ def import_document(conn: sqlite3.Connection, project: HistoricalProject, doc_pa
         write_json(tree_path, tree)
     except Exception as exc:
         markdown = ""
+        write_json(block_json_path, {"document_id": doc_id, "source_path": str(doc_path), "blocks": [], "assets": []})
+        write_text(html_preview_path, "")
         tree = {"doc_name": doc_path.stem, "line_count": 0, "structure": []}
         nodes = []
         status = "failed"
@@ -534,14 +697,18 @@ def import_document(conn: sqlite3.Connection, project: HistoricalProject, doc_pa
     conn.execute(
         """
         INSERT INTO case_documents(
-            id, project_id, file_name, extension, source_path, markdown_path, pageindex_tree_path,
+            id, project_id, file_name, extension, source_path, markdown_path,
+            block_json_path, html_preview_path, asset_dir, pageindex_tree_path,
             text_chars, node_count, status, error, indexed_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_path) DO UPDATE SET
             project_id=excluded.project_id,
             file_name=excluded.file_name,
             extension=excluded.extension,
             markdown_path=excluded.markdown_path,
+            block_json_path=excluded.block_json_path,
+            html_preview_path=excluded.html_preview_path,
+            asset_dir=excluded.asset_dir,
             pageindex_tree_path=excluded.pageindex_tree_path,
             text_chars=excluded.text_chars,
             node_count=excluded.node_count,
@@ -556,6 +723,9 @@ def import_document(conn: sqlite3.Connection, project: HistoricalProject, doc_pa
             doc_path.suffix.lower(),
             str(doc_path),
             str(markdown_path),
+            str(block_json_path),
+            str(html_preview_path),
+            str(asset_dir),
             str(tree_path),
             len(markdown),
             len(nodes),

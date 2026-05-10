@@ -1,6 +1,7 @@
 """Word export service for bid documents."""
 import base64
 import io
+import json
 import re
 import urllib.request
 from pathlib import Path
@@ -9,7 +10,7 @@ from urllib.parse import quote, unquote
 import docx
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
+from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
 from fastapi import HTTPException
@@ -17,6 +18,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..models.schemas import WordExportRequest
 from .file_service import FileService
+from .generation.content import ContentGenerationMixin
+from .history_case_service import HistoryCaseService
+
+
+_INHERITED_TEMPLATE_MODE = False
 
 
 def sanitize_docx_filename(filename: str) -> str:
@@ -29,6 +35,8 @@ def sanitize_docx_filename(filename: str) -> str:
 
 def set_run_font_simsun(run: docx.text.run.Run) -> None:
     """统一将 run 字体设置为宋体（包含 EastAsia 字体设置）"""
+    if _INHERITED_TEMPLATE_MODE:
+        return
     run.font.name = "宋体"
     r = run._element.rPr
     if r is not None and r.rFonts is not None:
@@ -37,6 +45,8 @@ def set_run_font_simsun(run: docx.text.run.Run) -> None:
 
 def set_paragraph_font_simsun(paragraph: docx.text.paragraph.Paragraph) -> None:
     """将段落内所有 runs 字体设置为宋体"""
+    if _INHERITED_TEMPLATE_MODE:
+        return
     for run in paragraph.runs:
         set_run_font_simsun(run)
 
@@ -136,42 +146,99 @@ def configure_word_style(doc: docx.Document, reference_profile: dict | None = No
     set_style_font("Heading 3", heading_font, _pt_value(_style_value(style_profile, "heading_3_size", "12pt"), 12), True)
 
 
+def clear_document_body_keep_section(doc: docx.Document) -> None:
+    """Clear template body while preserving styles, section settings, headers and footers."""
+    body = doc._element.body
+    sect_pr = body.sectPr
+    for child in list(body):
+        if sect_pr is not None and child is sect_pr:
+            continue
+        body.remove(child)
+    if sect_pr is not None and sect_pr.getparent() is None:
+        body.append(sect_pr)
+
+
+def iter_outline_items(items) -> list:
+    result = []
+    for item in items or []:
+        result.append(item)
+        result.extend(iter_outline_items(getattr(item, "children", None) or []))
+    return result
+
+
+def resolve_history_template_docx(request: WordExportRequest) -> Path | None:
+    """Pick the first matched historical docx as the export style template."""
+    for item in iter_outline_items(request.outline):
+        reference = getattr(item, "history_reference", None) or {}
+        if not isinstance(reference, dict):
+            continue
+        source_paths = reference.get("source_paths") or reference
+        if not isinstance(source_paths, dict):
+            continue
+        raw_path = str(
+            source_paths.get("source_docx_path")
+            or source_paths.get("best_document_path")
+            or ""
+        ).strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser()
+        if path.exists() and path.is_file() and path.suffix.lower() == ".docx":
+            return path
+    return None
+
+
+def create_export_document(request: WordExportRequest) -> tuple[docx.Document, Path | None]:
+    template_path = resolve_history_template_docx(request)
+    if template_path:
+        doc = docx.Document(str(template_path))
+        clear_document_body_keep_section(doc)
+        return doc, template_path
+    return docx.Document(), None
+
+
 
 async def create_word_export_response(request: WordExportRequest):
     """根据目录数据导出Word文档"""
+    global _INHERITED_TEMPLATE_MODE
+    previous_template_mode = _INHERITED_TEMPLATE_MODE
     try:
         if not request.manual_review_confirmed:
             raise HTTPException(status_code=400, detail="导出前必须完成人工复核确认，不能直接跳过模型结果复核。")
 
-        doc = docx.Document()
+        doc, inherited_template_path = create_export_document(request)
+        _INHERITED_TEMPLATE_MODE = bool(inherited_template_path)
         enable_update_fields_on_open(doc)
-        configure_word_style(doc, request.reference_bid_style_profile)
+        if not inherited_template_path:
+            configure_word_style(doc, request.reference_bid_style_profile)
 
         # 统一设置普通正文基础字体，标题样式已由成熟样例模板配置。
-        try:
-            styles = doc.styles
-            base_styles = ["Normal"]
-            for style_name in base_styles:
-                if style_name in styles:
-                    style = styles[style_name]
-                    font = style.font
-                    font.name = "宋体"
-                    # 设置中文字体
-                    if style._element.rPr is None:
-                        style._element._add_rPr()
-                    rpr = style._element.rPr
-                    rpr.rFonts.set(qn("w:eastAsia"), "宋体")
-                    if style_name == "Normal":
-                        font.bold = False
-        except Exception:
-            # 字体设置失败不影响文档生成，忽略
-            pass
+        if not inherited_template_path:
+            try:
+                styles = doc.styles
+                base_styles = ["Normal"]
+                for style_name in base_styles:
+                    if style_name in styles:
+                        style = styles[style_name]
+                        font = style.font
+                        font.name = "宋体"
+                        # 设置中文字体
+                        if style._element.rPr is None:
+                            style._element._add_rPr()
+                        rpr = style._element.rPr
+                        rpr.rFonts.set(qn("w:eastAsia"), "宋体")
+                        if style_name == "Normal":
+                            font.bold = False
+            except Exception:
+                # 字体设置失败不影响文档生成，忽略
+                pass
 
         # AI 生成声明
         p = doc.add_paragraph()
         run = p.add_run("内容由 AI 生成，导出前已要求人工复核确认；最终页码、目录、签章、版式和图表需在 Word 中复核。")
         run.italic = True
-        run.font.size = Pt(9)
+        if not inherited_template_path:
+            run.font.size = Pt(9)
         set_run_font_simsun(run)
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
@@ -188,8 +255,10 @@ async def create_word_export_response(request: WordExportRequest):
         title = request.project_name or "投标技术文件"
         title_p = doc.add_paragraph()
         title_run = title_p.add_run(title)
-        title_run.bold = True
-        title_run.font.size = Pt(16)
+        if not inherited_template_path:
+            title_run.bold = True
+        if not inherited_template_path:
+            title_run.font.size = Pt(16)
         set_run_font_simsun(title_run)
         title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
@@ -411,9 +480,10 @@ async def create_word_export_response(request: WordExportRequest):
                 else:
                     para.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 for run in para.runs:
-                    if is_header:
+                    if is_header and not _INHERITED_TEMPLATE_MODE:
                         run.bold = True
-                    run.font.size = Pt(10.5)
+                    if not _INHERITED_TEMPLATE_MODE:
+                        run.font.size = Pt(10.5)
                     set_run_font_simsun(run)
 
         def add_three_line_table(rows: list[list[str]]) -> None:
@@ -466,6 +536,7 @@ async def create_word_export_response(request: WordExportRequest):
             - ('list', items)        items: [(kind, num_str, text), ...]
             - ('table', rows)        rows: [[cell, ...], ...]
             - ('heading', level, text)
+            - ('image', alt, src)
             - ('paragraph', text)
             """
             blocks = []
@@ -474,6 +545,12 @@ async def create_word_export_response(request: WordExportRequest):
             while i < len(lines):
                 line = lines[i].rstrip("\r").strip()
                 if not line:
+                    i += 1
+                    continue
+
+                image_match = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$", line)
+                if image_match:
+                    blocks.append(("image", image_match.group(1).strip(), image_match.group(2).strip()))
                     i += 1
                     continue
 
@@ -556,7 +633,26 @@ async def create_word_export_response(request: WordExportRequest):
 
             return blocks
 
-        def render_markdown_blocks(blocks) -> None:
+        def resolve_history_markdown_image(src: str, item) -> bytes | None:
+            source_paths = getattr(item, "history_reference", {}) or {}
+            if isinstance(source_paths, dict):
+                source_paths = source_paths.get("source_paths") or source_paths
+            asset_dir = str(source_paths.get("asset_dir") or "") if isinstance(source_paths, dict) else ""
+            if not asset_dir:
+                return None
+            relative = str(src or "").replace("\\", "/")
+            if relative.startswith("assets/"):
+                relative = relative.split("/", 1)[1]
+            candidate = (Path(asset_dir) / relative).resolve()
+            try:
+                asset_root = Path(asset_dir).resolve()
+                if asset_root in candidate.parents and candidate.exists() and candidate.is_file():
+                    return candidate.read_bytes()
+            except Exception:
+                return None
+            return None
+
+        def render_markdown_blocks(blocks, item=None) -> None:
             """将结构化的 Markdown blocks 渲染到文档"""
             for block in blocks:
                 kind = block[0]
@@ -585,14 +681,126 @@ async def create_word_export_response(request: WordExportRequest):
                     heading = doc.add_heading(text, level=level)
                     heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     set_paragraph_font_simsun(heading)
+                elif kind == "image":
+                    _, alt, src = block
+                    image_bytes = resolve_history_markdown_image(src, item)
+                    if image_bytes:
+                        try:
+                            picture = doc.add_picture(io.BytesIO(image_bytes))
+                            max_width = doc.sections[-1].page_width - doc.sections[-1].left_margin - doc.sections[-1].right_margin
+                            if picture.width > max_width:
+                                ratio = max_width / picture.width
+                                picture.width = int(picture.width * ratio)
+                                picture.height = int(picture.height * ratio)
+                            if alt:
+                                caption = doc.add_paragraph(alt)
+                                caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                set_paragraph_font_simsun(caption)
+                        except Exception:
+                            add_markdown_paragraph(f"〖图片待插入：{alt or src}〗")
+                    else:
+                        add_markdown_paragraph(f"〖图片待插入：{alt or src}〗")
                 elif kind == "paragraph":
                     _, text = block
                     add_markdown_paragraph(text)
 
-        def add_markdown_content(content: str) -> None:
+        def add_markdown_content(content: str, item=None) -> None:
             """解析并渲染 Markdown 文本到文档"""
             blocks = parse_markdown_blocks(content)
-            render_markdown_blocks(blocks)
+            render_markdown_blocks(blocks, item=item)
+
+        def item_history_source_paths(item) -> dict:
+            reference = getattr(item, "history_reference", {}) or {}
+            if not isinstance(reference, dict):
+                return {}
+            source_paths = reference.get("source_paths") or reference
+            return source_paths if isinstance(source_paths, dict) else {}
+
+        def same_docx_path(path_text: str, template_path: Path | None) -> bool:
+            if not path_text or not template_path:
+                return False
+            try:
+                return Path(path_text).expanduser().resolve() == template_path.expanduser().resolve()
+            except Exception:
+                return False
+
+        def append_ooxml_block(xml_text: str) -> bool:
+            try:
+                element = parse_xml(xml_text)
+                body = doc._element.body
+                sect_pr = body.sectPr
+                if sect_pr is not None:
+                    body.insert(list(body).index(sect_pr), element)
+                else:
+                    body.append(element)
+                return True
+            except Exception:
+                return False
+
+        def remove_duplicate_history_section_heading(blocks: list[dict], item) -> list[dict]:
+            if not blocks:
+                return blocks
+            first = blocks[0]
+            if str(first.get("type") or "") != "heading":
+                return blocks
+            item_title = re.sub(r"\s+", "", str(getattr(item, "title", "") or ""))
+            first_title = re.sub(r"\s+", "", str(first.get("text") or ""))
+            if item_title and (item_title in first_title or first_title in item_title):
+                return blocks[1:]
+            return blocks
+
+        def load_patched_history_ooxml_blocks(item) -> list[dict]:
+            source_paths = item_history_source_paths(item)
+            if not same_docx_path(str(source_paths.get("source_docx_path") or ""), inherited_template_path):
+                return []
+            reference = getattr(item, "history_reference", {}) or {}
+            matched_block_ids = []
+            if isinstance(reference, dict) and isinstance(reference.get("matched_block_ids"), list):
+                matched_block_ids = [str(block_id) for block_id in reference.get("matched_block_ids") if str(block_id)]
+            block_json_path = str(source_paths.get("block_json_path") or "").strip()
+            if not block_json_path:
+                return []
+            try:
+                payload = json.loads(Path(block_json_path).expanduser().read_text(encoding="utf-8"))
+            except Exception:
+                return []
+            all_blocks = payload.get("blocks") if isinstance(payload, dict) else []
+            if not isinstance(all_blocks, list):
+                return []
+            if matched_block_ids:
+                wanted = set(matched_block_ids)
+                matched_blocks = [block for block in all_blocks if str(block.get("id") or "") in wanted]
+            else:
+                title = str(getattr(item, "title", "") or "")
+                matched_blocks = HistoryCaseService._extract_matching_blocks(all_blocks, title)
+            matched_blocks = remove_duplicate_history_section_heading(matched_blocks, item)
+            if not matched_blocks:
+                return []
+            operations = getattr(item, "patch_operations", None) or []
+            if not isinstance(operations, list):
+                operations = []
+            return ContentGenerationMixin._apply_history_patch_to_blocks(matched_blocks, operations)
+
+        def add_history_word_blocks_if_possible(item) -> bool:
+            if not inherited_template_path:
+                return False
+            blocks = load_patched_history_ooxml_blocks(item)
+            if not blocks:
+                return False
+            inserted = False
+            for block in blocks:
+                xml_text = str(block.get("docx_xml") or "").strip()
+                if xml_text and append_ooxml_block(xml_text):
+                    inserted = True
+                else:
+                    fallback_text = str(block.get("markdown") or block.get("text") or "").strip()
+                    if fallback_text:
+                        add_markdown_content(fallback_text, item=item)
+                        inserted = True
+                caption = str(block.get("caption_text") or "").strip()
+                if caption:
+                    add_markdown_paragraph(caption)
+            return inserted
 
         def planned_blocks_by_chapter() -> dict[str, list[dict]]:
             """按章节聚合图表/素材规划，兼容分组结构和旧版扁平结构。"""
@@ -712,7 +920,8 @@ async def create_word_export_response(request: WordExportRequest):
                 caption = doc.add_paragraph()
                 caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = caption.add_run(caption_text)
-                run.font.size = Pt(10.5)
+                if not _INHERITED_TEMPLATE_MODE:
+                    run.font.size = Pt(10.5)
                 set_run_font_simsun(run)
                 caption.paragraph_format.space_after = Pt(8)
                 return True
@@ -763,27 +972,31 @@ async def create_word_export_response(request: WordExportRequest):
                 if level <= 3:
                     heading = doc.add_heading(f"{item.id} {item.title}", level=level)
                     heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    for hr in heading.runs:
-                        hr.font.name = "宋体"
-                        rr = hr._element.rPr
-                        if rr is not None and rr.rFonts is not None:
-                            rr.rFonts.set(qn("w:eastAsia"), "宋体")
+                    if not _INHERITED_TEMPLATE_MODE:
+                        for hr in heading.runs:
+                            hr.font.name = "宋体"
+                            rr = hr._element.rPr
+                            if rr is not None and rr.rFonts is not None:
+                                rr.rFonts.set(qn("w:eastAsia"), "宋体")
                 else:
                     para = doc.add_paragraph()
                     run = para.add_run(f"{item.id} {item.title}")
-                    run.bold = True
-                    run.font.name = "宋体"
-                    rr = run._element.rPr
-                    if rr is not None and rr.rFonts is not None:
-                        rr.rFonts.set(qn("w:eastAsia"), "宋体")
+                    if not _INHERITED_TEMPLATE_MODE:
+                        run.bold = True
+                        run.font.name = "宋体"
+                        rr = run._element.rPr
+                        if rr is not None and rr.rFonts is not None:
+                            rr.rFonts.set(qn("w:eastAsia"), "宋体")
                     para.paragraph_format.space_before = Pt(6)
                     para.paragraph_format.space_after = Pt(3)
 
                 # 叶子节点内容
                 if not item.children:
                     content = item.content or ""
-                    if content.strip():
-                        add_markdown_content(content)
+                    if add_history_word_blocks_if_possible(item):
+                        pass
+                    elif content.strip():
+                        add_markdown_content(content, item=item)
                     add_planned_blocks(item.id)
                 else:
                     add_planned_blocks(item.id)
@@ -833,3 +1046,5 @@ async def create_word_export_response(request: WordExportRequest):
         print("导出Word失败:", str(e))
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"导出Word失败: {str(e)}")
+    finally:
+        _INHERITED_TEMPLATE_MODE = previous_template_mode
