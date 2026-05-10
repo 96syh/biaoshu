@@ -140,7 +140,7 @@ sequenceDiagram
 | --- | --- | --- | --- | --- | --- |
 | MinerU 版面解析 | `FileService.parse_file` | 关闭，`YIBIAO_DOCUMENT_PARSER=legacy` | 本机 `mineru` CLI / PyTorch | Markdown、content list、图片链接 | 使用内置 `pdfplumber` / `docx2python` / `PyPDF2` 解析，不阻塞上传 |
 | 原文页图预览 | `FileService` 预览方法 | 关闭，`YIBIAO_ENABLE_SOURCE_PREVIEW_PAGES=0` | LibreOffice / poppler | 页面图片、文本块 bbox | 前端使用纯文本分页预览 |
-| DOCX HTML 预览 | `FileService` DOCX 预览 | 关闭，`YIBIAO_ENABLE_DOCX_HTML_PREVIEW=0` | DOCX 转 HTML 能力 | `sourcePreviewHtml` | 前端使用纯文本分页预览 |
+| DOCX HTML 预览 | `FileService` DOCX 预览 | 开启，`YIBIAO_ENABLE_DOCX_HTML_PREVIEW=1` | `python-docx` | `sourcePreviewHtml` | 失败时前端使用纯文本分页预览 |
 | 提取图片上传 | `FileService` 图片处理 | 关闭，`YIBIAO_UPLOAD_EXTRACTED_IMAGES=0` | 本地文件/静态资源目录 | 解析图片资源 URL | 不影响正文生成，只少一些图片参考 |
 | 成熟样例模板 | `/api/document/reference-style-upload` 或历史匹配 | 手动触发 | 真实模型 + 样例文件/历史库 | `ReferenceBidStyleProfile` | 目录和正文按招标文件与默认规则生成 |
 | 历史案例匹配 | `/api/history-cases/match-reference` | 手动触发 | `history_cases.sqlite3` + 模型选择 | 匹配案例、样例风格 | 用户可手动上传样例或跳过 |
@@ -193,9 +193,12 @@ flowchart TD
 YIBIAO_DOCUMENT_PARSER=legacy
 YIBIAO_MINERU_TIMEOUT=900
 YIBIAO_ENABLE_SOURCE_PREVIEW_PAGES=0
-YIBIAO_ENABLE_DOCX_HTML_PREVIEW=0
+YIBIAO_ENABLE_DOCX_HTML_PREVIEW=1
 YIBIAO_UPLOAD_EXTRACTED_IMAGES=0
+YIBIAO_MODEL_CONCURRENCY=2
 YIBIAO_OUTLINE_CONCURRENCY=2
+REACT_APP_YIBIAO_CONTENT_CONCURRENCY=2
+YIBIAO_ENABLE_GENERATION_CACHE=1
 YIBIAO_AUTO_DOCUMENT_BLOCKS_PLAN=0
 YIBIAO_ENABLE_GENERATION_FALLBACKS=0
 ```
@@ -209,3 +212,15 @@ YIBIAO_ENABLE_GENERATION_FALLBACKS=0
 - 新增可选增强功能时，应保证关闭或失败时主链路仍可继续，除非该功能被用户明确选为当前任务的硬前置。
 - 前端组件继续向 `features/*` 下拆分，`App.tsx` 保持页面状态编排和流程连接，不继续堆大型展示组件。
 - 文档、环境变量和 UI 文案需要同步说明 optional 功能默认状态，避免用户误以为慢速增强链路是必选步骤。
+
+## 并发与缓存约束
+
+前端任务状态以 `tasks: Record<TaskId, TaskState>` 表示，保留 `busy` 作为旧页面按钮和顶部忙碌条的兼容字段。任务依赖按 DAG 表达：`upload_text` → `analysis` → `outline` → `batch` → `review/consistency` → `export`；`history_match` 可在上传后独立运行，`source_preview` 可在上传后异步增强。
+
+上传链路已拆成 `POST /api/document/upload-text` 和 `GET /api/document/source-preview/{source_preview_id}`。前者只抽取可供分析、历史匹配、目录生成使用的文本，后者单独生成 DOCX 原文预览并回填前端状态；因此 Word 预览渲染失败或变慢不会阻塞标准解析和历史案例匹配。旧 `POST /api/document/upload` 保留兼容，仍会同步返回文本和预览。
+
+后端所有模型流式调用通过 `ModelGatewayService` 的统一 semaphore 限流，默认 `YIBIAO_MODEL_CONCURRENCY=2`。目录内部二三级生成继续使用 `YIBIAO_OUTLINE_CONCURRENCY`，正文批量生成由前端 `REACT_APP_YIBIAO_CONTENT_CONCURRENCY` 控制，但最终仍会被后端模型限流兜住。
+
+重任务缓存由 `GenerationCacheService` 管理，默认写入 `artifacts/data/generation_cache/`。缓存 key 包含任务名、模型名、`YIBIAO_PROMPT_VERSION` 和输入 payload，当前覆盖标准解析、目录生成、成熟样例剖面和历史案例匹配。修改 prompt、schema 或模型时应更新 `YIBIAO_PROMPT_VERSION` 或关闭缓存重新生成。
+
+正文并发生成完成后必须执行一致性收口，重点检查历史残留、重复内容、承诺冲突和虚构风险；并发只用于提速正文初稿，不替代最终审校。

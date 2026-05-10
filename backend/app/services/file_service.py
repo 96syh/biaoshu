@@ -74,8 +74,8 @@ class FileService:
 
     @staticmethod
     def docx_html_preview_enabled() -> bool:
-        """是否生成 DOCX 样式化 HTML 预览，默认关闭，优先保证上传解析速度。"""
-        return FileService._env_enabled("YIBIAO_ENABLE_DOCX_HTML_PREVIEW", False)
+        """是否生成 DOCX 样式化 HTML 原文预览，默认开启以支撑前端 Word 风格定位。"""
+        return FileService._env_enabled("YIBIAO_ENABLE_DOCX_HTML_PREVIEW", True)
 
     @staticmethod
     def get_parser_mode() -> str:
@@ -298,6 +298,24 @@ class FileService:
             return None
 
     @staticmethod
+    def _line_spacing_to_css(value: Any) -> str:
+        """Convert python-docx line spacing into safe CSS."""
+        if value is None:
+            return ""
+        pt_value = FileService._length_to_pt(value)
+        if pt_value is not None:
+            if 0 < pt_value <= 120:
+                return f"{pt_value}pt"
+            return ""
+        try:
+            numeric = float(value)
+        except Exception:
+            return ""
+        if 0 < numeric <= 10:
+            return f"{numeric:.2f}"
+        return ""
+
+    @staticmethod
     def _paragraph_style(paragraph: Paragraph) -> str:
         fmt = paragraph.paragraph_format
         styles: List[str] = []
@@ -320,11 +338,9 @@ class FileService:
             styles.append(f"margin-top:{space_before}pt")
         if space_after is not None:
             styles.append(f"margin-bottom:{space_after}pt")
-        if fmt.line_spacing:
-            try:
-                styles.append(f"line-height:{float(fmt.line_spacing):.2f}")
-            except Exception:
-                pass
+        line_spacing = FileService._line_spacing_to_css(fmt.line_spacing)
+        if line_spacing:
+            styles.append(f"line-height:{line_spacing}")
         return ";".join(styles)
 
     @staticmethod
@@ -413,6 +429,14 @@ class FileService:
             page_style = f' style="{";".join(style_bits)}"' if style_bits else ""
 
         return f'<div class="docx-source-preview"{page_style}>{"".join(body_html)}</div>'
+
+    @staticmethod
+    def source_preview_html_has_text(source_preview_html: str) -> bool:
+        """Return True when generated preview HTML contains visible document text."""
+        text = re.sub(r"<br\s*/?>", "\n", source_preview_html or "", flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = html.unescape(text).replace("\xa0", " ")
+        return bool(text.strip())
 
     @staticmethod
     def _office_converter_command() -> str:
@@ -591,7 +615,7 @@ class FileService:
 
         # 生成带时间戳的文件名，防止重复
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # 精确到毫秒
-        filename = file.filename or "unknown_file"
+        filename = os.path.basename(file.filename or "unknown_file")
 
         # 分离文件名和扩展名
         name, ext = os.path.splitext(filename)
@@ -606,6 +630,69 @@ class FileService:
             await f.write(content)
 
         return file_path
+
+    @staticmethod
+    def _resolve_saved_upload_path(saved_file: str) -> str:
+        """Resolve a saved upload id to a path under the upload directory."""
+        safe_name = os.path.basename(saved_file or "")
+        if not safe_name or safe_name != (saved_file or ""):
+            raise Exception("无效的预览文件标识")
+        upload_root = Path(settings.upload_dir).resolve()
+        candidate = (upload_root / safe_name).resolve()
+        if os.path.commonpath([str(upload_root), str(candidate)]) != str(upload_root):
+            raise Exception("无效的预览文件路径")
+        if not candidate.exists():
+            raise Exception("预览文件已过期，请重新上传招标文件")
+        return str(candidate)
+
+    @staticmethod
+    def build_source_preview_for_saved_file(saved_file: str, cleanup_saved_file: bool = True) -> Dict[str, Any]:
+        """Generate source preview for a previously saved upload file."""
+        file_path = FileService._resolve_saved_upload_path(saved_file)
+        file_kind = Path(file_path).suffix.lower().lstrip(".")
+        source_preview_html = ""
+        source_preview_pages: List[Dict[str, Any]] = []
+        parser_info: Dict[str, Any] = {
+            "saved_file": os.path.basename(file_path),
+            "source_preview_status": "unavailable",
+        }
+        try:
+            if file_kind != "docx":
+                return {
+                    "source_preview_html": "",
+                    "source_preview_pages": [],
+                    "parser_info": parser_info,
+                    "source_preview_status": "unavailable",
+                }
+            if FileService.source_preview_pages_enabled():
+                try:
+                    source_preview_pages = FileService.build_office_source_preview_pages(file_path, file_kind)
+                except Exception as preview_error:
+                    print(f"DOCX Office 页图预览生成失败: {preview_error}")
+            if FileService.docx_html_preview_enabled():
+                try:
+                    source_preview_html = FileService.build_docx_source_preview_html(file_path)
+                except Exception as preview_error:
+                    print(f"DOCX 样式预览生成失败: {preview_error}")
+            if source_preview_pages:
+                parser_info["source_preview_renderer"] = "libreoffice-pdftoppm"
+                parser_info["source_preview_page_count"] = len(source_preview_pages)
+            elif source_preview_html:
+                if FileService.source_preview_html_has_text(source_preview_html):
+                    parser_info["source_preview_renderer"] = "python-docx-html"
+                    parser_info["source_preview_format"] = "docx-html"
+                else:
+                    source_preview_html = ""
+            parser_info["source_preview_status"] = "ready" if (source_preview_pages or source_preview_html) else "unavailable"
+            return {
+                "source_preview_html": source_preview_html,
+                "source_preview_pages": source_preview_pages,
+                "parser_info": parser_info,
+                "source_preview_status": parser_info["source_preview_status"],
+            }
+        finally:
+            if cleanup_saved_file:
+                FileService._safe_file_cleanup(file_path)
     
     @staticmethod
     async def extract_text_from_pdf(file_path: str) -> str:
@@ -1109,7 +1196,11 @@ class FileService:
             raise Exception(f"Word文档读取失败: {str(e)}")
     
     @staticmethod
-    async def process_uploaded_file_with_metadata(file: UploadFile) -> Dict[str, Any]:
+    async def process_uploaded_file_with_metadata(
+        file: UploadFile,
+        include_preview: bool = True,
+        cleanup_saved_file: bool = True,
+    ) -> Dict[str, Any]:
         """处理上传的文件并提取文本内容，返回解析器元信息。"""
         file_kind = FileService.detect_upload_file_kind(file)
         if file_kind in (None, "doc"):
@@ -1125,6 +1216,7 @@ class FileService:
         
         # 保存文件
         file_path = await FileService.save_uploaded_file(file)
+        keep_saved_file_for_preview = file_kind == "docx" and not include_preview and not cleanup_saved_file
         
         try:
             text, parser_info = await FileService._extract_with_configured_parser(file_path, file_kind)
@@ -1132,7 +1224,7 @@ class FileService:
                 raise Exception("无法从文件中提取文本内容")
             source_preview_html = ""
             source_preview_pages: List[Dict[str, Any]] = []
-            if file_kind == "docx":
+            if include_preview and file_kind == "docx":
                 if FileService.source_preview_pages_enabled():
                     try:
                         source_preview_pages = FileService.build_office_source_preview_pages(file_path, file_kind)
@@ -1148,15 +1240,28 @@ class FileService:
             if source_preview_pages:
                 parser_info.setdefault("source_preview_renderer", "libreoffice-pdftoppm")
                 parser_info.setdefault("source_preview_page_count", len(source_preview_pages))
+            elif source_preview_html:
+                if FileService.source_preview_html_has_text(source_preview_html):
+                    parser_info.setdefault("source_preview_renderer", "python-docx-html")
+                    parser_info.setdefault("source_preview_format", "docx-html")
+                else:
+                    source_preview_html = ""
+            elif keep_saved_file_for_preview:
+                parser_info.setdefault("source_preview_status", "pending")
+            else:
+                parser_info.setdefault("source_preview_status", "unavailable")
 
             # 成功提取后，使用安全的文件清理方法
-            FileService._safe_file_cleanup(file_path)
+            if not keep_saved_file_for_preview:
+                FileService._safe_file_cleanup(file_path)
 
             return {
                 "file_content": text,
                 "parser_info": parser_info,
                 "source_preview_html": source_preview_html,
                 "source_preview_pages": source_preview_pages,
+                "source_preview_id": os.path.basename(file_path) if keep_saved_file_for_preview else None,
+                "source_preview_status": "pending" if keep_saved_file_for_preview else ("ready" if (source_preview_html or source_preview_pages) else "unavailable"),
             }
 
         except Exception as e:

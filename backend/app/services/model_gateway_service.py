@@ -1,5 +1,7 @@
 """Low-level model gateway built on OpenAI-compatible APIs."""
+import asyncio
 import json
+import os
 import re
 from typing import Any, AsyncGenerator, Dict, List
 
@@ -23,6 +25,25 @@ from .model_runtime_monitor import ModelRuntimeMonitor
 
 class ModelGatewayService:
     """Provider configuration, endpoint verification and raw model streaming."""
+
+    _model_semaphore: asyncio.Semaphore | None = None
+    _model_semaphore_size: int | None = None
+
+    @classmethod
+    def _model_concurrency_limit(cls) -> int:
+        try:
+            limit = int(os.getenv("YIBIAO_MODEL_CONCURRENCY", "2"))
+        except (TypeError, ValueError):
+            return 2
+        return max(1, limit)
+
+    @classmethod
+    def _get_model_semaphore(cls) -> asyncio.Semaphore:
+        limit = cls._model_concurrency_limit()
+        if cls._model_semaphore is None or cls._model_semaphore_size != limit:
+            cls._model_semaphore = asyncio.Semaphore(limit)
+            cls._model_semaphore_size = limit
+        return cls._model_semaphore
 
     def __init__(self, config: Dict[str, Any] | None = None):
         """Initialize the model gateway, allowing runtime config overrides."""
@@ -271,78 +292,79 @@ class ModelGatewayService:
         max_tokens: int | None = None,
     ) -> AsyncGenerator[str, None]:
         """Stream a chat completion from the configured model gateway."""
-        last_error: Exception | None = None
-        monitor_id = ModelRuntimeMonitor.start(
-            provider=self.provider,
-            model_name=self.model_name,
-            api_mode=self.api_mode,
-            base_url=self.resolved_base_url or "",
-        )
-        for candidate in self._iter_base_urls():
-            client = self._create_client(candidate)
-            try:
-                self.client = client
-                self.resolved_base_url = candidate or ""
-                ModelRuntimeMonitor.mark_attempt(monitor_id, base_url=self.resolved_base_url)
-
-                request_kwargs: Dict[str, Any] = {}
-                if response_format is not None:
-                    request_kwargs["response_format"] = response_format
-                if max_tokens is not None:
-                    request_kwargs["max_tokens"] = max_tokens
-
-                request_messages = (
-                    self._augment_messages_for_json_output(messages, response_format)
-                    if self._response_format_requires_json_guard(response_format)
-                    else messages
-                )
-
-                try:
-                    stream = await self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=request_messages,
-                        temperature=temperature,
-                        stream=True,
-                        **request_kwargs,
-                    )
-                except Exception:
-                    if response_format is None:
-                        raise
-                    stream = await self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=request_messages,
-                        temperature=temperature,
-                        stream=True,
-                        **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-                    )
-
-                received_content = False
-                async for chunk in stream:
-                    self._raise_if_gateway_error(chunk)
-                    if not chunk.choices:
-                        continue
-                    if chunk.choices[0].delta.content is not None:
-                        received_content = True
-                        ModelRuntimeMonitor.mark_streaming(monitor_id)
-                        yield chunk.choices[0].delta.content
-                if not received_content:
-                    raise Exception("模型返回空流式内容，请确认 Base URL 指向真实 API 路径而不是管理后台页面")
-                ModelRuntimeMonitor.finish(monitor_id)
-                return
-            except Exception as e:
-                last_error = e
-
-        if self._is_model_selection_error(last_error):
-            final_error = Exception(
-                "LiteLLM Proxy 已响应，但当前模型名不可用。请先同步模型列表并选择 LiteLLM 返回的模型 ID，"
-                f"或确认 LiteLLM 配置中的 model_name。原始错误: {str(last_error)}"
+        async with self._get_model_semaphore():
+            last_error: Exception | None = None
+            monitor_id = ModelRuntimeMonitor.start(
+                provider=self.provider,
+                model_name=self.model_name,
+                api_mode=self.api_mode,
+                base_url=self.resolved_base_url or "",
             )
+            for candidate in self._iter_base_urls():
+                client = self._create_client(candidate)
+                try:
+                    self.client = client
+                    self.resolved_base_url = candidate or ""
+                    ModelRuntimeMonitor.mark_attempt(monitor_id, base_url=self.resolved_base_url)
+
+                    request_kwargs: Dict[str, Any] = {}
+                    if response_format is not None:
+                        request_kwargs["response_format"] = response_format
+                    if max_tokens is not None:
+                        request_kwargs["max_tokens"] = max_tokens
+
+                    request_messages = (
+                        self._augment_messages_for_json_output(messages, response_format)
+                        if self._response_format_requires_json_guard(response_format)
+                        else messages
+                    )
+
+                    try:
+                        stream = await self.client.chat.completions.create(
+                            model=self.model_name,
+                            messages=request_messages,
+                            temperature=temperature,
+                            stream=True,
+                            **request_kwargs,
+                        )
+                    except Exception:
+                        if response_format is None:
+                            raise
+                        stream = await self.client.chat.completions.create(
+                            model=self.model_name,
+                            messages=request_messages,
+                            temperature=temperature,
+                            stream=True,
+                            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
+                        )
+
+                    received_content = False
+                    async for chunk in stream:
+                        self._raise_if_gateway_error(chunk)
+                        if not chunk.choices:
+                            continue
+                        if chunk.choices[0].delta.content is not None:
+                            received_content = True
+                            ModelRuntimeMonitor.mark_streaming(monitor_id)
+                            yield chunk.choices[0].delta.content
+                    if not received_content:
+                        raise Exception("模型返回空流式内容，请确认 Base URL 指向真实 API 路径而不是管理后台页面")
+                    ModelRuntimeMonitor.finish(monitor_id)
+                    return
+                except Exception as e:
+                    last_error = e
+
+            if self._is_model_selection_error(last_error):
+                final_error = Exception(
+                    "LiteLLM Proxy 已响应，但当前模型名不可用。请先同步模型列表并选择 LiteLLM 返回的模型 ID，"
+                    f"或确认 LiteLLM 配置中的 model_name。原始错误: {str(last_error)}"
+                )
+                ModelRuntimeMonitor.fail(monitor_id, final_error)
+                raise final_error from last_error
+
+            final_error = Exception(f"模型调用失败: {str(last_error)}")
             ModelRuntimeMonitor.fail(monitor_id, final_error)
             raise final_error from last_error
-
-        final_error = Exception(f"模型调用失败: {str(last_error)}")
-        ModelRuntimeMonitor.fail(monitor_id, final_error)
-        raise final_error from last_error
 
     async def _get_anthropic_models(self) -> List[str]:
         """Fetch models through Anthropic's native API."""

@@ -11,6 +11,7 @@ from ...utils.json_util import check_json, extract_json_string
 from ...models.schemas import AnalysisReport, ResponseMatrix, ReviewReport
 from ..enterprise_material_service import EnterpriseMaterialService
 from ..fallback_generation import FallbackGenerationMixin
+from ..generation_cache_service import GenerationCacheService
 from .core import GenerationCoreMixin
 
 
@@ -794,6 +795,18 @@ class AnalysisGenerationMixin:
                 f"{len(str(file_content or ''))} -> {len(analysis_input)} 字符",
                 flush=True,
             )
+        cache_key = GenerationCacheService.build_key(
+            "analysis_report",
+            self.model_name,
+            {
+                "analysis_input": analysis_input,
+                "max_tokens": max_tokens,
+                "include_schema": self._include_schema_in_prompt(),
+            },
+        )
+        cached_report = GenerationCacheService.get("analysis_report", cache_key)
+        if isinstance(cached_report, dict):
+            return AnalysisReport.model_validate(cached_report).model_dump(mode="json")
         system_prompt, user_prompt = prompt_manager.generate_analysis_report_prompt(
             analysis_input,
             include_schema_in_prompt=self._include_schema_in_prompt(),
@@ -870,7 +883,9 @@ class AnalysisGenerationMixin:
                     missing_company_materials=report.get("missing_company_materials") or [],
                     evidence_chain_requirements=report.get("evidence_chain_requirements") or [],
                 )
-            return AnalysisReport.model_validate(report).model_dump(mode="json")
+            validated = AnalysisReport.model_validate(report).model_dump(mode="json")
+            GenerationCacheService.set("analysis_report", cache_key, validated)
+            return validated
         except asyncio.TimeoutError as e:
             raise Exception(
                 f"模型解析超时：标准解析超过 {timeout_seconds} 秒仍未完成。"

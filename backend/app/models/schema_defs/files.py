@@ -9,6 +9,8 @@ class FileUploadResponse(BaseModel):
     success: bool
     message: str
     file_content: Optional[str] = None
+    source_preview_id: Optional[str] = Field(None, description="异步生成源文件预览所需的已保存文件标识")
+    source_preview_status: Optional[str] = Field(None, description="源文件预览状态：pending、ready、unavailable")
     source_preview_html: Optional[str] = Field(None, description="上传源文件的样式化 HTML 预览片段")
     source_preview_pages: List[Dict[str, Any]] = Field(default_factory=list, description="上传源文件的 Office/PDF 渲染页图和文本块坐标")
     old_outline: Optional[str] = None

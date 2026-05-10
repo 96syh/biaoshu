@@ -374,7 +374,7 @@ export const ReviewPage = ({ controller }: PageProps) => {
                     <div className="ops-panel__head">
                       <h2>合规审校</h2>
                       <div className="outline-actions">
-                        <button type="button" className="text-link" onClick={runConsistencyRevision} disabled={!effectiveOutline || busy === 'consistency'}>
+                        <button type="button" className="text-link" onClick={() => runConsistencyRevision()} disabled={!effectiveOutline || busy === 'consistency'}>
                           {busy === 'consistency' ? '检查中' : '一致性修订'}
                         </button>
                         <button type="button" className="text-link" onClick={runReview} disabled={!effectiveOutline || completedLeaves === 0 || busy === 'review'}>{busy === 'review' ? '审校中' : '执行审校'}</button>

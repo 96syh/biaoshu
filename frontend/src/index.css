@@ -3205,10 +3205,45 @@
     outline: none;
   }
 
-  .source-jump-item span {
+  .source-jump-item > span {
     min-width: 0;
     margin: 0;
     font-size: 14px;
+    line-height: 1.75;
+    white-space: pre-wrap;
+  }
+
+  .source-jump-item__content {
+    min-width: 0;
+    display: block;
+    white-space: normal;
+  }
+
+  .source-jump-item__content--plain {
+    white-space: pre-wrap;
+  }
+
+  .source-jump-item__title {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    color: #334155;
+    font-weight: 850;
+    line-height: 1.65;
+  }
+
+  .source-jump-item__marker {
+    flex: 0 0 auto;
+    margin-top: 1px;
+    color: #2563eb;
+    font-size: 11px;
+    line-height: 1.9;
+  }
+
+  .source-jump-item__detail {
+    display: block;
+    margin-left: 18px;
+    color: #475569;
     line-height: 1.75;
     white-space: pre-wrap;
   }
@@ -3369,9 +3404,10 @@
   }
 
   .rendered-source-block--active {
-    border: 2px solid var(--ops-green);
-    background: rgba(15, 107, 79, 0.14);
-    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.88), 0 4px 14px rgba(15, 107, 79, 0.22);
+    z-index: 2;
+    border: 3px solid var(--ops-green);
+    background: rgba(34, 197, 94, 0.22);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.92), 0 0 0 7px rgba(15, 107, 79, 0.12), 0 6px 18px rgba(15, 107, 79, 0.24);
   }
 
   .rendered-source-block--active span {
@@ -3394,6 +3430,7 @@
   .tender-source-docx-stage {
     display: grid;
     justify-items: center;
+    width: 100%;
   }
 
   .tender-source-docx-page {
@@ -3403,6 +3440,7 @@
   }
 
   .docx-source-preview {
+    box-sizing: border-box;
     width: min(100%, var(--docx-page-width, 595pt));
     min-height: var(--docx-page-min-height, 842pt);
     margin: 0 auto;
@@ -3414,6 +3452,7 @@
     font-family: SimSun, STSong, "Songti SC", "Noto Serif CJK SC", serif;
     font-size: 12pt;
     line-height: 1.75;
+    text-align: left;
     overflow-wrap: anywhere;
   }
 
@@ -3424,6 +3463,7 @@
   .docx-source-preview h4 {
     scroll-margin-top: 120px;
     margin: 0 0 8pt;
+    line-height: 1.75 !important;
     white-space: pre-wrap;
   }
 
@@ -3465,9 +3505,12 @@
   }
 
   .docx-source-node--active {
+    position: relative;
     border-radius: 4px;
-    background: #e4f3eb;
-    box-shadow: inset 3px 0 0 var(--ops-green), 0 0 0 1px rgba(15, 107, 79, 0.16);
+    outline: 3px solid rgba(15, 107, 79, 0.72);
+    outline-offset: 3px;
+    background: #c8f5db !important;
+    box-shadow: inset 5px 0 0 var(--ops-green), 0 0 0 6px rgba(15, 107, 79, 0.10), 0 10px 24px rgba(15, 107, 79, 0.16);
     color: #0f261c;
     font-weight: 800;
   }
@@ -3495,26 +3538,32 @@
     margin: 0 0 4pt;
   }
 
+  .docx-source-preview .docx-source-node--active span,
+  .docx-source-preview .docx-source-node--active strong,
+  .docx-source-preview .docx-source-node--active b {
+    background: rgba(200, 245, 219, 0.84) !important;
+  }
+
   .tender-source-page {
     position: relative;
-    width: min(100%, 460px);
-    min-height: 650px;
+    width: min(100%, 720px);
+    min-height: 920px;
     margin: 0 auto;
-    padding: 58px 42px 62px;
+    padding: 72px 72px 74px;
     border: 1px solid #d5d5d5;
     background: #fff;
     box-shadow: 0 12px 24px rgba(33, 37, 41, 0.18);
   }
 
   .tender-source-page__body {
-    min-height: 530px;
+    min-height: 770px;
   }
 
   .tender-source-page__footer {
     position: absolute;
-    right: 42px;
+    right: 72px;
     bottom: 24px;
-    left: 42px;
+    left: 72px;
     color: #8a8f94;
     font-family: SimSun, STSong, "Songti SC", serif;
     font-size: 13px;
@@ -3614,8 +3663,10 @@
   }
 
   .tender-source-block--active {
-    background: #e4f3eb;
-    box-shadow: inset 3px 0 0 var(--ops-green);
+    outline: 2px solid rgba(15, 107, 79, 0.42);
+    outline-offset: 2px;
+    background: #dff3e8;
+    box-shadow: inset 4px 0 0 var(--ops-green), 0 8px 18px rgba(15, 107, 79, 0.12);
     color: #102b1f;
     font-weight: 800;
   }

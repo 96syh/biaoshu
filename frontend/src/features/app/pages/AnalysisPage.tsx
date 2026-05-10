@@ -52,6 +52,7 @@ export const AnalysisPage = ({ controller }: PageProps) => {
     activeResponseMatrix,
     activeScoringRows,
     activeSourceLabel,
+    activeSourceLineHighlightIndex,
     activeSourceLineIndex,
     activeSourceQuery,
     activeVisualAssets,
@@ -319,6 +320,7 @@ export const AnalysisPage = ({ controller }: PageProps) => {
     sourceLocateResult,
     sourcePanelStatusText,
     sourcePreviewBlocks,
+    sourcePreviewHtmlWithLocateHighlight,
     sourcePreviewPages,
     sourceSearchTokens,
     sourceSearchTokensForLocate,
@@ -368,6 +370,27 @@ export const AnalysisPage = ({ controller }: PageProps) => {
     wordPreviewStyle,
     workflowStatus,
   } = controller;
+  const sourcePreviewHtmlForDisplay = sourcePreviewHtmlWithLocateHighlight || state.sourcePreviewHtml || '';
+  const hasDocxSourcePreview = Boolean(sourcePreviewHtmlForDisplay && stripPreviewInlineMarkup(sourcePreviewHtmlForDisplay).trim());
+
+  const renderParseContentLine = (line: string) => {
+    const parts = line.split('\n').map(part => part.trim()).filter(Boolean);
+    if (parts.length <= 1) {
+      return <span className="source-jump-item__content source-jump-item__content--plain">{line}</span>;
+    }
+    const [title, ...details] = parts;
+    return (
+      <span className="source-jump-item__content">
+        <span className="source-jump-item__title">
+          <span className="source-jump-item__marker" aria-hidden="true">◆</span>
+          <span>{title}</span>
+        </span>
+        {details.map((detail, detailIndex) => (
+          <span key={`${title}-detail-${detailIndex}`} className="source-jump-item__detail">{detail}</span>
+        ))}
+      </span>
+    );
+  };
 
   return (
     <div className="ops-page-grid ops-page-grid--analysis">
@@ -507,6 +530,19 @@ export const AnalysisPage = ({ controller }: PageProps) => {
                               <nav className="tender-parse-sections" aria-label="解析章节">
                                 {activeParseTab.sections.map(section => {
                                   const sectionCheck = getRequirementCheckForItem(section.id, section.title);
+                                  const riskTitle = activeParseTab.key === 'risk' && sectionCheck
+                                    ? sectionCheck.satisfied
+                                      ? '历史库匹配满足：可避免成为废标'
+                                      : '历史库未满足：需要补充或修改材料/响应'
+                                    : undefined;
+                                  const riskAria = activeParseTab.key === 'risk' && sectionCheck
+                                    ? sectionCheck.satisfied
+                                      ? '历史库满足，非废标'
+                                      : '历史库不满足，需补改'
+                                    : undefined;
+                                  const riskMissingTitle = activeParseTab.key === 'risk'
+                                    ? '历史库未匹配到满足证据：需要补充或修改材料/响应'
+                                    : undefined;
                                   return (
                                     <button
                                       key={section.id}
@@ -516,7 +552,7 @@ export const AnalysisPage = ({ controller }: PageProps) => {
                                     >
                                       <span>{section.title}</span>
                                       <em>{section.count ? `${section.count} 项` : '待核对'}</em>
-                                      {renderRequirementMatchIcon(sectionCheck, true)}
+                                      {renderRequirementMatchIcon(sectionCheck, true, riskTitle, riskAria, riskMissingTitle)}
                                     </button>
                                   );
                                 })}
@@ -535,7 +571,7 @@ export const AnalysisPage = ({ controller }: PageProps) => {
                                       onClick={() => locateSourceItem(`${activeParseSection.title} · 第 ${index + 1} 项`, line)}
                                       title="定位到右侧原文"
                                     >
-                                      <span>{line}</span>
+                                      {renderParseContentLine(line)}
                                       <em>定位</em>
                                     </button>
                                   ))}
@@ -561,7 +597,7 @@ export const AnalysisPage = ({ controller }: PageProps) => {
                               ) : sourceLocateResult.status === 'not-found' ? (
                                 <div className="tender-source-locate-hint tender-source-locate-hint--miss">
                                   <strong>未找到完全一致的原文段落</strong>
-                                  <span>已显示上传 Word 全文，请点击左侧更具体的要求文本继续定位。</span>
+                                  <span>已显示上传文档全文，请点击左侧更具体的要求文本继续定位。</span>
                                 </div>
                               ) : null}
                               <div className="tender-source-word" role="document" aria-label="上传文档原文预览">
@@ -589,11 +625,11 @@ export const AnalysisPage = ({ controller }: PageProps) => {
                                       );
                                     })}
                                   </section>
-                                )) : state.sourcePreviewHtml ? (
+                                )) : hasDocxSourcePreview ? (
                                   <div className="tender-source-docx-stage">
                                     <section
                                       className="tender-source-docx-page"
-                                      dangerouslySetInnerHTML={{ __html: state.sourcePreviewHtml }}
+                                      dangerouslySetInnerHTML={{ __html: sourcePreviewHtmlForDisplay }}
                                     />
                                   </div>
                                 ) : sourcePreviewPages.length ? sourcePreviewPages.map(page => (
@@ -610,14 +646,14 @@ export const AnalysisPage = ({ controller }: PageProps) => {
                                           <div
                                             id={`source-line-${block.sourceIndex}`}
                                             key={`source-line-${block.sourceIndex}`}
-                                            className={`tender-source-block tender-source-block--blank ${block.sourceIndex === activeSourceLineIndex ? 'tender-source-block--active' : ''}`}
+                                            className={`tender-source-block tender-source-block--blank ${block.sourceIndex === activeSourceLineHighlightIndex ? 'tender-source-block--active' : ''}`}
                                             aria-hidden="true"
                                           />
                                         ) : (
                                           <p
                                             id={`source-line-${block.sourceIndex}`}
                                             key={`source-line-${block.sourceIndex}`}
-                                            className={`tender-source-block tender-source-block--${block.type} ${block.sourceIndex === activeSourceLineIndex ? 'tender-source-block--active' : ''}`}
+                                            className={`tender-source-block tender-source-block--${block.type} ${block.sourceIndex === activeSourceLineHighlightIndex ? 'tender-source-block--active' : ''}`}
                                           >
                                             {block.text}
                                           </p>

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { saveAs } from 'file-saver';
 import {
   ArrowDownTrayIcon,
@@ -73,6 +73,17 @@ import { ProgressState, useProgressState } from './hooks/useProgressState';
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
 type NavKey = 'project' | 'analysis' | 'outline' | 'assets' | 'content' | 'review' | 'config';
 type GenerationControlState = 'idle' | 'running' | 'paused' | 'stopped';
+type TaskStatus = 'idle' | 'blocked' | 'running' | 'success' | 'error' | 'paused' | 'stopped';
+type TaskState = {
+  id: string;
+  label: string;
+  status: TaskStatus;
+  detail?: string;
+  error?: string;
+  dependsOn?: string[];
+  startedAt?: number;
+  finishedAt?: number;
+};
 type DraftOutlineRow = { id: string; title: string; level: number; status: string };
 type OutlineEditorForm = { id: string; title: string; description: string };
 type ProjectSummary = Partial<AnalysisReport['project']> & { __fallback?: boolean };
@@ -108,6 +119,63 @@ type SourceLocateResult = {
 type RenderedSourceBlockTarget = {
   pageNumber: number;
   blockId: string;
+};
+
+const TASK_DAG: Record<string, string[]> = {
+  upload_text: [],
+  source_preview: ['upload_text'],
+  history_match: ['upload_text'],
+  analysis: ['upload_text'],
+  requirement_check: ['analysis'],
+  outline: ['analysis'],
+  document_blocks: ['outline'],
+  batch: ['outline'],
+  review: ['batch'],
+  consistency: ['batch'],
+  export: ['review', 'consistency'],
+};
+
+const TASK_LABELS: Record<string, string> = {
+  upload: '文件上传',
+  upload_text: '文件上传',
+  source_preview: '原文预览',
+  reference: '样例解析',
+  'reference-match': '历史案例匹配',
+  history_match: '历史案例匹配',
+  requirement_check: '要求匹配',
+  analysis: '标准解析',
+  outline: '目录生成',
+  blocks: '图表素材规划',
+  document_blocks: '图表素材规划',
+  batch: '批量生成',
+  review: '合规审校',
+  consistency: '一致性修订',
+  export: 'Word 导出',
+  config: '保存配置',
+  verify: '验证端点',
+  models: '同步模型',
+};
+
+const normalizeTaskId = (id: string) => {
+  if (id === 'upload') return 'upload_text';
+  if (id === 'reference-match') return 'history_match';
+  if (id === 'blocks') return 'document_blocks';
+  return id;
+};
+
+const taskDependencies = (id: string) => {
+  const normalizedId = normalizeTaskId(id);
+  if (normalizedId.startsWith('chapter:')) return ['outline'];
+  if (normalizedId.startsWith('asset:')) return ['document_blocks'];
+  return TASK_DAG[normalizedId] || [];
+};
+
+const taskLabel = (id: string) => TASK_LABELS[id] || (id.startsWith('chapter:') ? '正文生成' : id.startsWith('asset:') ? '图表生成' : id);
+
+const contentConcurrencyLimit = () => {
+  const raw = Number((process.env.REACT_APP_YIBIAO_CONTENT_CONCURRENCY || '2').trim());
+  if (!Number.isFinite(raw)) return 2;
+  return Math.max(1, Math.min(4, Math.floor(raw)));
 };
 type TenderScoringRow = {
   id: string;
@@ -1440,7 +1508,7 @@ const buildEvidenceSecondLevelChildren = (item: OutlineItem, report?: AnalysisRe
       content: undefined,
       children: undefined,
     };
-    return { ...child, children: buildEvidenceThirdLevelChildren(child, basis) };
+    return child;
   });
 
 const isPlaceholderOutlineChild = (item: OutlineItem) =>
@@ -1478,10 +1546,7 @@ const ensureOutlineThirdLevel = (items: OutlineItem[], level = 1, report?: Analy
       if (repeatedPatterns.size) {
         const repairedChildren = item.children.map(child => {
           if (!isRepeatedThirdLevelGroup(child, repeatedPatterns)) return child;
-          const basis = collectAutoOutlineBasis(child, report)[0];
-          return basis
-            ? { ...child, children: buildEvidenceThirdLevelChildren(child, basis) }
-            : { ...child, children: undefined };
+          return { ...child, children: undefined };
         });
         changed = true;
         currentItem = { ...item, children: repairedChildren };
@@ -1500,11 +1565,6 @@ const ensureOutlineThirdLevel = (items: OutlineItem[], level = 1, report?: Analy
       }
     }
     if (level === 2 && isGeneratedThirdLevelGroup(currentItem)) {
-      const basis = collectAutoOutlineBasis(currentItem, report)[0];
-      if (basis) {
-        changed = true;
-        return { ...currentItem, children: buildEvidenceThirdLevelChildren(currentItem, basis) };
-      }
       changed = true;
       return { ...currentItem, children: undefined };
     }
@@ -1513,11 +1573,7 @@ const ensureOutlineThirdLevel = (items: OutlineItem[], level = 1, report?: Analy
       if (result.changed) changed = true;
       return result.changed ? { ...currentItem, children: result.items } : currentItem;
     }
-    if (level !== 2) return currentItem;
-    const basis = collectAutoOutlineBasis(currentItem, report)[0];
-    if (!basis) return currentItem;
-    changed = true;
-    return { ...currentItem, children: buildEvidenceThirdLevelChildren(currentItem, basis) };
+    return currentItem;
   });
   return { items: nextItems, changed };
 };
@@ -1539,7 +1595,8 @@ export const useBidWorkspaceController = () => {
   const [uploadedFileName, setUploadedFileName] = useState(state.uploadedFileName || '');
   const [referenceFileName, setReferenceFileName] = useState('');
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
-  const [busy, setBusy] = useState('');
+  const [legacyBusy, setLegacyBusy] = useState('');
+  const [tasks, setTasks] = useState<Record<string, TaskState>>({});
   const [notice, setNotice] = useState<Notice | null>(null);
   const [streamText, setStreamText] = useState('');
   const [, setContentStreamText] = useState('');
@@ -1562,8 +1619,11 @@ export const useBidWorkspaceController = () => {
   const [activeParseSectionId, setActiveParseSectionId] = useState('');
   const [activeSourceQuery, setActiveSourceQuery] = useState('');
   const [activeSourceLabel, setActiveSourceLabel] = useState('');
+  const [sourceLocateRequestId, setSourceLocateRequestId] = useState(0);
   const [sourceLocateResult, setSourceLocateResult] = useState<SourceLocateResult>({ status: 'idle', label: '', snippet: '' });
   const [activeRenderedSourceBlock, setActiveRenderedSourceBlock] = useState<RenderedSourceBlockTarget | null>(null);
+  const [activeDocxSourceNodeIndex, setActiveDocxSourceNodeIndex] = useState<number | null>(null);
+  const [activeSourceLineHighlightIndex, setActiveSourceLineHighlightIndex] = useState<number | null>(null);
   const [analysisRevealPercent, setAnalysisRevealPercent] = useState(0);
   const [activeDocId, setActiveDocId] = useState('');
   const [outlineDraftRows, setOutlineDraftRows] = useState<DraftOutlineRow[]>([]);
@@ -1589,6 +1649,9 @@ export const useBidWorkspaceController = () => {
   const generationStoppedRef = useRef(false);
   const analysisStoppedRef = useRef(false);
   const batchOutlineRef = useRef<OutlineData | null>(null);
+  const legacyBusyRef = useRef('');
+  const uploadSessionRef = useRef(0);
+  const lastDocxSourceScrollKeyRef = useRef('');
   const {
     advanceProgress,
     clampProgress,
@@ -1603,6 +1666,52 @@ export const useBidWorkspaceController = () => {
 
   const activeReport = state.analysisReport || state.outlineData?.analysis_report || null;
   const effectiveOutline = state.outlineData;
+  const startTask = useCallback((id: string, detail = '') => {
+    const normalizedId = normalizeTaskId(id || 'task');
+    setTasks(prev => ({
+      ...prev,
+      [normalizedId]: {
+        id: normalizedId,
+        label: taskLabel(normalizedId),
+        status: 'running',
+        detail,
+        dependsOn: taskDependencies(normalizedId),
+        startedAt: Date.now(),
+      },
+    }));
+  }, []);
+  const finishTask = useCallback((id: string, status: Exclude<TaskStatus, 'idle' | 'blocked' | 'running'> = 'success', detail = '') => {
+    if (!id) return;
+    const normalizedId = normalizeTaskId(id);
+    setTasks(prev => ({
+      ...prev,
+      [normalizedId]: {
+        ...(prev[normalizedId] || {
+          id: normalizedId,
+          label: taskLabel(normalizedId),
+          dependsOn: taskDependencies(normalizedId),
+        }),
+        status,
+        detail: detail || prev[normalizedId]?.detail,
+        error: status === 'error' ? detail || prev[normalizedId]?.error : prev[normalizedId]?.error,
+        finishedAt: Date.now(),
+      },
+    }));
+  }, []);
+  const setBusy = useCallback((id: string) => {
+    if (!id) {
+      const previous = legacyBusyRef.current;
+      if (previous) finishTask(previous, 'success');
+      legacyBusyRef.current = '';
+      setLegacyBusy('');
+      return;
+    }
+    const previous = legacyBusyRef.current;
+    if (previous && previous !== id) finishTask(previous, 'success');
+    legacyBusyRef.current = id;
+    setLegacyBusy(id);
+    startTask(id);
+  }, [finishTask, startTask]);
   const outlineReferenceProfile = profileRecord(effectiveOutline?.reference_bid_style_profile);
   const reportReferenceProfile = profileRecord(activeReport?.reference_bid_style_profile);
   const rawReferenceProfile = Object.keys(outlineReferenceProfile).length
@@ -1684,6 +1793,32 @@ export const useBidWorkspaceController = () => {
     () => state.sourcePreviewPages || [],
     [state.sourcePreviewPages],
   );
+  const hasSourcePreviewHtml = useMemo(
+    () => Boolean(state.sourcePreviewHtml && stripPreviewInlineMarkup(state.sourcePreviewHtml).trim()),
+    [state.sourcePreviewHtml],
+  );
+  const sourcePreviewHtmlWithLocateHighlight = useMemo(() => {
+    const html = state.sourcePreviewHtml || '';
+    if (!hasSourcePreviewHtml || activeDocxSourceNodeIndex === null) return html;
+    if (typeof window === 'undefined' || typeof window.DOMParser === 'undefined') return html;
+
+    const parser = new window.DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    const nodes = Array.from(doc.querySelectorAll<HTMLElement>('.docx-source-preview p, .docx-source-preview h1, .docx-source-preview h2, .docx-source-preview h3, .docx-source-preview h4, .docx-source-preview td'));
+    const target = nodes[activeDocxSourceNodeIndex];
+    if (!target) return html;
+
+    doc.querySelectorAll<HTMLElement>('.docx-source-node--active').forEach(node => {
+      node.classList.remove('docx-source-node--active');
+      node.removeAttribute('data-locate-label');
+      node.removeAttribute('data-source-locate-active');
+    });
+    const locateLabel = activeSourceLabel || activeParseSection?.title || '';
+    target.classList.add('docx-source-node--active');
+    target.setAttribute('data-locate-label', locateLabel ? `${locateLabel}位置` : '原文位置');
+    target.setAttribute('data-source-locate-active', 'true');
+    return doc.body.innerHTML;
+  }, [activeDocxSourceNodeIndex, activeParseSection?.title, activeSourceLabel, hasSourcePreviewHtml, state.sourcePreviewHtml]);
   const activeSourceLineIndex = useMemo(
     () => activeSourceQuery
       ? findSourceLineIndexByText(sourceLines, activeSourceQuery)
@@ -1740,9 +1875,10 @@ export const useBidWorkspaceController = () => {
     if (sourceLocateResult.status === 'found') return `已定位：${label || '原文位置'}`;
     if (sourceLocateResult.status === 'locating') return `正在定位：${label || '原文位置'}`;
     if (sourceLocateResult.status === 'not-found') return `未精确命中：${label || '当前条目'}`;
-    return renderedSourcePages.length || state.sourcePreviewHtml || sourcePreviewPages.length
-      ? `全文：${label || '上传文件'}`
-      : '等待上传文件';
+    if (renderedSourcePages.length) return `Word 原文页图：${label || '上传文件'}`;
+    if (hasSourcePreviewHtml) return `Word 原文：${label || '上传文件'}`;
+    if (sourcePreviewPages.length) return `文本预览：${label || '上传文件'}`;
+    return '等待上传文件';
   })();
 
   useEffect(() => setLocalConfig(state.config), [state.config]);
@@ -1860,9 +1996,17 @@ export const useBidWorkspaceController = () => {
   }, [activeNav, activeReport]);
 
   useEffect(() => {
-    if (!evidenceHighlighted || activeNav !== 'analysis') return;
+    if (!sourceLocateRequestId || activeNav !== 'analysis') return;
     window.requestAnimationFrame(() => {
       const locateLabel = activeSourceLabel || activeParseSection?.title || '';
+      const panel = evidencePanelRef.current;
+      panel?.querySelectorAll<HTMLElement>('.docx-source-node--active').forEach(node => {
+        node.classList.remove('docx-source-node--active');
+        node.removeAttribute('data-locate-label');
+      });
+      setActiveRenderedSourceBlock(null);
+      setActiveDocxSourceNodeIndex(null);
+      setActiveSourceLineHighlightIndex(null);
       if (renderedSourcePages.length) {
         const tokens = (activeSourceQuery
           ? sourceSearchTokensForLocate(activeSourceQuery, activeParseSection)
@@ -1898,35 +2042,28 @@ export const useBidWorkspaceController = () => {
         setSourceLocateResult({ status: 'not-found', label: locateLabel, snippet: '' });
         return;
       }
-      setActiveRenderedSourceBlock(null);
-      if (state.sourcePreviewHtml) {
-        const panel = evidencePanelRef.current;
+      if (hasSourcePreviewHtml) {
         const tokens = (activeSourceQuery
           ? sourceSearchTokensForLocate(activeSourceQuery, activeParseSection)
           : sourceSearchTokensForLocate('', activeParseSection))
           .map(normalizeSourceText)
           .filter(token => token.length >= 4);
-        panel?.querySelectorAll<HTMLElement>('.docx-source-node--active').forEach(node => {
-          node.classList.remove('docx-source-node--active');
-          node.removeAttribute('data-locate-label');
-        });
         const nodes = Array.from(panel?.querySelectorAll<HTMLElement>('.docx-source-preview p, .docx-source-preview h1, .docx-source-preview h2, .docx-source-preview h3, .docx-source-preview h4, .docx-source-preview td') || []);
         const rankedTargets = nodes
-          .map(node => ({
+          .map((node, index) => ({
             node,
+            index,
             score: scoreSourceNodeMatch(node.innerText || node.textContent || '', tokens),
           }))
           .filter(item => item.score > 0)
           .sort((left, right) => right.score - left.score);
-        const target = rankedTargets[0]?.node;
+        const target = rankedTargets[0];
         if (target) {
-          target.classList.add('docx-source-node--active');
-          target.setAttribute('data-locate-label', locateLabel ? `${locateLabel}位置` : '原文位置');
-          target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setActiveDocxSourceNodeIndex(target.index);
           setSourceLocateResult({
             status: 'found',
             label: locateLabel,
-            snippet: stripPreviewInlineMarkup((target.innerText || target.textContent || '').replace(/\s+/g, ' ')).slice(0, 120),
+            snippet: stripPreviewInlineMarkup((target.node.innerText || target.node.textContent || '').replace(/\s+/g, ' ')).slice(0, 120),
           });
           return;
         }
@@ -1935,7 +2072,7 @@ export const useBidWorkspaceController = () => {
         return;
       }
       if (activeSourceLineIndex >= 0) {
-        setActiveRenderedSourceBlock(null);
+        setActiveSourceLineHighlightIndex(activeSourceLineIndex);
         document.getElementById(`source-line-${activeSourceLineIndex}`)?.scrollIntoView({
           behavior: 'smooth',
           block: 'center',
@@ -1947,11 +2084,25 @@ export const useBidWorkspaceController = () => {
         });
         return;
       }
-      setActiveRenderedSourceBlock(null);
       evidencePanelRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
       setSourceLocateResult({ status: 'not-found', label: locateLabel, snippet: '' });
     });
-  }, [activeNav, activeParseSection, activeSourceLabel, activeSourceLineIndex, activeSourceQuery, evidenceHighlighted, renderedSourcePages, sourceLines, state.sourcePreviewHtml]);
+  }, [activeNav, activeParseSection, activeSourceLabel, activeSourceLineIndex, activeSourceQuery, hasSourcePreviewHtml, renderedSourcePages, sourceLines, sourceLocateRequestId, state.sourcePreviewHtml]);
+
+  useEffect(() => {
+    if (!hasSourcePreviewHtml || activeDocxSourceNodeIndex === null) return;
+    const frame = window.requestAnimationFrame(() => {
+      const panel = evidencePanelRef.current;
+      const target = panel?.querySelector<HTMLElement>('.docx-source-node--active[data-source-locate-active="true"]');
+      if (!target) return;
+      const scrollKey = `${sourceLocateRequestId}:${activeDocxSourceNodeIndex}`;
+      if (lastDocxSourceScrollKeyRef.current !== scrollKey) {
+        lastDocxSourceScrollKeyRef.current = scrollKey;
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeDocxSourceNodeIndex, hasSourcePreviewHtml, sourceLocateRequestId, sourcePreviewHtmlWithLocateHighlight]);
 
   useEffect(() => {
     if (!state.outlineData?.outline?.length) return;
@@ -1984,6 +2135,7 @@ export const useBidWorkspaceController = () => {
     setActiveSourceQuery('');
     setActiveSourceLabel(label);
     setSourceLocateResult({ status: 'locating', label, snippet: '' });
+    setSourceLocateRequestId(value => value + 1);
     setEvidenceHighlighted(true);
     window.requestAnimationFrame(() => {
       evidencePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' });
@@ -1995,6 +2147,7 @@ export const useBidWorkspaceController = () => {
     setActiveSourceQuery(text);
     setActiveSourceLabel(label);
     setSourceLocateResult({ status: 'locating', label, snippet: '' });
+    setSourceLocateRequestId(value => value + 1);
     setEvidenceHighlighted(true);
     window.requestAnimationFrame(() => {
       evidencePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' });
@@ -2214,11 +2367,13 @@ export const useBidWorkspaceController = () => {
       setError('文件大小不能超过 500MB');
       return;
     }
+    const uploadSession = uploadSessionRef.current + 1;
+    uploadSessionRef.current = uploadSession;
     setBusy('upload');
     const taskVersion = startProgress('文件上传', ['读取文件', '后端解析文本'], '正在上传并读取招标文件', 12);
     setNotice(null);
     try {
-      const response = await documentApi.uploadFile(file);
+      const response = await documentApi.uploadFileText(file);
       if (!response.data.success || !response.data.file_content) throw new Error(response.data.message || '上传失败');
       setUploadedFileName(file.name);
       setReviewReport(null);
@@ -2237,10 +2392,40 @@ export const useBidWorkspaceController = () => {
         response.data.file_content,
         file.name,
         response.data.parser_info,
-        response.data.source_preview_html || '',
-        response.data.source_preview_pages || [],
+        '',
+        [],
       );
       completeProgress('文件已上传，文本读取完成', taskVersion);
+      if (response.data.source_preview_id && response.data.source_preview_status === 'pending') {
+        startTask('source_preview', '正在生成上传文档原文预览');
+        void documentApi.getSourcePreview(response.data.source_preview_id)
+          .then(previewResponse => {
+            if (uploadSessionRef.current !== uploadSession) return;
+            if (!previewResponse.data.success) {
+              finishTask('source_preview', 'error', previewResponse.data.message || '原文预览生成失败');
+              return;
+            }
+            restoreDraft({
+              sourcePreviewHtml: previewResponse.data.source_preview_html || '',
+              sourcePreviewPages: previewResponse.data.source_preview_pages || [],
+              parserInfo: {
+                ...(response.data.parser_info || {}),
+                ...(previewResponse.data.parser_info || {}),
+              },
+            });
+            finishTask(
+              'source_preview',
+              'success',
+              previewResponse.data.source_preview_status === 'ready' ? '原文预览已生成' : '该文件暂无可用原文预览',
+            );
+          })
+          .catch((previewError: any) => {
+            if (uploadSessionRef.current !== uploadSession) return;
+            finishTask('source_preview', 'error', previewError.response?.data?.detail || previewError.message || '原文预览生成失败');
+          });
+      } else {
+        finishTask('source_preview', 'success', '该文件使用文本预览');
+      }
     } catch (error: any) {
       failProgress(error.response?.data?.detail || error.message || '文件上传失败', 1, taskVersion);
       setError(error.response?.data?.detail || error.message || '文件上传失败');
@@ -2406,14 +2591,20 @@ export const useBidWorkspaceController = () => {
     });
   };
 
-  const renderRequirementMatchIcon = (check?: HistoryRequirementCheck, compact = false) => {
+  const renderRequirementMatchIcon = (
+    check?: HistoryRequirementCheck,
+    compact = false,
+    titleOverride?: string,
+    ariaOverride?: string,
+    missingTitleOverride?: string,
+  ) => {
     if (checkingHistoryRequirements && !check) {
       return <span className={`requirement-match requirement-match--pending ${compact ? 'requirement-match--compact' : ''}`} title="正在匹配数据库">…</span>;
     }
     if (!check) {
       if (historyRequirementSummary) {
         return (
-          <span className={`requirement-match requirement-match--miss ${compact ? 'requirement-match--compact' : ''}`} title="数据库未匹配到满足证据">
+          <span className={`requirement-match requirement-match--miss ${compact ? 'requirement-match--compact' : ''}`} title={missingTitleOverride || '数据库未匹配到满足证据'}>
             <XMarkIcon className="h-4 w-4" />
           </span>
         );
@@ -2423,8 +2614,8 @@ export const useBidWorkspaceController = () => {
     return (
       <span
         className={`requirement-match ${check.satisfied ? 'requirement-match--ok' : 'requirement-match--miss'} ${compact ? 'requirement-match--compact' : ''}`}
-        title={check.satisfied ? '数据库匹配：满足要求' : '数据库匹配：不满足要求'}
-        aria-label={check.satisfied ? '满足要求' : '不满足要求'}
+        title={titleOverride || (check.satisfied ? '数据库匹配：满足要求' : '数据库匹配：不满足要求')}
+        aria-label={ariaOverride || (check.satisfied ? '满足要求' : '不满足要求')}
       >
         {check.satisfied ? <CheckCircleIcon className="h-4 w-4" /> : <XMarkIcon className="h-4 w-4" />}
       </span>
@@ -2779,10 +2970,13 @@ export const useBidWorkspaceController = () => {
       let nextOutline = effectiveOutline;
       batchOutlineRef.current = nextOutline;
       const pendingEntries = entries.filter(entry => !entry.item.content?.trim());
-      for (let index = 0; index < pendingEntries.length; index += 1) {
+      const concurrency = Math.min(contentConcurrencyLimit(), Math.max(1, pendingEntries.length));
+      let completedCount = 0;
+      let firstError: unknown = null;
+      const runEntry = async (entry: ChapterEntry, index: number) => {
         await waitIfGenerationPaused();
-        const entry = pendingEntries[index];
-        if (entry.item.content?.trim()) continue;
+        if (firstError) return;
+        if (entry.item.content?.trim()) return;
         setStreamingChapterId(entry.item.id);
         setActiveDocId(entry.item.id);
         updateSelectedChapter(entry.item.id);
@@ -2810,12 +3004,31 @@ export const useBidWorkspaceController = () => {
         nextOutline = { ...nextOutline, outline: updateOutlineItem(nextOutline.outline, entry.item.id, { content }) };
         batchOutlineRef.current = nextOutline;
         updateOutline(nextOutline);
-      }
+        completedCount += 1;
+        const percent = Math.min(96, 8 + Math.round((completedCount / Math.max(pendingEntries.length, 1)) * 86));
+        advanceProgress(`已完成 ${completedCount}/${pendingEntries.length} 个章节，并发 ${concurrency}`, percent, 1, taskVersion);
+        syncGenerationProgress(`已完成 ${completedCount}/${pendingEntries.length} 个章节，并发 ${concurrency}`, percent, 1, '批量生成');
+      };
+
+      const workers = Array.from({ length: concurrency }, async (_, workerIndex) => {
+        for (let index = workerIndex; index < pendingEntries.length; index += concurrency) {
+          if (firstError) return;
+          try {
+            await runEntry(pendingEntries[index], index);
+          } catch (error) {
+            firstError = error;
+            controller.abort();
+            throw error;
+          }
+        }
+      });
+      await Promise.all(workers);
       await draftStorage.flushPendingSave();
       syncGenerationProgress('批量正文生成完成', 100, 2, '批量生成');
       setGenerationProgress(prev => prev ? { ...prev, status: 'success', percent: 100, detail: '批量正文生成完成' } : prev);
       completeProgress('批量正文生成完成', taskVersion);
-      setSuccess('批量正文生成完成');
+      setSuccess('批量正文生成完成，正在执行一致性收口');
+      await runConsistencyRevision(nextOutline, true);
     } catch (error: any) {
       if (error?.name === 'AbortError' || generationStoppedRef.current) {
         failProgress('已停止批量生成', undefined, taskVersion);
@@ -3009,21 +3222,23 @@ export const useBidWorkspaceController = () => {
     }
   };
 
-  const runConsistencyRevision = async () => {
-    if (!effectiveOutline || !activeReport) {
+  const runConsistencyRevision = async (outlineOverride?: OutlineData, autoAfterBatch = false) => {
+    const targetOutline = outlineOverride || effectiveOutline;
+    if (!targetOutline || !activeReport) {
       setError('请先完成标准解析并生成目录');
       return;
     }
     setBusy('consistency');
     const taskVersion = startProgress('一致性修订', ['整理全文', '一致性检查', '生成修订报告'], '正在检查历史残留、承诺冲突和虚构风险', 12);
     try {
-      const contentById = Object.fromEntries(entries.map(entry => [entry.item.id, entry.item.content || '']));
-      const fullBidDraft = buildExportOutline(effectiveOutline.outline, contentById);
+      const targetEntries = collectEntries(targetOutline.outline);
+      const contentById = Object.fromEntries(targetEntries.map(entry => [entry.item.id, entry.item.content || '']));
+      const fullBidDraft = buildExportOutline(targetOutline.outline, contentById);
       let raw = '';
       const response = await documentApi.generateConsistencyRevisionStream({
         full_bid_draft: fullBidDraft,
         analysis_report: activeReport,
-        response_matrix: effectiveOutline.response_matrix || activeReport.response_matrix,
+        response_matrix: targetOutline.response_matrix || activeReport.response_matrix,
         reference_bid_style_profile: activeReferenceProfile,
         document_blocks_plan: displayDocumentBlocksPlan,
       });
@@ -3037,7 +3252,9 @@ export const useBidWorkspaceController = () => {
       const report = parseJsonPayload<ConsistencyRevisionReport>(raw, '全文一致性修订');
       setConsistencyReport(report);
       completeProgress('一致性修订报告完成', taskVersion);
-      setSuccess(report.ready_for_export ? '一致性检查通过' : `一致性检查完成，发现 ${report.issues?.length || 0} 项问题`);
+      setSuccess(report.ready_for_export
+        ? (autoAfterBatch ? '批量生成完成，一致性收口通过' : '一致性检查通过')
+        : `一致性检查完成，发现 ${report.issues?.length || 0} 项问题`);
     } catch (error: any) {
       failProgress(error.message || '全文一致性修订失败', undefined, taskVersion);
       setError(error.message || '全文一致性修订失败');
@@ -3176,6 +3393,37 @@ export const useBidWorkspaceController = () => {
     goToPage(item.key);
   };
 
+  const runningTaskIds = Object.values(tasks)
+    .filter(task => task.status === 'running' || task.status === 'paused')
+    .map(task => task.id);
+  const busy = legacyBusy || runningTaskIds[0] || '';
+  const isTaskRunning = (id: string) => {
+    const normalizedId = normalizeTaskId(id);
+    return tasks[normalizedId]?.status === 'running' || tasks[normalizedId]?.status === 'paused';
+  };
+  const taskCompleted = (id: string) => {
+    const normalizedId = normalizeTaskId(id);
+    if (tasks[normalizedId]?.status === 'success') return true;
+    if (normalizedId === 'upload_text') return Boolean(state.fileContent);
+    if (normalizedId === 'source_preview') return Boolean(hasSourcePreviewHtml || state.sourcePreviewPages?.length);
+    if (normalizedId === 'history_match') return Boolean(hasReferenceProfile);
+    if (normalizedId === 'analysis') return Boolean(activeReport);
+    if (normalizedId === 'outline') return Boolean(effectiveOutline);
+    if (normalizedId === 'document_blocks') return Boolean(Object.keys(documentBlocksPlan || {}).length);
+    if (normalizedId === 'batch') return Boolean(effectiveOutline && entries.length > 0 && completedLeaves >= entries.length);
+    if (normalizedId === 'review') return Boolean(reviewReport);
+    if (normalizedId === 'consistency') return Boolean(consistencyReport);
+    return false;
+  };
+  const taskDag = Object.entries(TASK_DAG).map(([id, dependsOn]) => ({
+    id,
+    label: taskLabel(id),
+    dependsOn,
+    status: tasks[id]?.status || (dependsOn.some(dep => !taskCompleted(dep)) ? 'blocked' : taskCompleted(id) ? 'success' : 'idle'),
+    detail: tasks[id]?.detail || '',
+    error: tasks[id]?.error || '',
+  }));
+
   const workflowStatus = (key: NavKey) => {
     if (busy === 'upload' && key === 'project') return `${progress?.percent ?? 0}%`;
     if (busy === 'analysis' && key === 'analysis') return `${progress?.percent ?? 0}%`;
@@ -3246,6 +3494,7 @@ export const useBidWorkspaceController = () => {
     activeResponseMatrix,
     activeScoringRows,
     activeSourceLabel,
+    activeSourceLineHighlightIndex,
     activeSourceLineIndex,
     activeSourceQuery,
     activeVisualAssets,
@@ -3371,6 +3620,7 @@ export const useBidWorkspaceController = () => {
     isPlaceholderOutlineChild,
     isRepeatedThirdLevelGroup,
     isScoringParseTab,
+    isTaskRunning,
     isUsableReferenceProfile,
     lineOrMissing,
     linesOrMissing,
@@ -3513,6 +3763,7 @@ export const useBidWorkspaceController = () => {
     sourceLocateResult,
     sourcePanelStatusText,
     sourcePreviewBlocks,
+    sourcePreviewHtmlWithLocateHighlight,
     sourcePreviewPages,
     sourceSearchTokens,
     sourceSearchTokensForLocate,
@@ -3536,6 +3787,8 @@ export const useBidWorkspaceController = () => {
     tenderParseReady,
     tenderParseTabs,
     tenderRevealVisible,
+    taskDag,
+    tasks,
     THIRD_LEVEL_TITLE_CATALOG,
     thirdLevelPattern,
     toggleHistoryPanel,

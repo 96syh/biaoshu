@@ -11,6 +11,7 @@ from ...utils.json_util import check_json, extract_json_string
 from ...models.schemas import AnalysisReport, ResponseMatrix, ReviewReport
 from ..enterprise_material_service import EnterpriseMaterialService
 from ..fallback_generation import FallbackGenerationMixin
+from ..generation_cache_service import GenerationCacheService
 
 
 class ReferenceProfileGenerationMixin:
@@ -160,6 +161,19 @@ class ReferenceProfileGenerationMixin:
                 f"{len(str(reference_bid_text or ''))} -> {len(reference_input)} 字符",
                 flush=True,
             )
+        cache_key = GenerationCacheService.build_key(
+            "reference_profile",
+            self.model_name,
+            {
+                "reference_input": reference_input,
+                "max_tokens": max_tokens,
+                "include_schema": self._include_schema_in_prompt(),
+            },
+        )
+        cached_profile = GenerationCacheService.get("reference_profile", cache_key)
+        if isinstance(cached_profile, dict):
+            self._validate_reference_profile(cached_profile)
+            return cached_profile
 
         system_prompt, user_prompt = prompt_manager.generate_reference_bid_style_profile_prompt(
             reference_input,
@@ -184,6 +198,7 @@ class ReferenceProfileGenerationMixin:
             )
             profile = self._normalize_reference_profile_payload(content)
             self._validate_reference_profile(profile)
+            GenerationCacheService.set("reference_profile", cache_key, profile)
             return profile
         except asyncio.TimeoutError as e:
             raise Exception(

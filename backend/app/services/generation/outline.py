@@ -11,6 +11,7 @@ from ...utils.json_util import check_json, extract_json_string
 from ...models.schemas import AnalysisReport, ResponseMatrix, ReviewReport
 from ..enterprise_material_service import EnterpriseMaterialService
 from ..fallback_generation import FallbackGenerationMixin
+from ..generation_cache_service import GenerationCacheService
 
 
 class OutlineGenerationMixin:
@@ -330,6 +331,82 @@ class OutlineGenerationMixin:
         node["children"] = cleaned_children
         return node
 
+    @staticmethod
+    def _is_technical_scheme_node(node: Dict[str, Any]) -> bool:
+        """识别整本投标文件中的技术标/方案类章节包装节点。"""
+        title = str(node.get("title") or node.get("new_title") or node.get("rating_item") or "")
+        chapter_type = str(node.get("chapter_type") or "")
+        volume_id = str(node.get("volume_id") or "")
+        return bool(
+            volume_id == "V-TECH"
+            or chapter_type in {"technical", "service_plan", "design_plan", "construction_plan", "goods_supply"}
+            or re.search(r"技术标|技术部分|服务方案|设计方案|技术方案|实施方案|施工组织设计|供货方案|售后服务方案", title)
+        )
+
+    @classmethod
+    def _apply_scheme_outline_guard(
+        cls,
+        level_l1: list[dict[str, Any]],
+        report: Dict[str, Any],
+        bid_mode: str,
+    ) -> tuple[list[dict[str, Any]], bool, str]:
+        """把招标文件明确列出的技术/方案章节作为目录硬约束。"""
+        scheme_nodes = FallbackGenerationMixin._build_scheme_outline_nodes(report, report.get("response_matrix"))
+        if len(scheme_nodes) < 2:
+            return level_l1, False, ""
+
+        if bid_mode != "full_bid":
+            return scheme_nodes, True, "已按招标文件技术/方案规定章节重建一级目录"
+
+        guarded: list[dict[str, Any]] = []
+        applied = False
+        for node in level_l1:
+            current = dict(node or {})
+            if not applied and cls._is_technical_scheme_node(current):
+                parent_id = str(current.get("id") or len(guarded) + 1)
+                current["children"] = [
+                    {
+                        **dict(child),
+                        "id": f"{parent_id}.{index}",
+                        "volume_id": current.get("volume_id") or child.get("volume_id") or "V-TECH",
+                        "chapter_type": child.get("chapter_type") or current.get("chapter_type") or "service_plan",
+                        "children": [],
+                    }
+                    for index, child in enumerate(scheme_nodes, start=1)
+                ]
+                current.setdefault("description", "按招标文件技术标/方案规定章节组织。")
+                applied = True
+            guarded.append(current)
+
+        if not applied:
+            guarded.append({
+                "id": str(len(guarded) + 1),
+                "title": "技术标",
+                "description": "按招标文件技术标/方案规定章节组织。",
+                "volume_id": "V-TECH",
+                "chapter_type": "technical",
+                "source_type": "selected_generation_target",
+                "fixed_format_sensitive": False,
+                "price_sensitive": False,
+                "anonymity_sensitive": False,
+                "expected_word_count": 0,
+                "expected_depth": "medium",
+                "expected_blocks": ["paragraph"],
+                "enterprise_required": False,
+                "asset_required": False,
+                "scoring_item_ids": [],
+                "requirement_ids": [],
+                "risk_ids": [],
+                "material_ids": [],
+                "response_matrix_ids": [],
+                "children": [
+                    {**dict(child), "id": f"{len(guarded) + 1}.{index}", "children": []}
+                    for index, child in enumerate(scheme_nodes, start=1)
+                ],
+            })
+
+        return guarded, True, "已把招标文件技术/方案规定章节挂到技术标目录下"
+
     @classmethod
     def _normalize_outline_node(
         cls,
@@ -507,6 +584,22 @@ class OutlineGenerationMixin:
         blocks_plan = document_blocks_plan or report.get("document_blocks_plan") or {}
         effective_bid_mode = bid_mode or report.get("bid_mode_recommendation") or "technical_only"
 
+        cache_key = GenerationCacheService.build_key(
+            "outline",
+            self.model_name,
+            {
+                "overview": overview,
+                "requirements": requirements,
+                "report": report,
+                "bid_mode": effective_bid_mode,
+                "style_profile": style_profile,
+                "blocks_plan": blocks_plan,
+            },
+        )
+        cached_outline = GenerationCacheService.get("outline", cache_key)
+        if isinstance(cached_outline, dict):
+            return cached_outline
+
         if self._force_local_fallback():
             fallback = self._fallback_outline(report, effective_bid_mode)
             fallback.setdefault("document_blocks_plan", blocks_plan or {"document_blocks": [], "missing_assets": [], "missing_enterprise_data": []})
@@ -596,18 +689,15 @@ class OutlineGenerationMixin:
             for index, node in enumerate(level_l1, start=1)
         ]
 
-        # 技术/服务分册下，“服务方案/设计方案”只是生成对象；如果解析到了
-        # “应包括”的子项，必须把这些子项作为一级目录，避免模型只返回包装标题。
-        if effective_bid_mode != "full_bid":
-            scheme_nodes = self._build_scheme_outline_nodes(report, report.get("response_matrix"))
-            if len(scheme_nodes) >= 2:
-                level_l1 = scheme_nodes
-                if progress_callback:
-                    await progress_callback({
-                        "stage": "outline_guard",
-                        "message": "已按招标文件服务纲要子项重建一级目录",
-                        "outline": level_l1,
-                    })
+        # “服务方案/设计方案/技术标”可能只是包装节点；如果解析到了
+        # 招标文件列明的应包括章节，必须作为硬约束压过模型和通用模板。
+        level_l1, guarded, guard_message = self._apply_scheme_outline_guard(level_l1, report, effective_bid_mode)
+        if guarded and progress_callback:
+            await progress_callback({
+                "stage": "outline_guard",
+                "message": guard_message,
+                "outline": level_l1,
+            })
 
         nodes_distribution = self._build_nodes_distribution(level_l1, report, effective_bid_mode)
         outline_concurrency = max(1, self._int_env("YIBIAO_OUTLINE_CONCURRENCY", 2))
@@ -647,13 +737,15 @@ class OutlineGenerationMixin:
                 blocks_plan = {"document_blocks": [], "missing_assets": [], "missing_enterprise_data": []}
         elif not blocks_plan:
             blocks_plan = {"document_blocks": [], "missing_assets": [], "missing_enterprise_data": []}
-        return {
+        result = {
             "outline": outline,
             "response_matrix": report.get("response_matrix"),
             "coverage_summary": (report.get("response_matrix") or {}).get("coverage_summary", ""),
             "reference_bid_style_profile": style_profile,
             "document_blocks_plan": blocks_plan,
         }
+        GenerationCacheService.set("outline", cache_key, result)
+        return result
 
     async def process_level1_node(
         self,

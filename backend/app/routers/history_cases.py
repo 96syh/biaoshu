@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict
 
@@ -10,9 +11,11 @@ from pydantic import BaseModel, Field
 
 from ..services.openai_service import OpenAIService
 from ..services.history_case_service import HistoryCaseService
+from ..services.generation_cache_service import GenerationCacheService
 from ..utils.config_manager import config_manager
 from ..utils.json_util import extract_json_string
 from ..utils.provider_registry import get_provider_auth_error
+from ..utils import prompt_manager
 
 
 router = APIRouter(prefix="/api/history-cases", tags=["历史标书案例库"])
@@ -122,6 +125,15 @@ async def check_history_case_requirements(request: RequirementCheckRequest):
 @router.post("/match-reference")
 async def match_reference_case(request: ReferenceMatchRequest):
     """根据当前招标文件自动匹配历史成熟案例，并生成可复用样例风格剖面。"""
+    cache_key = GenerationCacheService.build_key(
+        "history_reference_match",
+        str(config_manager.load_config().get("model_name", "")),
+        request.model_dump(mode="json"),
+    )
+    cached = GenerationCacheService.get("history_reference_match", cache_key)
+    if isinstance(cached, dict):
+        return cached
+
     candidates = HistoryCaseService.match_candidates(
         tender_text=request.file_content,
         analysis_report=request.analysis_report,
@@ -140,29 +152,26 @@ async def match_reference_case(request: ReferenceMatchRequest):
         config = config_manager.load_config()
         auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
         if auth_error:
-            return {
-                "success": False,
-                "message": auth_error,
-                "candidates": candidates,
-            }
-        try:
-            selected_id, llm_reason = await _select_reference_candidate_with_llm(
-                request.file_content,
-                request.analysis_report,
-                candidates,
-            )
-            selected = next((item for item in candidates if item.get("project_id") == selected_id), selected)
-            guarded_selected, guard_reason = HistoryCaseService.validate_reference_selection(
-                selected,
-                candidates,
-                request.file_content,
-                request.analysis_report,
-            )
-            if guard_reason:
-                selected = guarded_selected
-                llm_reason = f"{llm_reason}；{guard_reason}" if llm_reason else guard_reason
-        except Exception as exc:
-            llm_reason = f"LLM 选择失败，已使用规则得分最高候选：{str(exc)}"
+            llm_reason = f"LLM 选择跳过，已使用规则得分最高候选：{auth_error}"
+        else:
+            try:
+                selected_id, llm_reason = await _select_reference_candidate_with_llm(
+                    request.file_content,
+                    request.analysis_report,
+                    candidates,
+                )
+                selected = next((item for item in candidates if item.get("project_id") == selected_id), selected)
+                guarded_selected, guard_reason = HistoryCaseService.validate_reference_selection(
+                    selected,
+                    candidates,
+                    request.file_content,
+                    request.analysis_report,
+                )
+                if guard_reason:
+                    selected = guarded_selected
+                    llm_reason = f"{llm_reason}；{guard_reason}" if llm_reason else guard_reason
+            except Exception as exc:
+                llm_reason = f"LLM 选择失败，已使用规则得分最高候选：{str(exc)}"
 
     markdown = HistoryCaseService.load_markdown(str(selected.get("markdown_path") or ""))
     if not markdown:
@@ -176,13 +185,9 @@ async def match_reference_case(request: ReferenceMatchRequest):
     try:
         profile = await OpenAIService().generate_reference_bid_style_profile(markdown)
     except Exception as exc:
-        return {
-            "success": False,
-            "message": f"已匹配历史案例，但生成成熟样例剖面失败：{str(exc)}",
-            "matched_case": selected,
-            "candidates": candidates,
-            "llm_reason": llm_reason,
-        }
+        profile = _build_rule_based_reference_profile(markdown, selected, str(exc))
+        warning = f"成熟样例剖面模型生成失败，已使用规则模板：{str(exc)}"
+        llm_reason = f"{llm_reason}；{warning}" if llm_reason else warning
 
     profile.setdefault("source_history_case", {
         "project_id": selected.get("project_id"),
@@ -193,7 +198,7 @@ async def match_reference_case(request: ReferenceMatchRequest):
         "pageindex_tree_path": selected.get("pageindex_tree_path"),
     })
 
-    return {
+    result = {
         "success": True,
         "message": f"已自动匹配历史案例：{selected.get('project_title')}",
         "matched_case": selected,
@@ -201,6 +206,102 @@ async def match_reference_case(request: ReferenceMatchRequest):
         "llm_reason": llm_reason,
         "reference_bid_style_profile": profile,
     }
+    GenerationCacheService.set("history_reference_match", cache_key, result)
+    return result
+
+
+def _build_rule_based_reference_profile(markdown: str, selected: Dict[str, Any], failure_reason: str = "") -> Dict[str, Any]:
+    """Build a minimal usable profile when the model cannot parse the matched case."""
+    profile = json.loads(json.dumps(prompt_manager.get_reference_bid_style_profile_schema(), ensure_ascii=False))
+    headings: list[dict[str, Any]] = []
+    for raw in str(markdown or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        markdown_heading = re.match(r"^(#{1,3})\s+(.{2,80})$", line)
+        numbered_heading = re.match(
+            r"^((?:第[一二三四五六七八九十百\d]+[章节篇部分])|(?:[一二三四五六七八九十]+[、.．])|(?:\d+(?:\.\d+){0,2}[、.．]))\s*(.{2,70})$",
+            line,
+        )
+        if markdown_heading:
+            level = len(markdown_heading.group(1))
+            title = markdown_heading.group(2).strip()
+        elif numbered_heading:
+            level = 1 if numbered_heading.group(1).startswith("第") else 2
+            title = re.sub(r"^\d+(?:\.\d+){0,2}[、.．]\s*", "", line).strip()
+            title = re.sub(r"^[一二三四五六七八九十]+[、.．]\s*", "", title).strip()
+        else:
+            continue
+        if title and not any(item["title"] == title for item in headings):
+            headings.append({"title": title, "level": max(1, min(3, level))})
+        if len(headings) >= 12:
+            break
+
+    if not headings:
+        headings = [{"title": str(selected.get("project_title") or "历史案例写作模板"), "level": 1}]
+
+    profile["profile_name"] = "历史案例库规则匹配模板"
+    profile["document_scope"] = "technical_service_plan"
+    profile["recommended_use_case"] = "模型模板解析不可用时，作为目录结构和正文风格的保守参考"
+    profile["template_intent"] = {
+        "how_to_use": "仅迁移历史案例的目录层级、章节功能和版式习惯；所有事实必须重新映射到当前招标文件和企业资料。",
+        "reuse_boundaries": ["不得照抄历史项目名称、人员、业绩、日期、金额和承诺时限"],
+        "must_map_from_tender": ["项目名称", "服务范围", "服务期限", "评分标准", "投标文件格式"],
+        "must_map_from_enterprise": ["企业资质", "人员", "业绩", "证书", "图片/附件"],
+        "must_keep_as_placeholder": ["缺失企业资料", "缺失图片素材", "最终页码"],
+    }
+    profile["outline_template"] = [
+        {
+            "id": str(index),
+            "title": item["title"],
+            "level": item["level"],
+            "children": [],
+            "source_type": "profile_expansion",
+            "scoring_purpose": "参考历史案例章节功能，当前项目需按招标文件重新映射",
+            "expected_depth": "medium",
+            "tables_required": [],
+            "image_slots": [],
+            "enterprise_required": False,
+            "asset_required": False,
+        }
+        for index, item in enumerate(headings[:10], 1)
+    ]
+    profile["chapter_blueprints"] = [
+        {
+            "chapter_title": item["title"],
+            "applies_when": ["当前招标文件存在同类技术/服务方案要求时使用"],
+            "writing_function": "响应招标要求",
+            "recommended_structure": ["目标与依据", "实施措施", "质量/进度/风险控制", "成果与承诺"],
+            "paragraph_blueprint": [
+                {
+                    "purpose": "说明本节如何响应当前招标文件要求",
+                    "opening_pattern": "围绕{{项目名称}}和{{服务范围}}，说明我公司的响应目标和实施原则。",
+                    "content_slots": ["{{招标要求}}", "{{评分项}}", "{{企业资料或占位}}"],
+                    "closing_rule": "缺失事实使用占位符，不继承历史案例具体值。",
+                }
+            ],
+            "tender_fact_slots": ["项目名称", "服务范围", "服务期限", "质量要求", "评分标准"],
+            "enterprise_fact_slots": ["企业资质", "人员配置", "同类业绩", "证书/附件"],
+            "tables_to_insert": [],
+            "assets_to_insert": [],
+            "do_not_copy": ["历史项目名称", "历史投标人", "历史人员", "历史业绩", "历史日期", "历史金额"],
+        }
+        for item in headings[:6]
+    ]
+    profile["quality_risks"] = [
+        {
+            "risk": "规则兜底模板未经过模型深度反向建模",
+            "location": str(selected.get("project_title") or ""),
+            "fix_rule": "生成目录和正文时只参考章节结构，必须以当前招标文件解析结果为最高依据。",
+        }
+    ]
+    if failure_reason:
+        profile["quality_risks"].append({
+            "risk": "模型样例剖面生成失败",
+            "location": "history-case-match",
+            "fix_rule": failure_reason[:300],
+        })
+    return profile
 
 
 async def _select_reference_candidate_with_llm(

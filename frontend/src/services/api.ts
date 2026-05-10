@@ -78,6 +78,8 @@ export interface FileUploadResponse {
   success: boolean;
   message: string;
   file_content?: string;
+  source_preview_id?: string;
+  source_preview_status?: 'pending' | 'ready' | 'unavailable' | string;
   source_preview_html?: string;
   source_preview_pages?: SourceRenderedPreviewPage[];
   old_outline?: string;
@@ -327,6 +329,22 @@ export const documentApi = {
       timeout: 600000,
     });
   },
+
+  uploadFileText: (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post<FileUploadResponse>('/api/document/upload-text', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+      timeout: 600000,
+    });
+  },
+
+  getSourcePreview: (sourcePreviewId: string) =>
+    api.get<FileUploadResponse>(`/api/document/source-preview/${encodeURIComponent(sourcePreviewId)}`, {
+      timeout: 600000,
+    }),
 
   // 上传成熟投标文件样例并生成风格剖面
   uploadReferenceStyleFile: (file: File) => {

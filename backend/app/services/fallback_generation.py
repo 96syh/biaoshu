@@ -1155,6 +1155,46 @@ class FallbackGenerationMixin:
         target_title = FallbackGenerationMixin._clean_outline_requirement_title(selected_target.get("target_title"))
         raw_items = list(selected_target.get("base_outline_items") or [])
         raw_items.extend(list(bid_doc.get("scheme_or_technical_outline_requirements") or []))
+
+        composition = bid_doc.get("composition") or []
+        selected_ids = {
+            str(value or "")
+            for value in (
+                selected_target.get("target_id"),
+                selected_target.get("parent_composition_id"),
+            )
+            if value
+        }
+
+        def is_target_composition(item: dict[str, Any]) -> bool:
+            title = FallbackGenerationMixin._clean_outline_requirement_title(item.get("title"))
+            return bool(
+                (item.get("id") and str(item.get("id")) in selected_ids)
+                or item.get("volume_id") == "V-TECH"
+                or item.get("chapter_type") in {"technical", "service_plan", "design_plan", "construction_plan", "goods_supply"}
+                or re.search(r"技术标|技术部分|服务方案|设计方案|技术方案|实施方案|施工组织设计|供货方案|售后服务方案", title)
+            )
+
+        for comp_item in (composition if isinstance(composition, list) else []):
+            if not isinstance(comp_item, dict) or not is_target_composition(comp_item):
+                continue
+            for child in comp_item.get("children") or []:
+                if not isinstance(child, dict):
+                    continue
+                title = FallbackGenerationMixin._clean_outline_requirement_title(child.get("title"))
+                if not title:
+                    continue
+                raw_items.append({
+                    **child,
+                    "id": child.get("id") or f"{comp_item.get('id') or 'BD-TECH'}-CH-{len(raw_items) + 1:02d}",
+                    "order": child.get("order") or len(raw_items) + 1,
+                    "title": title,
+                    "parent_title": comp_item.get("title") or target_title or "技术标",
+                    "source_ref": child.get("source_ref") or comp_item.get("source_ref") or "",
+                    "derived_from": "composition_children",
+                    "must_preserve_title": True,
+                })
+
         raw_titles = [
             FallbackGenerationMixin._clean_outline_requirement_title((raw_item or {}).get("title"))
             for raw_item in raw_items

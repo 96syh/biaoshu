@@ -53,6 +53,8 @@ class BackendContractImportTests(unittest.TestCase):
         paths = {route.path for route in main.app.routes}
 
         self.assertIn("/api/document/upload", paths)
+        self.assertIn("/api/document/upload-text", paths)
+        self.assertIn("/api/document/source-preview/{source_preview_id}", paths)
         self.assertIn("/api/outline/generate", paths)
         self.assertIn("/api/projects", paths)
         self.assertFalse(any(path.startswith("/api/search") for path in paths))
@@ -61,12 +63,175 @@ class BackendContractImportTests(unittest.TestCase):
 
     def test_runtime_data_defaults_to_artifacts(self):
         from backend.app.services.file_service import FileService
+        from backend.app.services.generation_cache_service import GenerationCacheService
         from backend.app.services.history_case_service import HistoryCaseService
         from backend.app.services.project_service import ProjectService
 
         self.assertIn("artifacts/data/generated_assets", str(FileService.GENERATED_ASSET_DIR))
+        self.assertIn("artifacts/data/generation_cache", str(GenerationCacheService.CACHE_DIR))
         self.assertIn("artifacts/data/history_cases.sqlite3", str(HistoryCaseService.DB_PATH))
         self.assertIn("artifacts/data/projects.sqlite3", str(ProjectService.DB_PATH))
+
+    def test_model_gateway_concurrency_env_has_safe_floor(self):
+        from backend.app.services.model_gateway_service import ModelGatewayService
+
+        original_value = os.environ.get("YIBIAO_MODEL_CONCURRENCY")
+        try:
+            os.environ["YIBIAO_MODEL_CONCURRENCY"] = "0"
+            self.assertEqual(ModelGatewayService._model_concurrency_limit(), 1)
+            os.environ["YIBIAO_MODEL_CONCURRENCY"] = "3"
+            self.assertEqual(ModelGatewayService._model_concurrency_limit(), 3)
+        finally:
+            if original_value is None:
+                os.environ.pop("YIBIAO_MODEL_CONCURRENCY", None)
+            else:
+                os.environ["YIBIAO_MODEL_CONCURRENCY"] = original_value
+
+    def test_generation_cache_round_trip(self):
+        from backend.app.services.generation_cache_service import GenerationCacheService
+
+        original_dir = GenerationCacheService.CACHE_DIR
+        original_enabled = os.environ.get("YIBIAO_ENABLE_GENERATION_CACHE")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            GenerationCacheService.CACHE_DIR = Path(temp_dir)
+            os.environ["YIBIAO_ENABLE_GENERATION_CACHE"] = "1"
+            try:
+                key = GenerationCacheService.build_key("analysis", "model-a", {"x": 1})
+                self.assertIsNone(GenerationCacheService.get("analysis", key))
+                GenerationCacheService.set("analysis", key, {"ok": True})
+                self.assertEqual(GenerationCacheService.get("analysis", key), {"ok": True})
+            finally:
+                GenerationCacheService.CACHE_DIR = original_dir
+                if original_enabled is None:
+                    os.environ.pop("YIBIAO_ENABLE_GENERATION_CACHE", None)
+                else:
+                    os.environ["YIBIAO_ENABLE_GENERATION_CACHE"] = original_enabled
+
+    def test_scheme_outline_items_include_technical_composition_children(self):
+        from backend.app.services.fallback_generation import FallbackGenerationMixin
+
+        report = {
+            "bid_document_requirements": {
+                "composition": [
+                    {
+                        "id": "BD-TECH",
+                        "title": "技术标",
+                        "volume_id": "V-TECH",
+                        "chapter_type": "technical",
+                        "source_ref": "BD-SRC-01",
+                        "children": [
+                            {"id": "BD-TECH-01", "order": 1, "title": "服务范围"},
+                            {"id": "BD-TECH-02", "order": 2, "title": "服务内容"},
+                            {"id": "BD-TECH-03", "order": 3, "title": "质量承诺及措施"},
+                        ],
+                    }
+                ],
+                "selected_generation_target": {
+                    "target_id": "BD-TECH",
+                    "target_title": "技术标",
+                    "parent_composition_id": "BD-TECH",
+                    "base_outline_items": [],
+                },
+                "scheme_or_technical_outline_requirements": [],
+            }
+        }
+
+        titles = [item["title"] for item in FallbackGenerationMixin._collect_scheme_outline_items(report)]
+
+        self.assertEqual(titles[:3], ["服务范围", "服务内容", "质量承诺及措施"])
+
+    def test_outline_guard_uses_tender_required_technical_chapters(self):
+        from backend.app.services.generation.outline import OutlineGenerationMixin
+
+        report = {
+            "bid_document_requirements": {
+                "composition": [
+                    {
+                        "id": "BD-TECH",
+                        "title": "技术标",
+                        "volume_id": "V-TECH",
+                        "chapter_type": "technical",
+                        "children": [
+                            {"id": "BD-TECH-01", "order": 1, "title": "服务范围"},
+                            {"id": "BD-TECH-02", "order": 2, "title": "服务内容"},
+                        ],
+                    }
+                ],
+                "selected_generation_target": {
+                    "target_id": "BD-TECH",
+                    "target_title": "技术标",
+                    "parent_composition_id": "BD-TECH",
+                    "base_outline_items": [],
+                },
+                "scheme_or_technical_outline_requirements": [],
+            },
+            "response_matrix": {"items": []},
+        }
+
+        tech_only_outline, changed, _ = OutlineGenerationMixin._apply_scheme_outline_guard(
+            [{"id": "1", "title": "通用实施方案", "children": []}],
+            report,
+            "technical_only",
+        )
+        self.assertTrue(changed)
+        self.assertEqual([item["title"] for item in tech_only_outline], ["服务范围", "服务内容"])
+
+        full_bid_outline, changed, _ = OutlineGenerationMixin._apply_scheme_outline_guard(
+            [{"id": "1", "title": "商务标"}, {"id": "2", "title": "技术标", "volume_id": "V-TECH"}],
+            report,
+            "full_bid",
+        )
+        self.assertTrue(changed)
+        self.assertEqual([item["title"] for item in full_bid_outline[1]["children"]], ["服务范围", "服务内容"])
+
+    def test_docx_html_preview_defaults_to_enabled_for_source_location(self):
+        from backend.app.services.file_service import FileService
+
+        original_value = os.environ.pop("YIBIAO_ENABLE_DOCX_HTML_PREVIEW", None)
+        try:
+            self.assertTrue(FileService.docx_html_preview_enabled())
+            os.environ["YIBIAO_ENABLE_DOCX_HTML_PREVIEW"] = "0"
+            self.assertFalse(FileService.docx_html_preview_enabled())
+        finally:
+            if original_value is not None:
+                os.environ["YIBIAO_ENABLE_DOCX_HTML_PREVIEW"] = original_value
+            else:
+                os.environ.pop("YIBIAO_ENABLE_DOCX_HTML_PREVIEW", None)
+
+    def test_source_preview_saved_upload_path_stays_under_upload_dir(self):
+        from backend.app.config import settings
+        from backend.app.services.file_service import FileService
+
+        original_upload_dir = settings.upload_dir
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings.upload_dir = temp_dir
+            safe_path = Path(temp_dir) / "sample.docx"
+            safe_path.write_text("placeholder", encoding="utf-8")
+            try:
+                self.assertEqual(FileService._resolve_saved_upload_path("sample.docx"), str(safe_path.resolve()))
+                with self.assertRaises(Exception):
+                    FileService._resolve_saved_upload_path("../sample.docx")
+            finally:
+                settings.upload_dir = original_upload_dir
+
+    def test_empty_docx_preview_html_is_not_treated_as_renderable(self):
+        from backend.app.services.file_service import FileService
+
+        self.assertFalse(FileService.source_preview_html_has_text('<div class="docx-source-preview"><p>&nbsp;</p></div>'))
+        self.assertTrue(FileService.source_preview_html_has_text('<div class="docx-source-preview"><p>服务质量保证</p></div>'))
+
+    def test_docx_line_spacing_conversion_does_not_emit_raw_emu_values(self):
+        from backend.app.services.file_service import FileService
+
+        class EmuLength:
+            pt = 22
+
+            def __float__(self):
+                return 279400.0
+
+        self.assertEqual(FileService._line_spacing_to_css(EmuLength()), "22.0pt")
+        self.assertEqual(FileService._line_spacing_to_css(1.5), "1.50")
+        self.assertEqual(FileService._line_spacing_to_css(279400), "")
 
     def test_history_case_legacy_artifact_paths_resolve_to_artifacts(self):
         from backend.app.services.history_case_service import HistoryCaseService
@@ -192,6 +357,20 @@ class BackendContractImportTests(unittest.TestCase):
                 self.assertEqual(scores.get("p1"), scores.get("p2"))
             finally:
                 HistoryCaseService.DB_PATH = original_db_path
+
+    def test_history_reference_rule_based_profile_is_usable(self):
+        from backend.app.routers.history_cases import _build_rule_based_reference_profile
+
+        profile = _build_rule_based_reference_profile(
+            "# 技术标\n\n## 服务方案\n\n### 质量保证措施\n正文",
+            {"project_title": "历史油库设计案例"},
+            "model unavailable",
+        )
+
+        self.assertEqual(profile["profile_name"], "历史案例库规则匹配模板")
+        self.assertTrue(profile["outline_template"])
+        self.assertTrue(profile["chapter_blueprints"])
+        self.assertIn("model unavailable", profile["quality_risks"][-1]["fix_rule"])
 
 
 if __name__ == "__main__":
