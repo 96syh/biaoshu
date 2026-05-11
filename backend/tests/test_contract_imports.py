@@ -535,6 +535,35 @@ class BackendContractImportTests(unittest.TestCase):
         self.assertNotIn("base64,abcdef", payload)
         self.assertNotIn("| 序号 | 姓名 |", compact["reference_text"])
 
+    def test_history_text_reference_excludes_table_blocks_from_plain_content(self):
+        from backend.app.services.openai_service import OpenAIService
+        from backend.app.services.history_case_service import HistoryCaseService
+
+        blocks = [
+            {
+                "id": "p-1",
+                "type": "paragraph",
+                "text": "包括工艺、结构、建筑、管道、设备、电气、仪表、电信、给排水、暖通等专业设计及现场技术服务。",
+                "markdown": "包括工艺、结构、建筑、管道、设备、电气、仪表、电信、给排水、暖通等专业设计及现场技术服务。",
+                "html": "<p>包括工艺、结构、建筑、管道、设备、电气、仪表、电信、给排水、暖通等专业设计及现场技术服务。</p>",
+            },
+            {
+                "id": "t-1",
+                "type": "table",
+                "text": "服务阶段 主要工作 输入资料 输出成果 配合对象 注意事项 任务接收与启动 接收招标人委托任务",
+                "markdown": "服务阶段 主要工作 输入资料 输出成果 配合对象 注意事项 任务接收与启动 接收招标人委托任务",
+                "html": "<table><tr><th>服务阶段</th><th>主要工作</th></tr><tr><td>任务接收与启动</td><td>接收招标人委托任务</td></tr></table>",
+            },
+        ]
+
+        plain_content = OpenAIService._history_text_reference_from_blocks(blocks)
+        html_content = HistoryCaseService._blocks_to_html(blocks)
+
+        self.assertIn("包括工艺", plain_content)
+        self.assertNotIn("服务阶段 主要工作 输入资料", plain_content)
+        self.assertIn("<table", html_content)
+        self.assertIn("任务接收与启动", html_content)
+
     def test_history_word_blocks_reuse_media_except_blind_bid_sensitive_blocks(self):
         from backend.app.services.openai_service import OpenAIService
 

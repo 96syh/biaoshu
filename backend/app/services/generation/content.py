@@ -492,10 +492,13 @@ class ContentGenerationMixin:
             )
             patched_blocks = self._apply_history_patch_to_blocks(reusable_blocks, operations)
             patched_blocks = self._strip_history_heading_blocks_from_content(patched_blocks)
-            markdown = HistoryCaseService._blocks_to_markdown(patched_blocks)
+            markdown = self._history_text_reference_from_blocks(patched_blocks)
             html_content = HistoryCaseService._blocks_to_html(patched_blocks)
+            if not markdown.strip() and html_content.strip():
+                markdown = "详见本节保留的历史 Word 表格、图片或附件内容。"
         else:
             markdown = self._apply_history_patch_operations(source_markdown, operations, html_mode=False)
+            markdown = HistoryCaseService._strip_non_text_markdown_from_reference(markdown)
             markdown = self._strip_generated_markdown_headings(markdown)
             html_content = source_html or self._history_markdown_to_basic_html(source_markdown)
             html_content = self._apply_history_patch_operations(html_content, operations, html_mode=True)
