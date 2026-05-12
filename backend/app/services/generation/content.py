@@ -16,6 +16,31 @@ from ..history_case_service import HistoryCaseService
 
 
 class ContentGenerationMixin:
+    @staticmethod
+    def _single_line_text(value: Any, max_chars: int = 120) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(text) <= max_chars:
+            return text
+        return f"{text[:max_chars].rstrip()}..."
+
+    @classmethod
+    def _history_reference_log_name(cls, draft: Dict[str, Any] | None) -> str:
+        if not isinstance(draft, dict):
+            return "未命名历史记录"
+        for key in ("file_name", "project_title", "matched_term", "document_id"):
+            value = cls._single_line_text(draft.get(key))
+            if value:
+                return value
+        matched_blocks = draft.get("matched_blocks") if isinstance(draft.get("matched_blocks"), list) else []
+        for block in matched_blocks:
+            if not isinstance(block, dict):
+                continue
+            for key in ("title", "caption_text", "id"):
+                value = cls._single_line_text(block.get(key))
+                if value:
+                    return value
+        return "未命名历史记录"
+
     async def generate_content_for_outline(
         self,
         outline: Dict[str, Any],
@@ -154,6 +179,8 @@ class ContentGenerationMixin:
             primary_history_draft = self._select_primary_history_draft(effective_history_reference_drafts)
             if primary_history_draft:
                 try:
+                    history_name = self._history_reference_log_name(primary_history_draft)
+                    print(f"当前章节正在复用历史记录{history_name}")
                     markdown, html_content, operations = await self._generate_patch_based_chapter_content(
                         chapter=chapter,
                         parent_chapters=parent_chapters or [],
@@ -199,6 +226,7 @@ class ContentGenerationMixin:
                 {"role": "user", "content": user_prompt},
             ]
             try:
+                print("当前章节正在自主生成内容")
                 async for chunk in self.stream_chat_completion(messages, temperature=0.35):
                     yield chunk
             except Exception as e:

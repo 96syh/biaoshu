@@ -165,6 +165,27 @@ def parse_project_folder(parent_name: str, project_path: Path) -> HistoricalProj
     )
 
 
+def parse_standalone_document(document_path: Path) -> HistoricalProject:
+    """Treat a standalone historical document as a one-document project."""
+    raw_name = document_path.stem.strip()
+    year_match = re.search(r"(20\d{2})", raw_name)
+    year = year_match.group(1) if year_match else ""
+    result = "、".join([item for item in RESULT_TAGS if item in raw_name]) or "未标明"
+    subject = "补充入库"
+    title = raw_name or document_path.name
+    return HistoricalProject(
+        project_id=stable_id("case", str(document_path.resolve())),
+        year=year,
+        batch="补充入库",
+        sequence="standalone",
+        result=result,
+        subject=subject,
+        title=title,
+        folder_name=document_path.name,
+        source_path=document_path.resolve(),
+    )
+
+
 def iter_historical_projects(history_root: Path, winning_only: bool = False) -> Iterable[HistoricalProject]:
     for outer in sorted(history_root.iterdir(), key=lambda item: item.name):
         if not outer.is_dir() or not re.match(r"20\d{2}年招投标-技术\d+$", outer.name):
@@ -175,9 +196,18 @@ def iter_historical_projects(history_root: Path, winning_only: bool = False) -> 
         for project_path in sorted(inner.iterdir(), key=lambda item: item.name):
             if project_path.is_dir() and (not winning_only or "中标" in project_path.name):
                 yield parse_project_folder(outer.name, project_path)
+    for path in sorted(history_root.iterdir(), key=lambda item: item.name):
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            if winning_only and "中标" not in path.name:
+                continue
+            yield parse_standalone_document(path)
 
 
 def iter_documents(project: HistoricalProject) -> Iterable[Path]:
+    if project.source_path.is_file():
+        if project.source_path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            yield project.source_path.resolve()
+        return
     for path in sorted(project.source_path.rglob("*"), key=lambda item: str(item)):
         if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
             yield path.resolve()
@@ -648,7 +678,10 @@ def import_project(conn: sqlite3.Connection, project: HistoricalProject) -> None
 
 def import_document(conn: sqlite3.Connection, project: HistoricalProject, doc_path: Path, artifact_root: Path) -> tuple[str, str]:
     doc_id = stable_id("doc", str(doc_path.resolve()))
-    relative_base = Path(project.year) / project.batch / f"{project.sequence}-{doc_id.removeprefix('doc-')}"
+    year_segment = project.year or "未分类年份"
+    batch_segment = project.batch or "补充入库"
+    sequence_segment = project.sequence or "standalone"
+    relative_base = Path(year_segment) / batch_segment / f"{sequence_segment}-{doc_id.removeprefix('doc-')}"
     markdown_path = artifact_root / "markdown" / relative_base / f"{doc_path.stem}.md"
     block_json_path = artifact_root / "blocks" / relative_base / f"{doc_path.stem}.json"
     html_preview_path = artifact_root / "html" / relative_base / f"{doc_path.stem}.html"

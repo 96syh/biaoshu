@@ -1365,28 +1365,50 @@ class HistoryCaseService:
         title_tokens = cls._chapter_reference_semantic_tokens(title)
         if not title_tokens:
             return []
+        prefer_personnel_only = cls._is_personnel_reference_title(title) and not cls._is_equipment_reference_title(title)
+        prefer_equipment_only = cls._is_equipment_reference_title(title) and not cls._is_personnel_reference_title(title)
         best_index = -1
         best_score = 0.0
+        best_precision = 0.0
+        best_level = -1
         for index, block in enumerate(blocks):
             if not isinstance(block, dict) or block.get("type") != "heading":
                 continue
             text = cls._text(block.get("text") or block.get("markdown"))
+            if prefer_personnel_only and cls._is_mixed_personnel_equipment_heading(text):
+                continue
+            if prefer_equipment_only and cls._is_mixed_personnel_equipment_heading(text):
+                continue
             tokens = cls._chapter_reference_semantic_tokens(text)
             if not tokens:
                 continue
-            score = len(title_tokens & tokens) / max(len(title_tokens), 1)
+            overlap_count = len(title_tokens & tokens)
+            recall = overlap_count / max(len(title_tokens), 1)
+            precision = overlap_count / max(len(tokens), 1)
+            score = recall * 0.72 + precision * 0.28
             compact_title = re.sub(r"\s+", "", str(title or ""))
             compact_text = re.sub(r"\s+", "", text)
             if compact_title and compact_title in compact_text:
                 score += 0.65
             level = int(block.get("level") or 0)
             if level:
-                score += max(0.0, 0.08 - 0.01 * min(level, 6))
+                score += min(0.06, 0.01 * min(level, 6))
             if cls._should_skip_history_heading_candidate(blocks, index, title):
                 score -= 0.65
-            if score > best_score:
+            if (
+                score > best_score
+                or (
+                    abs(score - best_score) <= 1e-9
+                    and (
+                        precision > best_precision
+                        or (abs(precision - best_precision) <= 1e-9 and level > best_level)
+                    )
+                )
+            ):
                 best_index = index
                 best_score = score
+                best_precision = precision
+                best_level = level
         if best_index < 0 or best_score < 0.34:
             return []
 
@@ -1492,6 +1514,11 @@ class HistoryCaseService:
     def _is_equipment_reference_title(title: str) -> bool:
         text = re.sub(r"\s+", "", str(title or ""))
         return any(keyword in text for keyword in ("设备", "软件", "仪器", "资源配置", "工具"))
+
+    @classmethod
+    def _is_mixed_personnel_equipment_heading(cls, title: str) -> bool:
+        text = re.sub(r"\s+", "", str(title or ""))
+        return cls._is_personnel_reference_title(text) and cls._is_equipment_reference_title(text)
 
     @classmethod
     def _candidate_section_probe_text(cls, blocks: list[dict[str, Any]], index: int, max_chars: int = 900) -> str:
