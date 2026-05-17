@@ -23,7 +23,7 @@
 - 图表与素材规划：根据目录、解析报告和企业材料，规划表格、图片、承诺书、附件、证据链等内容块。
 - 合规审校：导出前检查覆盖率、阻塞项、警告项、固定格式、签章、报价隔离、暗标泄露、证据链、页码占位、疑似虚构和重复内容，并生成修订计划。
 - Word 导出：将正文和目录导出为 DOCX，后端使用 `python-docx` 生成基础 Word 文档。
-- 草稿与历史：后端 SQLite 项目库保存当前草稿、章节正文和历史记录；前端会合并流式正文更新并延迟写入，减少大草稿生成时的重复写库压力。
+- 草稿与历史：后端 JSON 项目状态保存当前草稿、章节正文和历史记录；前端会合并流式正文更新并延迟写入，减少大草稿生成时的重复写入压力。
 
 ## 工作流程
 
@@ -90,8 +90,6 @@ yibiao-simple/
   backend/app/utils/        Prompt、配置、SSE、JSON 校验、目录工具
   docs/                     模型接入和 Prompt 工作流补充文档
   screenshots/              截图资源
-  cloudflare-demo/          Cloudflare 静态演示样例
-  cloudflare-fullstack/     Cloudflare 全栈部署实验样例
 ```
 
 主要技术栈：
@@ -138,8 +136,9 @@ yibiao-simple/
 - 可选搜索路由位于 `backend/app/optional/search.py`，默认不参与 FastAPI 主流程。
 - 旧扩写路由位于 `backend/app/optional/expand.py`，仅保留兼容。
 - MCP DuckDuckGo 示例位于 `backend/optional/mcp/`，手动运行，不被后端默认导入。
-- 构建包、发布包、历史案例库、生成素材和临时验收文件统一放入 `artifacts/`，默认由 `.gitignore` 忽略。
-- 运行态路径可通过 `YIBIAO_PROJECT_DB_PATH`、`YIBIAO_HISTORY_CASE_DB_PATH`、`YIBIAO_GENERATED_ASSET_DIR`、`YIBIAO_FRONTEND_STATIC_DIR` 覆盖。
+- 运行产物统一放入 `artifacts/`，默认由 `.gitignore` 忽略。
+- 历史案例库仅保留 PageIndex 兼容的树结构 JSON：`artifacts/data/history_cases/pageindex_trees/`。
+- 运行态路径可通过 `YIBIAO_PROJECT_STORE_PATH`、`YIBIAO_GENERATED_ASSET_DIR`、`YIBIAO_FRONTEND_STATIC_DIR` 覆盖。
 
 ## 本地开发
 
@@ -148,7 +147,7 @@ yibiao-simple/
 macOS/Linux 可在项目根目录执行：
 
 ```bash
-./start-dev.sh
+./一键启动.command
 ```
 
 脚本默认启动：
@@ -159,19 +158,15 @@ macOS/Linux 可在项目根目录执行：
 前端 API：REACT_APP_API_URL=http://127.0.0.1:8000
 ```
 
-在 macOS 中也可以双击 `start-dev.command` 启动。关闭脚本窗口或按 `Ctrl+C` 会停止本脚本启动的前后端进程。
+在 macOS 中也可以双击 `一键启动.command` 启动。脚本会打开后端 API 与前端页面两个终端窗口；关闭对应终端窗口或按 `Ctrl+C` 即可停止服务。
 
-首次运行时脚本会自动安装缺失的后端或前端依赖。若只想检查环境、不允许自动安装依赖，可执行：
-
-```bash
-AUTO_INSTALL=0 ./start-dev.sh
-```
+Ubuntu 22.04 Jammy 部署或装机依赖清单见 [`docs/dependencies-ubuntu2204-jammy.md`](docs/dependencies-ubuntu2204-jammy.md)。
 
 ### 手动启动后端
 
 ```bash
 cd backend
-HOST=127.0.0.1 PORT=8000 WORKERS=1 python run.py
+HOST=127.0.0.1 PORT=8000 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
 后端默认地址：
@@ -296,33 +291,10 @@ export YIBIAO_FORCE_LOCAL_FALLBACK=1
 
 `YIBIAO_FORCE_LOCAL_FALLBACK=1` 只有在 `YIBIAO_ENABLE_GENERATION_FALLBACKS=1` 时才生效。该模式会启用本地兜底解析、兜底目录、兜底正文和兜底审校，仅适合 smoke test，不代表真实生成质量。
 
-## Docker 运行
-
-项目保留 Dockerfile，可按 amd64 构建：
-
-```bash
-docker buildx build --platform linux/amd64 -t huazheng-ai:amd64 . --load
-```
-
-运行：
-
-```bash
-docker run --rm -p 8000:8000 \
-  -v huazheng-ai-config:/home/app/.ai_write_helper \
-  -v huazheng-ai-uploads:/app/backend/uploads \
-  huazheng-ai:amd64
-```
-
-访问：
-
-```text
-http://localhost:8000
-```
-
 ## 部署与数据边界
 
 - 应用默认是本地工作台，不自带用户体系、权限体系和团队协作。
-- 模型配置保存到本机用户目录，草稿历史保存在后端 SQLite 项目库。
+- 模型配置保存到本机用户目录，草稿历史保存在后端 JSON 项目状态文件。
 - 招标文件上传后会被后端临时保存，解析完成后会清理临时文件。
 - 模型理解阶段会把招标文本发送到用户配置的 LiteLLM 后端；是否外传取决于 LiteLLM 后端接入的是本地模型、内网模型还是云端模型。
 - 文件解析默认不接入 MinerU；如果手动启用 MinerU 远端 API，需要自行确认数据边界。
@@ -331,7 +303,7 @@ http://localhost:8000
 ## 当前限制
 
 - 企业资料解析还不是独立模块，目前通过 `enterprise_materials` 和 `missing_materials` 传递已提供材料和待补资料。
-- 大项目草稿包含原文、目录、解析报告和正文内容，仍需关注 SQLite 项目库体积、磁盘空间和长时间生成过程中的保存失败提示。
+- 大项目草稿包含原文、目录、解析报告和正文内容，仍需关注项目状态 JSON 体积、磁盘空间和长时间生成过程中的保存失败提示。
 - 生成内容依赖模型质量，导出前必须人工复核实质性条款、签章、报价、暗标和证明材料。
 - Word 导出提供基础 DOCX 结构，最终页码、目录、版式、图表细节和盖章位置仍建议在 Word 中人工确认。
 - 前端主工作台逻辑目前集中在 `frontend/src/App.tsx`，后续大规模扩展时建议拆分组件和业务 hooks。

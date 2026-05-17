@@ -2,27 +2,184 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import mimetypes
-import os
 import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List
 
+import docx
+from docx.document import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+
+
+def heading_level(paragraph: docx.text.paragraph.Paragraph) -> int:
+    style_name = (paragraph.style.name if paragraph.style else "") or ""
+    match = re.search(r"heading\s*(\d+)|标题\s*(\d+)", style_name, re.IGNORECASE)
+    if match:
+        return max(1, min(6, int(match.group(1) or match.group(2))))
+
+    text = paragraph.text.strip()
+    if not text or len(text) > 80:
+        return 0
+    if re.match(r"^第[一二三四五六七八九十百\d]+[章节篇部分]", text):
+        return 1
+    if re.match(r"^[一二三四五六七八九十]+[、.．]", text):
+        return 2
+    if re.match(r"^（[一二三四五六七八九十]+）", text):
+        return 3
+    if re.match(r"^\d+(?:\.\d+)*[、.．]\s*", text):
+        return min(4, text.count(".") + text.count("．") + 2)
+    return 0
+
+
+def iter_docx_blocks(document: DocxDocument):
+    for child in document.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, document)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, document)
+
+
+def extract_docx_media_assets(path: Path, asset_dir: Path) -> list[dict]:
+    document = docx.Document(str(path))
+    assets: list[dict] = []
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    for index, rel in enumerate(document.part.rels.values(), 1):
+        if not str(rel.reltype).endswith("/image") or not hasattr(rel.target_part, "blob"):
+            continue
+        content_type = getattr(rel.target_part, "content_type", "") or ""
+        ext = ".png"
+        if "jpeg" in content_type or "jpg" in content_type:
+            ext = ".jpg"
+        elif "gif" in content_type:
+            ext = ".gif"
+        elif "bmp" in content_type:
+            ext = ".bmp"
+        name = f"image-{index}{ext}"
+        target = asset_dir / name
+        target.write_bytes(rel.target_part.blob)
+        assets.append({
+            "id": f"img-{index}",
+            "name": name,
+            "path": str(target),
+            "relative_path": name,
+            "content_type": content_type,
+        })
+    return assets
+
+
+def extract_docx_blocks(path: Path, asset_dir: Path) -> dict:
+    document = docx.Document(str(path))
+    assets = extract_docx_media_assets(path, asset_dir)
+    blocks: list[dict] = []
+    markdown_lines: list[str] = [f"# {path.stem}", ""]
+    html_parts: list[str] = ['<div class="history-word-preview">']
+    pending_image_index = 0
+    heading_stack: list[dict] = []
+
+    def next_image_html() -> str:
+        nonlocal pending_image_index
+        if pending_image_index >= len(assets):
+            return ""
+        asset = assets[pending_image_index]
+        pending_image_index += 1
+        src = f"assets/{html.escape(asset['name'])}"
+        return f'<figure data-history-block-id="{asset["id"]}"><img src="{src}" alt="{html.escape(asset["name"])}" /></figure>'
+
+    for index, block in enumerate(iter_docx_blocks(document), 1):
+        block_id = f"b-{index}"
+        if isinstance(block, Paragraph):
+            text = block.text.strip()
+            has_image = bool(block._element.xpath(".//a:blip"))
+            if not text and not has_image:
+                continue
+            level = heading_level(block)
+            block_type = "heading" if level else "paragraph"
+            if level:
+                heading_stack = [item for item in heading_stack if int(item.get("level") or 0) < level]
+                heading_path = [*heading_stack, {"id": block_id, "level": level, "title": text}]
+                heading_stack = heading_path
+            else:
+                heading_path = list(heading_stack)
+            markdown_text = f"{'#' * level} {text}" if level and text else text
+            image_html = next_image_html() if has_image else ""
+            if markdown_text:
+                markdown_lines.extend([markdown_text, ""])
+            if has_image:
+                image_ref = assets[pending_image_index - 1] if pending_image_index else None
+                if image_ref:
+                    markdown_lines.extend([f"![{image_ref['name']}](assets/{image_ref['name']})", ""])
+            tag = f"h{min(level, 6)}" if level else "p"
+            html_text = f"<{tag} data-history-block-id=\"{block_id}\">{html.escape(text)}</{tag}>" if text else ""
+            html_parts.append(html_text + image_html)
+            blocks.append({
+                "id": block_id,
+                "type": block_type,
+                "level": level,
+                "text": text,
+                "markdown": markdown_text,
+                "html": html_text + image_html,
+                "docx_xml": block._element.xml,
+                "heading_path": heading_path,
+                "asset_ids": [assets[pending_image_index - 1]["id"]] if has_image and pending_image_index else [],
+            })
+        elif isinstance(block, Table):
+            rows = [[cell.text.strip().replace("\n", " ") for cell in row.cells] for row in block.rows]
+            rows = [row for row in rows if any(row)]
+            if not rows:
+                continue
+            markdown_lines.append("| " + " | ".join(rows[0]) + " |")
+            if len(rows) > 1:
+                markdown_lines.append("| " + " | ".join(["---"] * len(rows[0])) + " |")
+                for row in rows[1:]:
+                    markdown_lines.append("| " + " | ".join(row) + " |")
+            markdown_lines.append("")
+            html_rows = []
+            for row_index, row in enumerate(rows):
+                tag = "th" if row_index == 0 else "td"
+                cells = "".join(f"<{tag}>{html.escape(cell)}</{tag}>" for cell in row)
+                html_rows.append(f"<tr>{cells}</tr>")
+            table_html = (
+                f'<table data-history-block-id="{block_id}"><tbody>'
+                f'{"".join(html_rows)}</tbody></table>'
+            )
+            html_parts.append(table_html)
+            blocks.append({
+                "id": block_id,
+                "type": "table",
+                "level": 0,
+                "text": "\n".join(" | ".join(row) for row in rows),
+                "markdown": "\n".join(markdown_lines[-len(rows) - 2:]).strip(),
+                "html": table_html,
+                "docx_xml": block._element.xml,
+                "heading_path": list(heading_stack),
+                "rows": rows,
+                "asset_ids": [],
+            })
+
+    html_parts.append("</div>")
+    return {
+        "markdown": "\n".join(markdown_lines).strip() + "\n",
+        "blocks": blocks,
+        "html": "".join(html_parts),
+        "assets": assets,
+    }
+
 
 class HistoryCaseService:
-    """Read-only access to the generated historical bid case library."""
+    """Read-only access to the PageIndex JSON historical bid case library."""
 
     REPO_ROOT = Path(__file__).resolve().parents[3]
     HISTORY_ARTIFACT_ROOT = REPO_ROOT / "artifacts" / "data" / "history_cases"
     LEGACY_HISTORY_ARTIFACT_ROOT = REPO_ROOT / "backend" / "data" / "history_cases"
-    DB_PATH = Path(
-        os.getenv(
-            "YIBIAO_HISTORY_CASE_DB_PATH",
-            str(REPO_ROOT / "artifacts" / "data" / "history_cases.sqlite3"),
-        )
-    )
+    HISTORY_DB_PATH = REPO_ROOT / "artifacts" / "data" / "history_cases.sqlite3"
+    PAGEINDEX_TREE_ROOT = HISTORY_ARTIFACT_ROOT / "pageindex_trees"
     MATCH_HINTS = [
         "石油", "中石油", "中石化", "油库", "加油站", "加能站", "油罐",
         "燃气", "天然气", "LNG", "CNG", "加气", "气化",
@@ -54,29 +211,6 @@ class HistoryCaseService:
         "survey": ("勘察", "测绘"),
         "consulting": ("咨询", "评估", "造价"),
     }
-
-    @classmethod
-    def _connect(cls) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(cls.DB_PATH))
-        conn.row_factory = sqlite3.Row
-        cls._ensure_optional_document_columns(conn)
-        return conn
-
-    @classmethod
-    def _ensure_optional_document_columns(cls, conn: sqlite3.Connection) -> None:
-        try:
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(case_documents)").fetchall()}
-            optional_columns = {
-                "block_json_path": "TEXT NOT NULL DEFAULT ''",
-                "html_preview_path": "TEXT NOT NULL DEFAULT ''",
-                "asset_dir": "TEXT NOT NULL DEFAULT ''",
-            }
-            for column, definition in optional_columns.items():
-                if column not in columns:
-                    conn.execute(f"ALTER TABLE case_documents ADD COLUMN {column} {definition}")
-            conn.commit()
-        except sqlite3.Error:
-            pass
 
     @classmethod
     def _resolve_history_artifact_path(cls, raw_path: str) -> Path:
@@ -112,81 +246,426 @@ class HistoryCaseService:
         return str(resolved) if str(resolved) else ""
 
     @classmethod
-    def summary(cls) -> Dict[str, Any]:
-        if not cls.DB_PATH.exists():
-            return {
-                "ready": False,
-                "project_count": 0,
-                "document_count": 0,
-                "indexed_document_count": 0,
-                "failed_document_count": 0,
-                "db_path": str(cls.DB_PATH),
-            }
+    def _pageindex_tree_files(cls) -> list[Path]:
+        if not cls.PAGEINDEX_TREE_ROOT.exists():
+            return []
+        return sorted(cls.PAGEINDEX_TREE_ROOT.rglob("*.json"))
 
-        with cls._connect() as conn:
-            project_count = conn.execute("SELECT COUNT(*) AS count FROM case_projects").fetchone()["count"]
-            document_count = conn.execute("SELECT COUNT(*) AS count FROM case_documents").fetchone()["count"]
-            indexed_count = conn.execute(
-                "SELECT COUNT(*) AS count FROM case_documents WHERE status='indexed'"
-            ).fetchone()["count"]
-            failed_count = conn.execute(
-                "SELECT COUNT(*) AS count FROM case_documents WHERE status!='indexed'"
-            ).fetchone()["count"]
-            by_year = [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT year, COUNT(*) AS count
-                    FROM case_projects
-                    GROUP BY year
-                    ORDER BY year
-                    """
-                ).fetchall()
-            ]
-            by_result = [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT result, COUNT(*) AS count
-                    FROM case_projects
-                    GROUP BY result
-                    ORDER BY count DESC, result
-                    """
-                ).fetchall()
-            ]
-            by_extension = [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT extension, COUNT(*) AS count
-                    FROM case_documents
-                    GROUP BY extension
-                    ORDER BY count DESC, extension
-                    """
-                ).fetchall()
-            ]
-            by_domain = [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT primary_domain AS domain, COUNT(*) AS count
-                    FROM case_projects
-                    GROUP BY primary_domain
-                    ORDER BY count DESC, primary_domain
-                    """
-                ).fetchall()
-            ]
+    @classmethod
+    def _history_db_available(cls) -> bool:
+        return cls.HISTORY_DB_PATH.exists() and cls.HISTORY_DB_PATH.is_file()
+
+    @classmethod
+    def _is_path_under_pageindex_root(cls, raw_path: Any) -> bool:
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            return False
+        resolved = cls._resolve_history_artifact_path(path_text)
+        try:
+            resolved.resolve().relative_to(cls.PAGEINDEX_TREE_ROOT.resolve())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    @classmethod
+    def _connect_history_db(cls) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(cls.HISTORY_DB_PATH))
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @classmethod
+    def _load_pageindex_tree(cls, path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _tree_metadata(cls, path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parts = path.relative_to(cls.PAGEINDEX_TREE_ROOT).parts
+        except ValueError:
+            parts = path.parts
+        year = parts[0] if len(parts) >= 1 else ""
+        batch = parts[1] if len(parts) >= 2 else ""
+        folder = parts[2] if len(parts) >= 3 else path.parent.name
+        sequence = folder.split("-", 1)[0] if folder else ""
+        doc_name = str(payload.get("doc_name") or path.stem)
+        category = "技术标" if "技术" in batch or "技术" in doc_name else "商务标" if "商务" in batch or "商务" in doc_name else "未分类"
         return {
-            "ready": True,
-            "project_count": project_count,
-            "document_count": document_count,
-            "indexed_document_count": indexed_count,
-            "failed_document_count": failed_count,
-            "by_year": by_year,
-            "by_result": by_result,
-            "by_extension": by_extension,
-            "by_domain": by_domain,
-            "db_path": str(cls.DB_PATH),
+            "project_id": folder or path.stem,
+            "document_id": path.stem,
+            "year": year,
+            "batch": batch,
+            "sequence": sequence,
+            "subject": doc_name,
+            "result": "",
+            "primary_domain": "",
+            "primary_subdomain": "",
+            "domain_confidence": 0,
+            "domain_keywords": "[]",
+            "project_title": doc_name,
+            "project_path": str(path.parent),
+            "file_name": f"{doc_name}.json",
+            "document_category": category,
+            "document_category_basis": "PageIndex JSON 路径推断",
+            "document_path": str(path),
+            "markdown_path": "",
+            "block_json_path": "",
+            "html_preview_path": "",
+            "asset_dir": "",
+            "pageindex_tree_path": str(path),
+        }
+
+    @classmethod
+    def _flatten_pageindex_nodes(
+        cls,
+        nodes: list[Any],
+        *,
+        metadata: dict[str, Any],
+        parent_id: str = "",
+        parent_titles: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        parent_titles = parent_titles or []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("node_id") or f"node-{len(records) + 1}")
+            title = str(node.get("title") or "").strip()
+            text = str(node.get("text") or "").strip()
+            level = max(1, min(6, len(re.match(r"^(#+)", text).group(1)) if re.match(r"^(#+)", text) else len(parent_titles) + 1))
+            node_path = [*parent_titles, title] if title else list(parent_titles)
+            record = {
+                **metadata,
+                "rank": 0.0,
+                "pageindex_node_id": f"{metadata['document_id']}:{node_id}",
+                "node_id": node_id,
+                "parent_node_id": parent_id,
+                "node_title": title,
+                "node_level": level,
+                "node_line_num": int(node.get("line_num") or 0),
+                "node_text": text,
+                "node_path": node_path,
+                "node_path_text": " > ".join(node_path),
+            }
+            records.append(record)
+            children = node.get("nodes")
+            if isinstance(children, list):
+                records.extend(
+                    cls._flatten_pageindex_nodes(
+                        children,
+                        metadata=metadata,
+                        parent_id=node_id,
+                        parent_titles=node_path,
+                    )
+                )
+        return records
+
+    @classmethod
+    def _sqlite_document_category(cls, row: Dict[str, Any]) -> str:
+        batch = str(row.get("batch") or "")
+        file_name = str(row.get("file_name") or "")
+        project_title = str(row.get("project_title") or row.get("subject") or "")
+        haystack = f"{batch} {file_name} {project_title}"
+        if "技术" in haystack:
+            return "技术标"
+        if "商务" in haystack or "非技术" in haystack:
+            return "商务标"
+        return "未分类"
+
+    @classmethod
+    def _metadata_from_sqlite_row(cls, row: Dict[str, Any]) -> dict[str, Any]:
+        category = cls._sqlite_document_category(row)
+        return {
+            "project_id": str(row.get("project_id") or ""),
+            "document_id": str(row.get("document_id") or ""),
+            "year": str(row.get("year") or ""),
+            "batch": str(row.get("batch") or ""),
+            "sequence": str(row.get("sequence") or ""),
+            "subject": str(row.get("subject") or ""),
+            "result": str(row.get("result") or ""),
+            "primary_domain": str(row.get("primary_domain") or ""),
+            "primary_subdomain": str(row.get("primary_subdomain") or ""),
+            "domain_confidence": row.get("domain_confidence") or 0,
+            "domain_keywords": str(row.get("domain_keywords") or "[]"),
+            "project_title": str(row.get("project_title") or row.get("subject") or ""),
+            "project_path": str(row.get("project_path") or ""),
+            "file_name": str(row.get("file_name") or ""),
+            "document_category": category,
+            "document_category_basis": "SQLite 元数据推断",
+            "document_path": str(row.get("document_path") or ""),
+            "markdown_path": str(row.get("markdown_path") or ""),
+            "block_json_path": str(row.get("block_json_path") or ""),
+            "html_preview_path": str(row.get("html_preview_path") or ""),
+            "asset_dir": str(row.get("asset_dir") or ""),
+            "pageindex_tree_path": str(row.get("pageindex_tree_path") or ""),
+        }
+
+    @classmethod
+    def _pageindex_record_from_sqlite_row(cls, row: Dict[str, Any]) -> dict[str, Any]:
+        """Use SQLite for recall, then load the matching PageIndex node as source of truth."""
+        metadata = cls._metadata_from_sqlite_row(row)
+        fallback = {
+            **metadata,
+            "rank": 0.0,
+            "pageindex_node_id": str(row.get("pageindex_node_id") or ""),
+            "node_id": str(row.get("node_id") or ""),
+            "parent_node_id": str(row.get("parent_node_id") or ""),
+            "node_title": str(row.get("node_title") or ""),
+            "node_level": int(row.get("node_level") or 1),
+            "node_line_num": int(row.get("node_line_num") or 0),
+            "node_text": str(row.get("node_text") or ""),
+            "node_path": [str(row.get("node_title") or "")] if row.get("node_title") else [],
+            "node_path_text": str(row.get("node_title") or ""),
+        }
+
+        tree_path = cls._resolve_history_artifact_path(str(row.get("pageindex_tree_path") or ""))
+        payload = cls._load_pageindex_tree(tree_path) if tree_path else {}
+        structure = payload.get("structure")
+        if not isinstance(structure, list):
+            return fallback
+
+        target_node_id = str(row.get("node_id") or "")
+        for record in cls._flatten_pageindex_nodes(structure, metadata=metadata):
+            if str(record.get("node_id") or "") == target_node_id:
+                record["pageindex_node_id"] = str(row.get("pageindex_node_id") or record.get("pageindex_node_id") or "")
+                return record
+        return fallback
+
+    @classmethod
+    def _search_sqlite_pageindex_nodes(
+        cls,
+        query: str,
+        limit: int,
+        *,
+        document_category: str = "",
+    ) -> list[dict[str, Any]]:
+        if not cls._history_db_available():
+            return []
+
+        terms = cls._pageindex_search_terms(query)
+        if not terms:
+            return []
+
+        searchable_terms = terms[:10]
+        like_parts: list[str] = []
+        params: list[Any] = []
+        for term in searchable_terms:
+            pattern = f"%{term}%"
+            like_parts.append(
+                "(n.title LIKE ? OR n.text LIKE ? OR p.title LIKE ? OR p.subject LIKE ? "
+                "OR p.primary_domain LIKE ? OR p.primary_subdomain LIKE ? OR d.file_name LIKE ?)"
+            )
+            params.extend([pattern, pattern, pattern, pattern, pattern, pattern, pattern])
+
+        category_clause = ""
+        if document_category == "技术标":
+            category_clause = "AND (p.batch LIKE '%技术%' OR d.file_name LIKE '%技术%' OR p.title LIKE '%技术%')"
+        elif document_category in {"商务标", "非技术标"}:
+            category_clause = "AND (p.batch LIKE '%商务%' OR d.file_name LIKE '%商务%' OR p.title LIKE '%商务%' OR p.batch LIKE '%非技术%')"
+
+        sql = f"""
+            SELECT
+                n.id AS pageindex_node_id,
+                n.document_id AS document_id,
+                n.node_id AS node_id,
+                n.parent_node_id AS parent_node_id,
+                n.title AS node_title,
+                n.line_num AS node_line_num,
+                n.level AS node_level,
+                n.text AS node_text,
+                d.project_id AS project_id,
+                d.file_name AS file_name,
+                d.source_path AS document_path,
+                d.markdown_path AS markdown_path,
+                d.block_json_path AS block_json_path,
+                d.html_preview_path AS html_preview_path,
+                d.asset_dir AS asset_dir,
+                d.pageindex_tree_path AS pageindex_tree_path,
+                p.year AS year,
+                p.batch AS batch,
+                p.sequence AS sequence,
+                p.result AS result,
+                p.subject AS subject,
+                p.primary_domain AS primary_domain,
+                p.primary_subdomain AS primary_subdomain,
+                p.domain_confidence AS domain_confidence,
+                p.domain_keywords AS domain_keywords,
+                p.title AS project_title,
+                p.source_path AS project_path
+            FROM pageindex_nodes n
+            JOIN case_documents d ON d.id = n.document_id
+            JOIN case_projects p ON p.id = d.project_id
+            WHERE d.status = 'indexed'
+              AND ({' OR '.join(like_parts)})
+              {category_clause}
+            LIMIT ?
+        """
+        params.append(max(limit * 24, 120))
+
+        try:
+            with cls._connect_history_db() as connection:
+                raw_rows = [dict(row) for row in connection.execute(sql, params)]
+        except sqlite3.Error:
+            return []
+
+        scored: list[dict[str, Any]] = []
+        for raw in raw_rows:
+            if not cls._is_path_under_pageindex_root(raw.get("pageindex_tree_path")):
+                continue
+            record = cls._pageindex_record_from_sqlite_row(raw)
+            score = cls._pageindex_node_score(record, query, terms)
+            if score <= 0:
+                continue
+            record["snippet"] = cls._make_pageindex_snippet(
+                query,
+                node_title=str(record.get("node_title") or ""),
+                node_text=str(record.get("node_text") or ""),
+                terms=terms,
+            )
+            record["rank"] = round(score, 4)
+            scored.append(record)
+
+        scored.sort(
+            key=lambda item: (
+                -float(item.get("rank") or 0),
+                int(item.get("node_level") or 99),
+                str(item.get("project_title") or ""),
+            )
+        )
+        return scored[:limit]
+
+    @classmethod
+    def _iter_pageindex_records(cls) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for path in cls._pageindex_tree_files():
+            payload = cls._load_pageindex_tree(path)
+            structure = payload.get("structure")
+            if not isinstance(structure, list):
+                continue
+            records.extend(
+                cls._flatten_pageindex_nodes(
+                    structure,
+                    metadata=cls._tree_metadata(path, payload),
+                )
+            )
+        return records
+
+    @classmethod
+    def summary(cls) -> Dict[str, Any]:
+        if cls._history_db_available():
+            try:
+                with cls._connect_history_db() as connection:
+                    document_rows = [
+                        dict(row)
+                        for row in connection.execute(
+                            """
+                            SELECT
+                                p.id AS project_id,
+                                p.year AS year,
+                                p.result AS result,
+                                p.primary_domain AS primary_domain,
+                                p.primary_subdomain AS primary_subdomain,
+                                p.batch AS batch,
+                                p.title AS project_title,
+                                d.file_name AS file_name,
+                                d.pageindex_tree_path AS pageindex_tree_path,
+                                d.extension AS extension,
+                                d.status AS status
+                            FROM case_documents d
+                            JOIN case_projects p ON p.id = d.project_id
+                            """
+                        )
+                    ]
+                aligned_rows = [
+                    row for row in document_rows if cls._is_path_under_pageindex_root(row.get("pageindex_tree_path"))
+                ]
+                if aligned_rows:
+                    by_year_map: dict[str, int] = {}
+                    by_result_map: dict[str, int] = {}
+                    by_extension_map: dict[str, int] = {}
+                    by_category_map: dict[str, int] = {}
+                    by_domain_map: dict[tuple[str, str], int] = {}
+                    project_ids: set[str] = set()
+                    indexed_count = 0
+                    failed_count = 0
+                    for row in aligned_rows:
+                        project_ids.add(str(row.get("project_id") or ""))
+                        by_year_map[str(row.get("year") or "")] = by_year_map.get(str(row.get("year") or ""), 0) + 1
+                        result = str(row.get("result") or "未标注")
+                        by_result_map[result] = by_result_map.get(result, 0) + 1
+                        extension = str(row.get("extension") or Path(str(row.get("file_name") or "")).suffix or "unknown")
+                        by_extension_map[extension] = by_extension_map.get(extension, 0) + 1
+                        category = cls._sqlite_document_category(row)
+                        by_category_map[category] = by_category_map.get(category, 0) + 1
+                        domain_key = (
+                            str(row.get("primary_domain") or "其他"),
+                            str(row.get("primary_subdomain") or "未分类"),
+                        )
+                        by_domain_map[domain_key] = by_domain_map.get(domain_key, 0) + 1
+                        if str(row.get("status") or "") == "indexed":
+                            indexed_count += 1
+                        else:
+                            failed_count += 1
+                    return {
+                        "ready": True,
+                        "project_count": len(project_ids),
+                        "document_count": len(aligned_rows),
+                        "indexed_document_count": indexed_count,
+                        "failed_document_count": failed_count,
+                        "by_year": [{"year": key, "count": value} for key, value in sorted(by_year_map.items())],
+                        "by_result": [
+                            {"result": key, "count": value}
+                            for key, value in sorted(by_result_map.items(), key=lambda item: (-item[1], item[0]))
+                        ],
+                        "by_extension": [
+                            {"extension": key, "count": value}
+                            for key, value in sorted(by_extension_map.items(), key=lambda item: (-item[1], item[0]))
+                        ],
+                        "by_document_category": [
+                            {"category": key, "count": value}
+                            for key, value in sorted(by_category_map.items(), key=lambda item: (-item[1], item[0]))
+                        ],
+                        "by_domain": [
+                            {"domain": key[0], "subdomain": key[1], "count": value}
+                            for key, value in sorted(by_domain_map.items(), key=lambda item: (-item[1], item[0]))
+                        ],
+                        "history_db_path": str(cls.HISTORY_DB_PATH),
+                        "pageindex_tree_root": str(cls.PAGEINDEX_TREE_ROOT),
+                        "index_mode": "sqlite_recall_pageindex_context",
+                    }
+            except sqlite3.Error:
+                pass
+
+        files = cls._pageindex_tree_files()
+        by_year_map: dict[str, int] = {}
+        by_category_map: dict[str, int] = {}
+        project_ids: set[str] = set()
+        for path in files:
+            payload = cls._load_pageindex_tree(path)
+            metadata = cls._tree_metadata(path, payload)
+            project_ids.add(str(metadata["project_id"]))
+            by_year_map[str(metadata["year"])] = by_year_map.get(str(metadata["year"]), 0) + 1
+            category = str(metadata["document_category"])
+            by_category_map[category] = by_category_map.get(category, 0) + 1
+        return {
+            "ready": bool(files),
+            "project_count": len(project_ids),
+            "document_count": len(files),
+            "indexed_document_count": len(files),
+            "failed_document_count": 0,
+            "by_year": [{"year": key, "count": value} for key, value in sorted(by_year_map.items())],
+            "by_result": [],
+            "by_extension": [{"extension": ".json", "count": len(files)}] if files else [],
+            "by_document_category": [
+                {"category": key, "count": value}
+                for key, value in sorted(by_category_map.items(), key=lambda item: (-item[1], item[0]))
+            ],
+            "by_domain": [],
+            "pageindex_tree_root": str(cls.PAGEINDEX_TREE_ROOT),
+            "index_mode": "pageindex_json_fallback",
         }
 
     @classmethod
@@ -198,189 +677,267 @@ class HistoryCaseService:
         result: str = "",
         domain: str = "",
     ) -> List[Dict[str, Any]]:
-        if not cls.DB_PATH.exists():
-            return []
+        if cls._history_db_available():
+            try:
+                with cls._connect_history_db() as connection:
+                    rows = [
+                        dict(row)
+                        for row in connection.execute(
+                            """
+                            SELECT
+                                p.id AS id,
+                                p.year AS year,
+                                p.batch AS batch,
+                                p.sequence AS sequence,
+                                p.subject AS subject,
+                                p.result AS result,
+                                p.primary_domain AS primary_domain,
+                                p.primary_subdomain AS primary_subdomain,
+                                p.domain_confidence AS domain_confidence,
+                                p.domain_keywords AS domain_keywords,
+                                p.title AS title,
+                                p.source_path AS source_path,
+                                SUM(CASE WHEN d.status = 'indexed' THEN 1 ELSE 0 END) AS indexed_document_count,
+                                COUNT(d.id) AS document_count,
+                                MAX(d.pageindex_tree_path) AS pageindex_tree_path
+                            FROM case_projects p
+                            JOIN case_documents d ON d.project_id = p.id
+                            GROUP BY p.id
+                            ORDER BY p.year, p.batch, p.sequence
+                            """
+                        )
+                    ]
+                records = []
+                for row in rows:
+                    if not cls._is_path_under_pageindex_root(row.get("pageindex_tree_path")):
+                        continue
+                    haystack = " ".join(str(row.get(key) or "") for key in ("subject", "title", "batch", "primary_domain", "primary_subdomain"))
+                    if year and row.get("year") != year:
+                        continue
+                    if subject and subject not in haystack:
+                        continue
+                    if result and result not in str(row.get("result") or ""):
+                        continue
+                    if domain and domain not in haystack:
+                        continue
+                    records.append({key: value for key, value in row.items() if key != "pageindex_tree_path"})
+                    if len(records) >= limit:
+                        break
+                if records:
+                    return records
+            except sqlite3.Error:
+                pass
 
-        where = []
-        params: list[Any] = []
-        if year:
-            where.append("p.year = ?")
-            params.append(year)
-        if subject:
-            where.append("p.subject LIKE ?")
-            params.append(f"%{subject}%")
-        if result:
-            where.append("p.result LIKE ?")
-            params.append(f"%{result}%")
-        if domain:
-            where.append(
-                """
-                (
-                    p.primary_domain LIKE ?
-                    OR p.primary_subdomain LIKE ?
-                    OR EXISTS (
-                        SELECT 1
-                        FROM case_project_domains cpd
-                        WHERE cpd.project_id = p.id
-                          AND (cpd.domain LIKE ? OR cpd.subdomain LIKE ?)
-                    )
-                )
-                """
-            )
-            params.extend([f"%{domain}%", f"%{domain}%", f"%{domain}%", f"%{domain}%"])
-        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-        params.append(limit)
-
-        with cls._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT
-                    p.*,
-                    COUNT(d.id) AS document_count,
-                    SUM(CASE WHEN d.status='indexed' THEN 1 ELSE 0 END) AS indexed_document_count
-                FROM case_projects p
-                LEFT JOIN case_documents d ON d.project_id = p.id
-                {where_sql}
-                GROUP BY p.id
-                ORDER BY p.year, p.batch, CAST(p.sequence AS REAL), p.sequence
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-            return [dict(row) for row in rows]
+        projects: dict[str, dict[str, Any]] = {}
+        for path in cls._pageindex_tree_files():
+            payload = cls._load_pageindex_tree(path)
+            metadata = cls._tree_metadata(path, payload)
+            haystack = " ".join(str(metadata.get(key) or "") for key in ("subject", "project_title", "batch"))
+            if year and metadata["year"] != year:
+                continue
+            if subject and subject not in haystack:
+                continue
+            if result and result not in str(metadata.get("result") or ""):
+                continue
+            if domain and domain not in haystack:
+                continue
+            record = projects.setdefault(str(metadata["project_id"]), {
+                "id": metadata["project_id"],
+                "year": metadata["year"],
+                "batch": metadata["batch"],
+                "sequence": metadata["sequence"],
+                "subject": metadata["subject"],
+                "result": metadata["result"],
+                "primary_domain": metadata["primary_domain"],
+                "primary_subdomain": metadata["primary_subdomain"],
+                "domain_confidence": metadata["domain_confidence"],
+                "domain_keywords": metadata["domain_keywords"],
+                "title": metadata["project_title"],
+                "source_path": metadata["project_path"],
+                "document_count": 0,
+                "indexed_document_count": 0,
+            })
+            record["document_count"] += 1
+            record["indexed_document_count"] += 1
+        records = list(projects.values())
+        records.sort(key=lambda item: (item.get("year") or "", item.get("batch") or "", item.get("sequence") or ""))
+        return records[:limit]
 
     @classmethod
     def list_domains(cls) -> List[Dict[str, Any]]:
-        if not cls.DB_PATH.exists():
-            return []
-
-        with cls._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                    domain,
-                    subdomain,
-                    COUNT(*) AS project_count,
-                    ROUND(AVG(confidence), 2) AS avg_confidence,
-                    GROUP_CONCAT(DISTINCT keywords) AS keyword_groups
-                FROM case_project_domains
-                GROUP BY domain, subdomain
-                ORDER BY project_count DESC, domain, subdomain
-                """
-            ).fetchall()
-            return [dict(row) for row in rows]
+        if cls._history_db_available():
+            try:
+                with cls._connect_history_db() as connection:
+                    rows = [
+                        dict(row)
+                        for row in connection.execute(
+                            """
+                            SELECT
+                                p.primary_domain AS domain,
+                                p.primary_subdomain AS subdomain,
+                                COUNT(DISTINCT p.id) AS project_count
+                            FROM case_projects p
+                            JOIN case_documents d ON d.project_id = p.id
+                            WHERE d.status = 'indexed'
+                            GROUP BY p.primary_domain, p.primary_subdomain
+                            ORDER BY project_count DESC, domain, subdomain
+                            """
+                        )
+                    ]
+                return [
+                    {
+                        "domain": str(row.get("domain") or "其他"),
+                        "subdomain": str(row.get("subdomain") or "未分类"),
+                        "project_count": int(row.get("project_count") or 0),
+                    }
+                    for row in rows
+                ]
+            except sqlite3.Error:
+                pass
+        return []
 
     @classmethod
-    def search(cls, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        if not cls.DB_PATH.exists() or not query.strip():
+    def search_pageindex_nodes(
+        cls,
+        query: str,
+        limit: int = 10,
+        *,
+        document_category: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Search historical PageIndex JSON nodes and return node-level evidence."""
+        if not query.strip() or limit <= 0:
             return []
 
         normalized_query = query.strip()
-        with cls._connect() as conn:
-            try:
-                fts_rows = conn.execute(
-                    """
-                    SELECT
-                        bm25(history_case_fts) AS rank,
-                        p.id AS project_id,
-                        p.year,
-                        p.batch,
-                        p.sequence,
-                        p.subject,
-                        p.result,
-                        p.primary_domain,
-                        p.primary_subdomain,
-                        p.domain_confidence,
-                        p.domain_keywords,
-                        p.title AS project_title,
-                        p.source_path AS project_path,
-                        d.id AS document_id,
-                        d.file_name,
-                        d.source_path AS document_path,
-                        d.markdown_path,
-                        d.block_json_path,
-                        d.html_preview_path,
-                        d.asset_dir,
-                        d.pageindex_tree_path,
-                        snippet(history_case_fts, 4, '[', ']', '...', 24) AS snippet
-                    FROM history_case_fts
-                    JOIN case_projects p ON p.id = history_case_fts.project_id
-                    JOIN case_documents d ON d.id = history_case_fts.document_id
-                    WHERE history_case_fts MATCH ?
-                    ORDER BY rank
-                    LIMIT ?
-                    """,
-                    (normalized_query, limit),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                fts_rows = []
-            results = [dict(row) for row in fts_rows]
-            seen_document_ids = {row["document_id"] for row in results}
-            if len(results) >= limit:
-                return results
+        sqlite_rows = cls._search_sqlite_pageindex_nodes(
+            normalized_query,
+            limit=limit,
+            document_category=document_category,
+        )
+        if sqlite_rows:
+            return sqlite_rows
 
-            like = f"%{normalized_query}%"
-            fallback_rows = conn.execute(
-                """
-                SELECT
-                    0.0 AS rank,
-                    p.id AS project_id,
-                    p.year,
-                    p.batch,
-                    p.sequence,
-                    p.subject,
-                    p.result,
-                    p.primary_domain,
-                    p.primary_subdomain,
-                    p.domain_confidence,
-                    p.domain_keywords,
-                    p.title AS project_title,
-                    p.source_path AS project_path,
-                    d.id AS document_id,
-                    d.file_name,
-                    d.source_path AS document_path,
-                    d.markdown_path,
-                    d.block_json_path,
-                    d.html_preview_path,
-                    d.asset_dir,
-                    d.pageindex_tree_path,
-                    history_case_fts.body AS body
-                FROM history_case_fts
-                JOIN case_projects p ON p.id = history_case_fts.project_id
-                JOIN case_documents d ON d.id = history_case_fts.document_id
-                WHERE
-                    p.title LIKE ?
-                    OR p.subject LIKE ?
-                    OR p.result LIKE ?
-                    OR p.primary_domain LIKE ?
-                    OR p.primary_subdomain LIKE ?
-                    OR p.domain_keywords LIKE ?
-                    OR p.folder_name LIKE ?
-                    OR d.file_name LIKE ?
-                    OR history_case_fts.body LIKE ?
-                ORDER BY p.year, p.batch, CAST(p.sequence AS REAL), p.sequence, d.file_name
-                LIMIT ?
-                """,
-                (like, like, like, like, like, like, like, like, like, limit * 3),
-            ).fetchall()
-            for row in fallback_rows:
-                if row["document_id"] in seen_document_ids:
-                    continue
-                record = dict(row)
-                body = str(record.pop("body") or "")
-                record["snippet"] = cls._make_snippet(
-                    query=normalized_query,
-                    body=body,
-                    fallback=" ".join(
-                        str(record.get(key) or "")
-                        for key in ("project_title", "subject", "result", "file_name")
-                    ),
-                )
-                results.append(record)
-                seen_document_ids.add(row["document_id"])
-                if len(results) >= limit:
-                    break
-            return results
+        terms = cls._pageindex_search_terms(normalized_query)
+        scored: list[dict[str, Any]] = []
+        for record in cls._iter_pageindex_records():
+            if document_category and record.get("document_category") != document_category:
+                continue
+            score = cls._pageindex_node_score(record, normalized_query, terms)
+            if score <= 0:
+                continue
+            record = dict(record)
+            record["snippet"] = cls._make_pageindex_snippet(
+                normalized_query,
+                node_title=str(record.get("node_title") or ""),
+                node_text=str(record.get("node_text") or ""),
+                terms=terms,
+            )
+            record["rank"] = round(score, 4)
+            scored.append(record)
+
+        scored.sort(
+            key=lambda item: (
+                -float(item.get("rank") or 0),
+                int(item.get("node_level") or 99),
+                str(item.get("project_title") or ""),
+            )
+        )
+        return scored[:limit]
+
+    @classmethod
+    def _pageindex_search_terms(cls, query: str) -> List[str]:
+        terms: list[str] = []
+
+        def add(term: str) -> None:
+            cleaned = re.sub(r"\s+", " ", str(term or "")).strip("：:，,。；; ")
+            if 2 <= len(cleaned) <= 48 and cleaned not in terms:
+                terms.append(cleaned)
+
+        normalized = str(query or "").strip()
+        compact = re.sub(r"\s+", "", normalized)
+        add(normalized)
+        add(compact)
+        for term in cls._extract_match_terms(normalized):
+            add(term)
+        for term in cls._requirement_search_terms(normalized):
+            add(term)
+        for token in re.findall(r"[\u4e00-\u9fffA-Za-z0-9（）()]{2,24}", normalized):
+            add(token)
+        for keyword in (*cls.MATCH_HINTS, *cls.REQUIREMENT_KEYWORDS):
+            if keyword in normalized or keyword in compact:
+                add(keyword)
+        return terms[:16]
+
+    @classmethod
+    def _pageindex_node_score(cls, row: Dict[str, Any], query: str, terms: list[str]) -> float:
+        title = str(row.get("node_title") or "")
+        text = str(row.get("node_text") or "")
+        metadata = " ".join(
+            str(row.get(key) or "")
+            for key in (
+                "project_title",
+                "subject",
+                "result",
+                "primary_domain",
+                "primary_subdomain",
+                "domain_keywords",
+                "file_name",
+                "document_category",
+            )
+        )
+        compact_title = re.sub(r"\s+", "", title)
+        compact_text = re.sub(r"\s+", "", text)
+        compact_metadata = re.sub(r"\s+", "", metadata)
+        compact_query = re.sub(r"\s+", "", str(query or ""))
+        score = 0.0
+
+        if compact_query:
+            if compact_query in compact_title:
+                score += 18.0
+            if compact_query in compact_text:
+                score += 12.0
+            if compact_query in compact_metadata:
+                score += 5.0
+
+        seen_terms: set[str] = set()
+        for index, term in enumerate(terms):
+            compact_term = re.sub(r"\s+", "", term)
+            if not compact_term or compact_term in seen_terms:
+                continue
+            seen_terms.add(compact_term)
+            weight = max(1.0, 6.0 - index * 0.22)
+            if compact_term in compact_title:
+                score += weight * 2.2
+            if compact_term in compact_text:
+                score += weight
+            if compact_term in compact_metadata:
+                score += weight * 0.55
+
+        result = str(row.get("result") or "")
+        if "中标" in result and "未中" not in result:
+            score += 2.0
+        if str(row.get("document_category") or "") == "技术标":
+            score += 1.4
+        node_level = int(row.get("node_level") or 0)
+        if 1 <= node_level <= 2:
+            score += 0.8
+        return score
+
+    @classmethod
+    def _make_pageindex_snippet(cls, query: str, node_title: str, node_text: str, terms: list[str]) -> str:
+        body = re.sub(r"\n{3,}", "\n\n", str(node_text or "")).strip()
+        for term in [query, *terms]:
+            cleaned = str(term or "").strip()
+            if cleaned and cleaned in body:
+                return cls._make_snippet(query=cleaned, body=body, fallback=node_title)
+        fallback = "\n".join(part for part in [node_title, body] if part)
+        return cls._make_snippet(query=query, body=fallback, fallback=node_title)
+
+    @classmethod
+    def search(cls, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        if not query.strip():
+            return []
+        return cls.search_pageindex_nodes(query.strip(), limit=limit)
 
     @classmethod
     def match_candidates(
@@ -390,7 +947,7 @@ class HistoryCaseService:
         limit: int = 8,
     ) -> List[Dict[str, Any]]:
         """召回并按规则分数聚合历史案例候选。"""
-        if not cls.DB_PATH.exists():
+        if not cls._pageindex_tree_files():
             return []
 
         query_text = cls._build_match_query_text(tender_text, analysis_report or {})
@@ -416,17 +973,42 @@ class HistoryCaseService:
                 "project_path": row.get("project_path", ""),
                 "best_document_id": row.get("document_id", ""),
                 "best_file_name": row.get("file_name", ""),
+                "best_document_category": row.get("document_category", ""),
+                "best_document_category_basis": row.get("document_category_basis", ""),
                 "best_document_path": row.get("document_path", ""),
                 "markdown_path": cls._normalize_artifact_path_for_response(row.get("markdown_path", "")),
                 "block_json_path": cls._normalize_artifact_path_for_response(row.get("block_json_path", "")),
                 "html_preview_path": cls._normalize_artifact_path_for_response(row.get("html_preview_path", "")),
                 "asset_dir": cls._normalize_artifact_path_for_response(row.get("asset_dir", "")),
                 "pageindex_tree_path": cls._normalize_artifact_path_for_response(row.get("pageindex_tree_path", "")),
+                "best_pageindex_node_id": row.get("pageindex_node_id", ""),
+                "best_node_id": row.get("node_id", ""),
+                "best_node_title": row.get("node_title", ""),
+                "best_node_path": row.get("node_path", []),
+                "best_node_path_text": row.get("node_path_text", ""),
+                "best_node_level": row.get("node_level", 0),
+                "best_node_line_num": row.get("node_line_num", 0),
+                "best_node_text": cls._trim_reference_text(str(row.get("node_text") or ""), max_chars=1200),
+                "pageindex_snippets": [],
                 "snippet": row.get("snippet", ""),
                 "score": 0.0,
                 "match_reasons": [],
                 "_scored_hit_keys": set(),
             })
+            if row.get("pageindex_node_id") and not any(
+                item.get("pageindex_node_id") == row.get("pageindex_node_id")
+                for item in record.get("pageindex_snippets", [])
+            ):
+                record["pageindex_snippets"].append({
+                    "pageindex_node_id": row.get("pageindex_node_id", ""),
+                    "node_id": row.get("node_id", ""),
+                    "node_title": row.get("node_title", ""),
+                    "node_path": row.get("node_path", []),
+                    "node_path_text": row.get("node_path_text", ""),
+                    "node_level": row.get("node_level", 0),
+                    "node_line_num": row.get("node_line_num", 0),
+                    "snippet": row.get("snippet", ""),
+                })
             scored_hit_keys = record.setdefault("_scored_hit_keys", set())
             if reason not in scored_hit_keys:
                 record["score"] = float(record["score"]) + score
@@ -437,56 +1019,26 @@ class HistoryCaseService:
                 record["snippet"] = row.get("snippet")
                 record["best_document_id"] = row.get("document_id", "")
                 record["best_file_name"] = row.get("file_name", "")
+                record["best_document_category"] = row.get("document_category", "")
+                record["best_document_category_basis"] = row.get("document_category_basis", "")
                 record["best_document_path"] = row.get("document_path", "")
                 record["markdown_path"] = cls._normalize_artifact_path_for_response(row.get("markdown_path", ""))
                 record["block_json_path"] = cls._normalize_artifact_path_for_response(row.get("block_json_path", ""))
                 record["html_preview_path"] = cls._normalize_artifact_path_for_response(row.get("html_preview_path", ""))
                 record["asset_dir"] = cls._normalize_artifact_path_for_response(row.get("asset_dir", ""))
                 record["pageindex_tree_path"] = cls._normalize_artifact_path_for_response(row.get("pageindex_tree_path", ""))
+                record["best_pageindex_node_id"] = row.get("pageindex_node_id", "")
+                record["best_node_id"] = row.get("node_id", "")
+                record["best_node_title"] = row.get("node_title", "")
+                record["best_node_path"] = row.get("node_path", [])
+                record["best_node_path_text"] = row.get("node_path_text", "")
+                record["best_node_level"] = row.get("node_level", 0)
+                record["best_node_line_num"] = row.get("node_line_num", 0)
+                record["best_node_text"] = cls._trim_reference_text(str(row.get("node_text") or ""), max_chars=1200)
 
         for index, term in enumerate(query_terms[:10]):
             for row in cls.search(term, limit=12):
                 add_result(row, max(1.0, 10.0 - index), f"关键词命中：{term}")
-
-        with cls._connect() as conn:
-            for term in query_terms[:8]:
-                rows = conn.execute(
-                    """
-                    SELECT
-                        p.id AS project_id,
-                        p.year,
-                        p.batch,
-                        p.sequence,
-                        p.subject,
-                        p.result,
-                        p.primary_domain,
-                        p.primary_subdomain,
-                        p.domain_confidence,
-                        p.domain_keywords,
-                        p.title AS project_title,
-                        p.source_path AS project_path,
-                        d.id AS document_id,
-                        d.file_name,
-                        d.source_path AS document_path,
-                        d.markdown_path,
-                        d.block_json_path,
-                        d.html_preview_path,
-                        d.asset_dir,
-                        d.pageindex_tree_path,
-                        '' AS snippet
-                    FROM case_projects p
-                    JOIN case_documents d ON d.project_id = p.id
-                    WHERE p.primary_domain LIKE ?
-                       OR p.primary_subdomain LIKE ?
-                       OR p.title LIKE ?
-                       OR p.folder_name LIKE ?
-                    GROUP BY p.id
-                    LIMIT 20
-                    """,
-                    (f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%"),
-                ).fetchall()
-                for row in rows:
-                    add_result(dict(row), 3.0, f"元数据命中：{term}")
 
         cls._apply_reference_match_rerank(project_scores.values(), query_text)
         candidates = sorted(project_scores.values(), key=lambda item: (-float(item["score"]), item["year"], item["batch"]))[:limit]
@@ -540,6 +1092,49 @@ class HistoryCaseService:
         return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
 
     @classmethod
+    def load_pageindex_context_for_candidate(cls, candidate: Dict[str, Any], max_chars: int = 60000) -> str:
+        """Load compact PageIndex context for a matched historical candidate."""
+        if not candidate:
+            return ""
+        parts: list[str] = []
+        best_text = cls._trim_reference_text(str(candidate.get("best_node_text") or ""), max_chars=12000)
+        if best_text:
+            parts.append(
+                "【最相关 PageIndex 节点】\n"
+                f"项目：{candidate.get('project_title') or candidate.get('subject') or ''}\n"
+                f"文档：{candidate.get('best_file_name') or candidate.get('file_name') or ''}\n"
+                f"标题：{candidate.get('best_node_title') or candidate.get('node_title') or ''}\n"
+                f"{best_text}"
+            )
+
+        tree_path = cls._first_text(
+            candidate.get("pageindex_tree_path"),
+            (candidate.get("source_paths") or {}).get("pageindex_tree_path") if isinstance(candidate.get("source_paths"), dict) else "",
+        )
+        tree = cls._load_pageindex_tree(Path(tree_path)) if tree_path else {}
+        structure = tree.get("structure")
+        if isinstance(structure, list):
+            metadata = cls._tree_metadata(Path(tree_path), tree)
+            rows = [
+                row
+                for row in cls._flatten_pageindex_nodes(structure, metadata=metadata)
+                if int(row.get("node_level") or 1) <= 2
+            ][:80]
+            if rows:
+                parts.append(f"【PageIndex 文档结构：{tree.get('doc_name') or metadata['project_title']}】")
+            for row in rows:
+                if sum(len(part) for part in parts) >= max_chars:
+                    break
+                level = max(1, min(6, int(row.get("node_level") or 1)))
+                heading = f"{'#' * level} {row.get('node_title') or ''}".strip()
+                text = str(row.get("node_text") or "").strip()
+                payload = cls._trim_reference_text(text if text.startswith("#") else f"{heading}\n{text}", max_chars=2400)
+                if payload:
+                    parts.append(payload)
+        context = "\n\n".join(part for part in parts if str(part or "").strip())
+        return context[:max_chars]
+
+    @classmethod
     def load_block_json(cls, block_json_path: str) -> Dict[str, Any]:
         path = cls._resolve_history_artifact_path(block_json_path)
         if not path.exists() or not path.is_file():
@@ -586,28 +1181,36 @@ class HistoryCaseService:
             return []
 
         candidates: list[dict[str, Any]] = []
-        seen_documents: set[str] = set()
+        seen_nodes: set[str] = set()
         for term in terms:
-            rows = cls.search(term, limit=max(limit * 3, 6))
+            rows = cls.search_pageindex_nodes(term, limit=max(limit * 6, 12), document_category="技术标")
+            if not rows:
+                rows = cls.search(term, limit=max(limit * 3, 6))
             for row in rows:
-                document_key = cls._first_text(
-                    row.get("document_id"),
+                node_key = cls._first_text(
+                    row.get("pageindex_node_id"),
+                    row.get("node_id"),
                     row.get("markdown_path"),
                     row.get("document_path"),
-                    fallback=str(len(seen_documents)),
+                    fallback=str(len(seen_nodes)),
                 )
-                if document_key in seen_documents:
+                if node_key in seen_nodes:
                     continue
-                seen_documents.add(document_key)
+                seen_nodes.add(node_key)
 
                 markdown = cls.load_markdown(str(row.get("markdown_path") or ""), max_chars=90000)
                 block_payload = cls.load_block_json(str(row.get("block_json_path") or ""))
                 all_blocks = block_payload.get("blocks") if isinstance(block_payload, dict) else []
-                matched_blocks = cls._extract_matching_blocks(all_blocks if isinstance(all_blocks, list) else [], title)
+                matched_blocks = cls._extract_pageindex_matched_blocks(
+                    all_blocks if isinstance(all_blocks, list) else [],
+                    title=title,
+                    row=row,
+                )
                 has_word_heading_match = bool(matched_blocks)
                 reference_text = cls._blocks_to_markdown(matched_blocks) if matched_blocks else ""
                 if not reference_text:
-                    reference_text = cls._extract_markdown_section(
+                    node_text = cls._trim_reference_text(str(row.get("node_text") or ""), max_chars=4200)
+                    reference_text = node_text or cls._extract_markdown_section(
                         markdown,
                         title,
                         fallback_snippet=str(row.get("snippet") or ""),
@@ -664,13 +1267,23 @@ class HistoryCaseService:
                         "html_fragment": html_fragment,
                         "matched_blocks": matched_blocks,
                         "has_word_heading_match": has_word_heading_match,
-                        "reference_source": "word_heading_blocks" if has_word_heading_match else "markdown_fallback",
+                        "reference_source": "pageindex_word_blocks" if has_word_heading_match else "pageindex_node",
+                        "pageindex_node": {
+                            "pageindex_node_id": row.get("pageindex_node_id") or "",
+                            "node_id": row.get("node_id") or "",
+                            "node_title": row.get("node_title") or "",
+                            "node_path": row.get("node_path") or [],
+                            "node_path_text": row.get("node_path_text") or "",
+                            "node_level": row.get("node_level") or 0,
+                            "node_line_num": row.get("node_line_num") or 0,
+                        },
                         "source_paths": {
                             "markdown_path": cls._normalize_artifact_path_for_response(row.get("markdown_path", "")),
                             "block_json_path": cls._normalize_artifact_path_for_response(row.get("block_json_path", "")),
                             "html_preview_path": cls._normalize_artifact_path_for_response(row.get("html_preview_path", "")),
                             "asset_dir": cls._normalize_artifact_path_for_response(row.get("asset_dir", "")),
                             "source_docx_path": cls._normalize_artifact_path_for_response(row.get("document_path", "")),
+                            "pageindex_tree_path": cls._normalize_artifact_path_for_response(row.get("pageindex_tree_path", "")),
                         },
                         "reference_char_count": len(reference_text),
                         "block_inventory": block_inventory,
@@ -915,18 +1528,31 @@ class HistoryCaseService:
     def _check_single_requirement(cls, item: Dict[str, Any], limit_per_item: int) -> Dict[str, Any]:
         terms = cls._requirement_search_terms(item.get("query_text") or item.get("requirement") or item.get("label") or "")
         evidence: list[dict[str, Any]] = []
-        seen_documents: set[str] = set()
+        seen_sources: set[str] = set()
         matched_terms: set[str] = set()
 
         for term in terms:
-            for row in cls.search(term, limit=max(4, limit_per_item * 2)):
-                document_id = str(row.get("document_id") or "")
-                if document_id in seen_documents:
+            rows = cls.search_pageindex_nodes(term, limit=max(6, limit_per_item * 3))
+            if not rows:
+                rows = cls.search(term, limit=max(4, limit_per_item * 2))
+            for row in rows:
+                source_id = cls._first_text(row.get("pageindex_node_id"), row.get("document_id"), fallback=str(len(seen_sources)))
+                if source_id in seen_sources:
                     continue
-                seen_documents.add(document_id)
+                seen_sources.add(source_id)
                 haystack = " ".join(
                     str(row.get(key) or "")
-                    for key in ("project_title", "subject", "result", "primary_domain", "file_name", "snippet")
+                    for key in (
+                        "project_title",
+                        "subject",
+                        "result",
+                        "primary_domain",
+                        "file_name",
+                        "node_title",
+                        "node_path_text",
+                        "node_text",
+                        "snippet",
+                    )
                 )
                 term_hits = [candidate for candidate in terms if candidate and candidate in haystack]
                 if term_hits:
@@ -939,11 +1565,20 @@ class HistoryCaseService:
                     "primary_subdomain": row.get("primary_subdomain"),
                     "document_id": row.get("document_id"),
                     "file_name": row.get("file_name"),
+                    "document_category": row.get("document_category"),
+                    "document_category_basis": row.get("document_category_basis"),
                     "document_path": row.get("document_path"),
                     "pageindex_tree_path": row.get("pageindex_tree_path"),
+                    "pageindex_node_id": row.get("pageindex_node_id"),
+                    "node_id": row.get("node_id"),
+                    "node_title": row.get("node_title"),
+                    "node_path": row.get("node_path"),
+                    "node_path_text": row.get("node_path_text"),
+                    "node_level": row.get("node_level"),
+                    "node_line_num": row.get("node_line_num"),
                     "snippet": row.get("snippet"),
                     "matched_term": term,
-                    "is_winning_case": "中标" in str(row.get("result") or ""),
+                    "is_winning_case": "中标" in str(row.get("result") or "") and "未中" not in str(row.get("result") or ""),
                 })
                 if len(evidence) >= limit_per_item * 3:
                     break
@@ -1211,7 +1846,18 @@ class HistoryCaseService:
         score = 0.18
         candidate_text = " ".join(
             cls._text(row.get(key))
-            for key in ("project_title", "subject", "primary_domain", "primary_subdomain", "domain_keywords", "file_name", "snippet")
+            for key in (
+                "project_title",
+                "subject",
+                "primary_domain",
+                "primary_subdomain",
+                "domain_keywords",
+                "file_name",
+                "node_title",
+                "node_path_text",
+                "node_text",
+                "snippet",
+            )
         )
         query_groups = cls._object_groups(query_text)
         candidate_groups = cls._object_groups(candidate_text)
@@ -1357,6 +2003,130 @@ class HistoryCaseService:
             "has_table": bool(table_lines),
             "has_image": bool(image_matches),
         }
+
+    @classmethod
+    def _extract_pageindex_matched_blocks(
+        cls,
+        blocks: list[dict[str, Any]],
+        *,
+        title: str,
+        row: Dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not blocks:
+            return []
+        titles: list[str] = []
+
+        def add(candidate: Any) -> None:
+            text = cls._text(candidate)
+            if text and text not in titles:
+                titles.append(text)
+
+        add(row.get("node_title"))
+        add(title)
+        node_path = row.get("node_path")
+        if isinstance(node_path, list):
+            for item in reversed(node_path):
+                add(item)
+        add(row.get("node_path_text"))
+
+        for candidate_title in titles:
+            matched = cls._extract_matching_blocks(blocks, candidate_title)
+            if matched:
+                if cls._should_prefer_full_personnel_roster(title, candidate_title):
+                    return cls._prefer_full_personnel_roster_blocks(blocks, matched)
+                return matched
+        return []
+
+    @classmethod
+    def _should_prefer_full_personnel_roster(cls, title: str, candidate_title: str) -> bool:
+        text = re.sub(r"\s+", "", f"{title or ''}{candidate_title or ''}")
+        if cls._is_equipment_reference_title(text):
+            return False
+        return any(
+            keyword in text
+            for keyword in (
+                "项目组成人员",
+                "组成人员详情",
+                "人员配置",
+                "主要人员",
+                "拟投入人员",
+                "团队人员",
+            )
+        )
+
+    @classmethod
+    def _prefer_full_personnel_roster_blocks(
+        cls,
+        blocks: list[dict[str, Any]],
+        matched_blocks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        roster_table = cls._largest_personnel_roster_table(blocks)
+        if not roster_table:
+            return matched_blocks
+
+        matched_table_rows = [
+            len(block.get("rows") or [])
+            for block in matched_blocks
+            if isinstance(block, dict) and str(block.get("type") or "") == "table"
+        ]
+        best_matched_rows = max(matched_table_rows or [0])
+        roster_rows = len(roster_table.get("rows") or [])
+        if roster_rows < max(8, best_matched_rows + 3):
+            return matched_blocks
+
+        roster_id = str(roster_table.get("id") or "")
+        roster_index = next(
+            (index for index, block in enumerate(blocks) if str(block.get("id") or "") == roster_id),
+            -1,
+        )
+        if roster_index < 0:
+            return matched_blocks
+
+        start = roster_index
+        while start > 0 and str(blocks[start - 1].get("type") or "") == "paragraph":
+            previous_text = cls._text(blocks[start - 1].get("text") or blocks[start - 1].get("markdown"))
+            if not re.search(r"人员|配置|见下表|如下", previous_text):
+                break
+            start -= 1
+        if start > 0 and str(blocks[start - 1].get("type") or "") == "heading":
+            heading_text = cls._text(blocks[start - 1].get("text") or blocks[start - 1].get("markdown"))
+            if cls._is_personnel_reference_title(heading_text):
+                start -= 1
+
+        selected = blocks[start : roster_index + 1]
+        if selected:
+            return selected
+        return [roster_table]
+
+    @classmethod
+    def _largest_personnel_roster_table(cls, blocks: list[dict[str, Any]]) -> dict[str, Any] | None:
+        best: dict[str, Any] | None = None
+        best_score = -1
+        for block in blocks:
+            if not isinstance(block, dict) or str(block.get("type") or "") != "table":
+                continue
+            rows = block.get("rows")
+            if not isinstance(rows, list) or len(rows) < 8:
+                continue
+            text = re.sub(r"\s+", "", cls._text(block.get("text") or block.get("markdown")))
+            if not (
+                "姓名" in text
+                and ("职称" in text or "注册证书" in text or "执业证书" in text)
+                and ("本项目职务" in text or "负责事项" in text or "专业" in text or "岗位" in text)
+            ):
+                continue
+            heading_text = "".join(
+                cls._text(item.get("title") or item.get("text"))
+                for item in (block.get("heading_path") or [])
+                if isinstance(item, dict)
+            )
+            score = len(rows) * 10
+            if re.search(r"人员配置|项目管理机构|主要人员|拟投入人员|人员表", heading_text + text):
+                score += 1000
+            if score > best_score:
+                best = block
+                best_score = score
+        return best
 
     @classmethod
     def _extract_matching_blocks(cls, blocks: list[dict[str, Any]], title: str, max_blocks: int = 160) -> list[dict[str, Any]]:
@@ -1765,6 +2535,9 @@ class HistoryCaseService:
                 "primary_subdomain",
                 "domain_keywords",
                 "best_file_name",
+                "best_node_title",
+                "best_node_path_text",
+                "best_node_text",
                 "snippet",
             )
         )

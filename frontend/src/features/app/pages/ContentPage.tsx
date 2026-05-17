@@ -10,7 +10,6 @@ import {
   ExclamationTriangleIcon,
   PauseIcon,
   PlayIcon,
-  ShieldCheckIcon,
   SparklesIcon,
   StopIcon,
   XMarkIcon,
@@ -20,12 +19,11 @@ import { BidMode } from '../../../types';
 import { blockAssetKey, blockTypeLabel, isVisualBlockType, visualAssetResultFromBlock } from '../../../utils/visualAssets';
 import { ReferenceSlotPreview } from '../../assets/ReferenceSlotPreview';
 import { ReferenceSlotShowcase } from '../../assets/ReferenceSlotShowcase';
-import { DocumentPreviewNode } from '../../content/DocumentPreviewNode';
+import { DocumentPreviewNode, buildDocumentTableNumbering } from '../../content/DocumentPreviewNode';
 import { DocumentTocRows } from '../../content/DocumentTocRows';
 import { VerifyLine } from '../../config/VerifyLine';
 import { OutlineDraftPreview } from '../../outline/OutlineDraftPreview';
 import { OutlineRows } from '../../outline/OutlineRows';
-import { Metric } from '../../review/Metric';
 import { TaskProgress } from '../../shared/TaskProgress';
 import type { BidWorkspaceController } from '../useBidWorkspaceController';
 
@@ -77,7 +75,6 @@ export const ContentPage = ({ controller }: PageProps) => {
     bidDocumentCompositionLine,
     bidModeLabel,
     BLOCKING_REPORT_WARNING_PATTERN,
-    blockingIssues,
     buildClientFallbackOutline,
     buildEvidenceSecondLevelChildren,
     buildEvidenceThirdLevelChildren,
@@ -184,7 +181,6 @@ export const ContentPage = ({ controller }: PageProps) => {
     localConfig,
     locateSourceItem,
     makeFallbackOutlineNode,
-    manualReviewConfirmed,
     markdownImagePattern,
     markdownTableDividerPattern,
     matchedHistoryCase,
@@ -236,8 +232,6 @@ export const ContentPage = ({ controller }: PageProps) => {
     restoreDraft,
     restoreHistoryRecord,
     resumeGeneration,
-    reviewCoverage,
-    reviewReport,
     runAnalysis,
     runBatch,
     runConsistencyRevision,
@@ -247,7 +241,6 @@ export const ContentPage = ({ controller }: PageProps) => {
     runHistoryRequirementCheck,
     runOutline,
     runReferenceAnalysis,
-    runReview,
     runtimeEvent,
     runtimeStatus,
     runtimeStatusText,
@@ -293,7 +286,6 @@ export const ContentPage = ({ controller }: PageProps) => {
     setHistoryRequirementSummary,
     setInfo,
     setLocalConfig,
-    setManualReviewConfirmed,
     setMatchedHistoryCase,
     setModelRuntime,
     setNavCollapsed,
@@ -364,13 +356,41 @@ export const ContentPage = ({ controller }: PageProps) => {
     visualBlocksByChapter,
     visualBlocksCount,
     waitIfGenerationPaused,
-    warningIssues,
     wordPreviewStyle,
     workflowStatus,
   } = controller;
+  const tableNumberingByItemId = effectiveOutline ? buildDocumentTableNumbering(effectiveOutline.outline) : {};
 
   return (
-    <div className="word-workspace">
+    <div className="content-workspace">
+      <div className="preview-actions content-action-strip">
+        <label className="export-path-control export-path-control--strip">
+          <span>后端保存目录（可选）</span>
+          <input
+            value={exportDirectory}
+            onChange={event => setExportDirectory(event.target.value)}
+            placeholder="留空时导出会弹出本地保存位置选择"
+          />
+        </label>
+        <button type="button" className="solid-button" onClick={runCurrentChapter} disabled={!selectedEntry || busy.startsWith('chapter')}>
+          <PlayIcon className="h-4 w-4" /> 生成本章
+        </button>
+        <button type="button" onClick={runBatch} disabled={!effectiveOutline || busy === 'batch'}>批量生成</button>
+        {(busy.startsWith('chapter') || busy === 'batch') && (
+          <div className="generation-controls">
+            {generationControl === 'paused' ? (
+              <button type="button" onClick={resumeGeneration}><PlayIcon className="h-4 w-4" /> 继续</button>
+            ) : (
+              <button type="button" onClick={pauseGeneration}><PauseIcon className="h-4 w-4" /> 暂停</button>
+            )}
+            <button type="button" className="danger-button" onClick={stopGeneration}><StopIcon className="h-4 w-4" /> 停止</button>
+          </div>
+        )}
+        <button type="button" onClick={exportWord} disabled={!effectiveOutline || busy === 'export'}>
+          <ArrowDownTrayIcon className="h-4 w-4" /> 导出 Word（选择位置）
+        </button>
+      </div>
+      <div className="word-workspace">
                     <aside className="word-toc-panel">
                       <div className="ops-panel__head">
                         <div>
@@ -399,41 +419,6 @@ export const ContentPage = ({ controller }: PageProps) => {
                     </aside>
     
                     <div className="word-editor-panel">
-                      <div className="preview-actions">
-                        <button type="button" className="solid-button" onClick={runCurrentChapter} disabled={!selectedEntry || busy.startsWith('chapter')}>
-                          <PlayIcon className="h-4 w-4" /> 生成本章
-                        </button>
-                        <button type="button" onClick={runBatch} disabled={!effectiveOutline || busy === 'batch'}>批量生成</button>
-                        {(busy.startsWith('chapter') || busy === 'batch') && (
-                          <div className="generation-controls">
-                            {generationControl === 'paused' ? (
-                              <button type="button" onClick={resumeGeneration}><PlayIcon className="h-4 w-4" /> 继续</button>
-                            ) : (
-                              <button type="button" onClick={pauseGeneration}><PauseIcon className="h-4 w-4" /> 暂停</button>
-                            )}
-                            <button type="button" className="danger-button" onClick={stopGeneration}><StopIcon className="h-4 w-4" /> 停止</button>
-                          </div>
-                        )}
-                        <button type="button" onClick={exportWord} disabled={!effectiveOutline || busy === 'export' || !manualReviewConfirmed}>
-                          <ArrowDownTrayIcon className="h-4 w-4" /> 导出 Word
-                        </button>
-                      </div>
-                      <label className="manual-review-control">
-                        <input
-                          type="checkbox"
-                          checked={manualReviewConfirmed}
-                          onChange={event => setManualReviewConfirmed(event.target.checked)}
-                        />
-                        <span>已人工复核模型结果、缺失材料、页码目录、版式、签章位置、图表占位和固定格式风险。</span>
-                      </label>
-                      <label className="export-path-control">
-                        <span>保存目录</span>
-                        <input
-                          value={exportDirectory}
-                          onChange={event => setExportDirectory(event.target.value)}
-                          placeholder="例如 ~/Downloads 或 /Users/songyuheng/Desktop"
-                        />
-                      </label>
                       {generationProgress && (
                         <div className="content-progress-strip">
                           <TaskProgress progress={generationProgress} />
@@ -463,6 +448,7 @@ export const ContentPage = ({ controller }: PageProps) => {
                                   streamingId={streamingChapterId}
                                   onSelect={scrollToDocumentNode}
                                   visualBlocksByChapter={visualBlocksByChapter}
+                                  tableNumberingByItemId={tableNumberingByItemId}
                                 />
                               ))}
                             </>
@@ -476,5 +462,6 @@ export const ContentPage = ({ controller }: PageProps) => {
                       </div>
                     </div>
                   </div>
+                </div>
   );
 };

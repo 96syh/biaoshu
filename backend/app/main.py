@@ -8,10 +8,10 @@ from pathlib import Path
 import fastapi.middleware.cors
 import starlette.middleware.cors
 
+from .api.health import router as health_router
+from .api.router import api_router
 from .config import settings
-from .routers import config, document, outline, content, projects, history_cases
 from .services.file_service import FileService
-from .services.model_runtime_monitor import ModelRuntimeMonitor
 
 HTML_NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -56,13 +56,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册路由
-app.include_router(config.router)
-app.include_router(document.router)
-app.include_router(outline.router)
-app.include_router(content.router)
-app.include_router(projects.router)
-app.include_router(history_cases.router)
+app.include_router(health_router)
+app.include_router(api_router)
 
 if search is not None:
     app.include_router(search.router)
@@ -76,17 +71,6 @@ app.mount(
     StaticFiles(directory=str(FileService.GENERATED_ASSET_DIR)),
     name="generated_assets",
 )
-
-# 健康检查端点
-@app.get("/health")
-async def health_check():
-    """健康检查"""
-    return {
-        "status": "healthy",
-        "app_name": settings.app_name,
-        "version": settings.app_version,
-        "model_runtime": ModelRuntimeMonitor.snapshot(),
-    }
 
 def _frontend_static_dir() -> Path | None:
     configured = os.getenv("YIBIAO_FRONTEND_STATIC_DIR", "").strip()

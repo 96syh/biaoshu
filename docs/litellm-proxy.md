@@ -17,8 +17,6 @@ uv tool install "litellm[proxy]"
 litellm --model openai/gpt-4.1-mini --host 0.0.0.0 --port 4000
 ```
 
-如果使用 Docker，可参考 LiteLLM 官方镜像，把配置文件挂载到容器中运行。
-
 ## 多模型配置示例
 
 创建 `litellm_config.yaml`：

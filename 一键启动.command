@@ -90,7 +90,7 @@ if [ -f .env ]; then
   . ./.env
   set +a
 fi
-HOST="$BACKEND_HOST" PORT="$BACKEND_PORT" WORKERS=1 "$PYTHON_BIN" run.py
+HOST="$BACKEND_HOST" PORT="$BACKEND_PORT" WORKERS=1 "$PYTHON_BIN" -m uvicorn app.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" --workers 1
 EOF
 
 cat >"$FRONTEND_LAUNCHER" <<EOF

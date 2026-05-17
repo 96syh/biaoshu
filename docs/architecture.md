@@ -47,7 +47,7 @@ flowchart LR
     File["FileService<br/>上传解析与原文预览"]
     Gateway["ModelGatewayService<br/>底层模型网关"]
     Biz["OpenAIService<br/>标书业务生成"]
-    Project["ProjectService<br/>SQLite 项目草稿"]
+    Project["ProjectService<br/>JSON 项目草稿"]
     History["HistoryCaseService<br/>历史案例检索"]
     Visual["VisualAssetService<br/>图片生成"]
     Export["WordExportService<br/>DOCX 导出"]
@@ -143,7 +143,7 @@ sequenceDiagram
 | DOCX HTML 预览 | `FileService` DOCX 预览 | 开启，`YIBIAO_ENABLE_DOCX_HTML_PREVIEW=1` | `python-docx` | `sourcePreviewHtml` | 失败时前端使用纯文本分页预览 |
 | 提取图片上传 | `FileService` 图片处理 | 关闭，`YIBIAO_UPLOAD_EXTRACTED_IMAGES=0` | 本地文件/静态资源目录 | 解析图片资源 URL | 不影响正文生成，只少一些图片参考 |
 | 成熟样例模板 | `/api/document/reference-style-upload` 或历史匹配 | 手动触发 | 真实模型 + 样例文件/历史库 | `ReferenceBidStyleProfile` | 目录和正文按招标文件与默认规则生成 |
-| 历史案例匹配 | `/api/history-cases/match-reference` | 手动触发 | `history_cases.sqlite3` + 模型选择 | 匹配案例、样例风格 | 用户可手动上传样例或跳过 |
+| 历史案例匹配 | `/api/history-cases/match-reference` | 手动触发 | PageIndex 树结构 JSON + 模型选择 | 匹配案例、样例风格 | 用户可手动上传样例或跳过 |
 | 历史要求核对 | `/api/history-cases/check-requirements` | 手动触发 | 历史案例库 | 要求满足/未命中证据 | 只影响提示和核对，不改变解析事实源 |
 | 图表素材规划 | `/api/document/document-blocks-plan-stream` | 手动触发，`YIBIAO_AUTO_DOCUMENT_BLOCKS_PLAN=0` | 模型 | 表格/图片/流程图/承诺书规划 | 正文和导出继续，图表占位减少 |
 | 图片生成 | `/api/document/generate-visual-asset` | 手动触发 | 图像模型 | base64 或图片 URL | Word 中保留占位，人工替换 |
@@ -151,7 +151,7 @@ sequenceDiagram
 | 搜索路由 | `ENABLE_SEARCH_ROUTER=true` | 关闭 | `backend/app/optional/search.py` + `backend/requirements-optional.txt` | 搜索结果 | 不影响标书主链路 |
 | 旧扩写接口 | `ENABLE_LEGACY_EXPAND_ROUTER=true` | 关闭 | `backend/app/optional/expand.py` | 旧目录参考 | 保留兼容，不参与默认流程 |
 | MCP DuckDuckGo | 手动运行 | 关闭 | `backend/optional/mcp/` + optional 依赖 | MCP 搜索工具 | 与 FastAPI 主流程隔离 |
-| 构建/发布/运行数据 | 构建脚本或运行时生成 | 非源码 | `artifacts/build/`、`artifacts/release/`、`artifacts/data/`、`artifacts/tmp/` | 静态包、发布包、SQLite、生成素材 | 默认 `.gitignore`，可用 env 指向外部路径 |
+| 构建/发布/运行数据 | 一键启动或运行时生成 | 非源码 | `artifacts/runtime/`、`artifacts/data/history_cases/pageindex_trees/` | 项目状态 JSON、PageIndex 树 JSON、生成素材 | 默认 `.gitignore`，可用 env 指向外部路径 |
 | 本地兜底生成 | `YIBIAO_ENABLE_GENERATION_FALLBACKS=1` + `YIBIAO_FORCE_LOCAL_FALLBACK=1` | 关闭 | 无模型或 smoke test | 兜底报告/目录/正文/审校 | 默认关闭；真实生成失败应报错并重试 |
 
 ## 功能边界图

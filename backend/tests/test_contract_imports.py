@@ -71,8 +71,8 @@ class BackendContractImportTests(unittest.TestCase):
 
         self.assertIn("artifacts/data/generated_assets", str(FileService.GENERATED_ASSET_DIR))
         self.assertIn("artifacts/data/generation_cache", str(GenerationCacheService.CACHE_DIR))
-        self.assertIn("artifacts/data/history_cases.sqlite3", str(HistoryCaseService.DB_PATH))
-        self.assertIn("artifacts/data/projects.sqlite3", str(ProjectService.DB_PATH))
+        self.assertIn("artifacts/data/history_cases/pageindex_trees", str(HistoryCaseService.PAGEINDEX_TREE_ROOT))
+        self.assertIn("artifacts/runtime/projects.json", str(ProjectService.STORE_PATH))
 
     def test_model_gateway_concurrency_env_has_safe_floor(self):
         from backend.app.services.model_gateway_service import ModelGatewayService
@@ -724,7 +724,7 @@ class BackendContractImportTests(unittest.TestCase):
 
     def test_docx_block_extraction_keeps_original_ooxml(self):
         import docx
-        from backend.scripts.build_history_case_library import extract_docx_blocks
+        from backend.app.services.history_case_service import extract_docx_blocks
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
@@ -940,6 +940,107 @@ class BackendContractImportTests(unittest.TestCase):
             self.assertNotIn("2025-2027 年工程设计服务框架项目投标文件-技术文件", header_text)
             self.assertIn("<w:pict", header_xml)
 
+    def test_word_export_prefers_generated_content_over_history_blocks(self):
+        import docx
+        from backend.app.models.schemas import OutlineItem, WordExportRequest
+        from backend.app.services.word_export_service import create_word_export_response
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template_path = Path(temp_dir) / "template.docx"
+            template = docx.Document()
+            template.add_paragraph("历史模板正文")
+            template.save(template_path)
+
+            block_json_path = Path(temp_dir) / "blocks.json"
+            block_json_path.write_text(json.dumps({
+                "blocks": [
+                    {
+                        "id": "b-1",
+                        "type": "paragraph",
+                        "text": "历史旧正文",
+                        "markdown": "历史旧正文",
+                        "docx_xml": (
+                            '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                            "<w:r><w:t>历史旧正文</w:t></w:r></w:p>"
+                        ),
+                    }
+                ]
+            }), encoding="utf-8")
+
+            request = WordExportRequest(
+                project_name="测试导出",
+                manual_review_confirmed=True,
+                export_dir=temp_dir,
+                outline=[
+                    OutlineItem(
+                        id="1",
+                        title="服务范围",
+                        description="",
+                        content="模型生成正文应当被导出。",
+                        history_reference={
+                            "matched_block_ids": ["b-1"],
+                            "source_paths": {
+                                "source_docx_path": str(template_path),
+                                "block_json_path": str(block_json_path),
+                            },
+                        },
+                    )
+                ],
+            )
+
+            response = asyncio.run(create_word_export_response(request))
+            payload = json.loads(response.body.decode("utf-8"))
+            exported = docx.Document(payload["file_path"])
+            text = "\n".join(paragraph.text for paragraph in exported.paragraphs)
+
+            self.assertIn("模型生成正文应当被导出。", text)
+            self.assertNotIn("历史旧正文", text)
+
+    def test_word_export_keeps_content_html_tables_with_full_borders(self):
+        import docx
+        import zipfile
+        from backend.app.models.schemas import OutlineItem, WordExportRequest
+        from backend.app.services.word_export_service import create_word_export_response
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            request = WordExportRequest(
+                project_name="测试导出",
+                manual_review_confirmed=True,
+                export_dir=temp_dir,
+                outline=[
+                    OutlineItem(
+                        id="5.2",
+                        title="项目组成人员详情",
+                        description="",
+                        content="本节说明人员配置。",
+                        content_html=(
+                            "<table><tbody>"
+                            "<tr><th>序号</th><th>本项目职务</th><th>姓名</th></tr>"
+                            "<tr><td>1</td><td>项目经理</td><td>关义</td></tr>"
+                            "</tbody></table>"
+                        ),
+                    )
+                ],
+            )
+
+            response = asyncio.run(create_word_export_response(request))
+            payload = json.loads(response.body.decode("utf-8"))
+            exported = docx.Document(payload["file_path"])
+            table_text = "\n".join(
+                "\t".join(cell.text for cell in row.cells)
+                for table in exported.tables
+                for row in table.rows
+            )
+            with zipfile.ZipFile(payload["file_path"]) as package:
+                document_xml = package.read("word/document.xml").decode("utf-8")
+
+            self.assertIn("本节说明人员配置。", "\n".join(p.text for p in exported.paragraphs))
+            self.assertIn("项目经理", table_text)
+            self.assertIn("关义", table_text)
+            self.assertIn("<w:insideH", document_xml)
+            self.assertIn("<w:insideV", document_xml)
+            self.assertNotIn('w:val="nil"', document_xml)
+
     def test_word_export_renumbers_outline_and_removes_duplicate_content_heading(self):
         import docx
         from backend.app.models.schemas import OutlineItem, WordExportRequest
@@ -991,93 +1092,209 @@ class BackendContractImportTests(unittest.TestCase):
     def test_history_case_match_deduplicates_same_project_document_hits(self):
         from backend.app.services.history_case_service import HistoryCaseService
 
-        original_db_path = HistoryCaseService.DB_PATH
+        original_tree_root = HistoryCaseService.PAGEINDEX_TREE_ROOT
         with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "history.sqlite3"
-            conn = sqlite3.connect(db_path)
+            tree_root = Path(temp_dir) / "pageindex_trees"
+            tree_payload = {
+                "line_count": 2,
+                "structure": [
+                    {
+                        "title": "服务方案",
+                        "node_id": "0001",
+                        "line_num": 1,
+                        "text": "# 服务方案\n油库 加油站 工程设计 服务方案",
+                        "nodes": [],
+                    }
+                ],
+            }
             try:
-                conn.executescript(
-                    """
-                    CREATE TABLE case_projects (
-                        id TEXT PRIMARY KEY,
-                        year TEXT,
-                        batch TEXT,
-                        sequence TEXT,
-                        subject TEXT,
-                        result TEXT,
-                        primary_domain TEXT,
-                        primary_subdomain TEXT,
-                        domain_confidence REAL,
-                        domain_keywords TEXT,
-                        title TEXT,
-                        source_path TEXT,
-                        folder_name TEXT
-                    );
-                    CREATE TABLE case_documents (
-                        id TEXT PRIMARY KEY,
-                        project_id TEXT,
-                        file_name TEXT,
-                        source_path TEXT,
-                        markdown_path TEXT,
-                        pageindex_tree_path TEXT
-                    );
-                    CREATE VIRTUAL TABLE history_case_fts USING fts5(
-                        project_id,
-                        document_id,
-                        project_title,
-                        file_name,
-                        body
-                    );
-                    """
-                )
-                projects = [
-                    ("p1", "1", "重复文档油库设计项目"),
-                    ("p2", "2", "单文档油库设计项目"),
-                ]
-                for project_id, sequence, title in projects:
-                    conn.execute(
-                        """
-                        INSERT INTO case_projects(
-                            id, year, batch, sequence, subject, result, primary_domain,
-                            primary_subdomain, domain_confidence, domain_keywords,
-                            title, source_path, folder_name
-                        ) VALUES (?, '2025', '技术1', ?, '华正', '中标', '油库加油站',
-                            '油库/加油站', 0.9, '["油库","设计"]', ?, '', ?)
-                        """,
-                        (project_id, sequence, title, title),
-                    )
-                docs = [
-                    ("d1", "p1", "技术标.docx"),
-                    ("d2", "p1", "技术标.pdf"),
-                    ("d3", "p2", "技术标.docx"),
-                ]
-                for doc_id, project_id, file_name in docs:
-                    conn.execute(
-                        """
-                        INSERT INTO case_documents(
-                            id, project_id, file_name, source_path, markdown_path, pageindex_tree_path
-                        ) VALUES (?, ?, ?, '', '', '')
-                        """,
-                        (doc_id, project_id, file_name),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO history_case_fts(project_id, document_id, project_title, file_name, body)
-                        VALUES (?, ?, '油库设计项目', ?, '油库 加油站 工程设计 服务方案')
-                        """,
-                        (project_id, doc_id, file_name),
-                    )
-                conn.commit()
-            finally:
-                conn.close()
-
-            HistoryCaseService.DB_PATH = db_path
-            try:
+                for relative, doc_name in (
+                    ("2025/技术1/p1/技术标-1.json", "重复文档油库设计项目"),
+                    ("2025/技术1/p1/技术标-2.json", "重复文档油库设计项目"),
+                    ("2025/技术1/p2/技术标.json", "单文档油库设计项目"),
+                ):
+                    path = tree_root / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    payload = {**tree_payload, "doc_name": doc_name}
+                    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                HistoryCaseService.PAGEINDEX_TREE_ROOT = tree_root
                 candidates = HistoryCaseService.match_candidates("油库 工程设计", {}, limit=2)
                 scores = {item["project_id"]: item["score"] for item in candidates}
                 self.assertEqual(scores.get("p1"), scores.get("p2"))
             finally:
-                HistoryCaseService.DB_PATH = original_db_path
+                HistoryCaseService.PAGEINDEX_TREE_ROOT = original_tree_root
+
+    def test_history_search_uses_pageindex_nodes_as_primary_source(self):
+        from backend.app.services.history_case_service import HistoryCaseService
+
+        original_tree_root = HistoryCaseService.PAGEINDEX_TREE_ROOT
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tree_root = Path(temp_dir) / "pageindex_trees"
+            tree_path = tree_root / "2025/技术1/p1/历史技术标.json"
+            tree_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                tree_path.write_text(
+                    json.dumps(
+                        {
+                            "doc_name": "历史油库设计服务项目",
+                            "line_count": 10,
+                            "structure": [
+                                {
+                                    "title": "技术标",
+                                    "node_id": "0001",
+                                    "line_num": 1,
+                                    "text": "# 技术标",
+                                    "nodes": [
+                                        {
+                                            "title": "服务范围",
+                                            "node_id": "0002",
+                                            "line_num": 8,
+                                            "text": "## 服务范围\n油库工程设计服务范围包括工艺、建筑、结构、给排水等专业。",
+                                            "nodes": [],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                HistoryCaseService.PAGEINDEX_TREE_ROOT = tree_root
+                rows = HistoryCaseService.search("油库 工程设计 服务范围", limit=1)
+                self.assertTrue(rows[0]["pageindex_node_id"].endswith(":0002"))
+                self.assertEqual(rows[0]["node_path"], ["技术标", "服务范围"])
+                self.assertIn("油库工程设计", rows[0]["node_text"])
+
+                context = HistoryCaseService.load_pageindex_context_for_candidate({
+                    "project_id": "p1",
+                    "best_node_text": rows[0]["node_text"],
+                    "pageindex_tree_path": rows[0]["pageindex_tree_path"],
+                })
+                self.assertIn("最相关 PageIndex 节点", context)
+                self.assertIn("服务范围", context)
+            finally:
+                HistoryCaseService.PAGEINDEX_TREE_ROOT = original_tree_root
+
+    def test_history_search_uses_sqlite_recall_with_pageindex_context(self):
+        from backend.app.services.history_case_service import HistoryCaseService
+
+        original_tree_root = HistoryCaseService.PAGEINDEX_TREE_ROOT
+        original_db_path = HistoryCaseService.HISTORY_DB_PATH
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tree_root = root / "pageindex_trees"
+            tree_path = tree_root / "2025/技术1/p1/历史技术标.json"
+            db_path = root / "history_cases.sqlite3"
+            tree_path.parent.mkdir(parents=True, exist_ok=True)
+            tree_path.write_text(
+                json.dumps(
+                    {
+                        "doc_name": "SQLite召回油库设计服务项目",
+                        "structure": [
+                            {
+                                "title": "技术标",
+                                "node_id": "0001",
+                                "line_num": 1,
+                                "text": "# 技术标",
+                                "nodes": [
+                                    {
+                                        "title": "项目组成人员",
+                                        "node_id": "0002",
+                                        "line_num": 5,
+                                        "text": "## 项目组成人员\n油库工程设计项目组成人员包括项目负责人、工艺、结构专业人员。",
+                                        "nodes": [],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with sqlite3.connect(str(db_path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE case_projects (
+                        id TEXT PRIMARY KEY,
+                        year TEXT NOT NULL,
+                        batch TEXT NOT NULL,
+                        sequence TEXT NOT NULL,
+                        result TEXT NOT NULL,
+                        subject TEXT NOT NULL,
+                        primary_domain TEXT NOT NULL,
+                        primary_subdomain TEXT NOT NULL,
+                        domain_confidence REAL NOT NULL,
+                        domain_keywords TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        folder_name TEXT NOT NULL,
+                        source_path TEXT NOT NULL,
+                        imported_at TEXT NOT NULL
+                    );
+                    CREATE TABLE case_documents (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        file_name TEXT NOT NULL,
+                        extension TEXT NOT NULL,
+                        source_path TEXT NOT NULL,
+                        markdown_path TEXT NOT NULL,
+                        block_json_path TEXT NOT NULL,
+                        html_preview_path TEXT NOT NULL,
+                        asset_dir TEXT NOT NULL,
+                        pageindex_tree_path TEXT NOT NULL,
+                        text_chars INTEGER NOT NULL,
+                        node_count INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        error TEXT NOT NULL,
+                        indexed_at TEXT NOT NULL
+                    );
+                    CREATE TABLE pageindex_nodes (
+                        id TEXT PRIMARY KEY,
+                        document_id TEXT NOT NULL,
+                        node_id TEXT NOT NULL,
+                        parent_node_id TEXT,
+                        title TEXT NOT NULL,
+                        line_num INTEGER NOT NULL,
+                        level INTEGER NOT NULL,
+                        text TEXT NOT NULL
+                    );
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO case_projects VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "p1", "2025", "技术1", "1", "中标", "华正", "石油", "油库", 0.9,
+                        "[]", "SQLite召回油库设计服务项目", "1【中标】SQLite召回油库设计服务项目",
+                        str(root / "project"), "2026-01-01T00:00:00Z",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO case_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "doc-sqlite", "p1", "SQLite召回油库设计服务项目-2025.docx", ".docx",
+                        str(root / "source.docx"), "", "", "", "", str(tree_path), 100, 2,
+                        "indexed", "", "2026-01-01T00:00:00Z",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO pageindex_nodes VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        "doc-sqlite:0002", "doc-sqlite", "0002", "0001", "项目组成人员", 5, 2,
+                        "SQLite 中只用于召回，完整正文应来自 PageIndex JSON。",
+                    ),
+                )
+
+            try:
+                HistoryCaseService.PAGEINDEX_TREE_ROOT = tree_root
+                HistoryCaseService.HISTORY_DB_PATH = db_path
+                rows = HistoryCaseService.search("油库 项目组成人员", limit=1)
+                self.assertEqual(rows[0]["pageindex_node_id"], "doc-sqlite:0002")
+                self.assertEqual(rows[0]["node_path"], ["技术标", "项目组成人员"])
+                self.assertIn("油库工程设计项目组成人员", rows[0]["node_text"])
+            finally:
+                HistoryCaseService.PAGEINDEX_TREE_ROOT = original_tree_root
+                HistoryCaseService.HISTORY_DB_PATH = original_db_path
 
     def test_history_reference_rule_based_profile_is_usable(self):
         from backend.app.routers.history_cases import _build_rule_based_reference_profile

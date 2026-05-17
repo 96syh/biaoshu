@@ -446,6 +446,22 @@ export const AnalysisPage = ({ controller }: PageProps) => {
                         </div>
                       )}
                       {streamText && <pre className="stream-box stream-box--large">{streamText}</pre>}
+                      <div className={`analysis-next-card ${activeReport ? 'analysis-next-card--ready' : ''}`}>
+                        <div>
+                          <span>下一步</span>
+                          <strong>生成目录规划</strong>
+                          <p>{activeReport ? '解析结果已就绪，可进入章节目录与评分项映射。' : '完成标准解析后开放目录规划。'}</p>
+                        </div>
+                        <button
+                          type="button"
+                          className="solid-button"
+                          onClick={() => goToPage('outline')}
+                          disabled={!activeReport || busy === 'analysis'}
+                        >
+                          <span>{activeReport ? '生成目录' : '等待解析'}</span>
+                          <ChevronRightIcon className="h-4 w-4" />
+                        </button>
+                      </div>
                       {tenderParseReady ? (
                         <>
                           <div className="tender-parse-tabs">
@@ -585,10 +601,6 @@ export const AnalysisPage = ({ controller }: PageProps) => {
                               className={`tender-source-panel ${evidenceHighlighted ? 'tender-source-panel--highlight' : ''}`}
                               aria-live="polite"
                             >
-                              <div className="tender-source-panel__head">
-                                <strong>上传文档原文</strong>
-                                <span>{sourcePanelStatusText}</span>
-                              </div>
                               {sourceLocateResult.status === 'found' && sourceLocateResult.snippet ? (
                                 <div className="tender-source-locate-hint">
                                   <strong>{sourceLocateResult.label || '原文位置'}</strong>

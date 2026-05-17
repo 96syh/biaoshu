@@ -1,9 +1,8 @@
-"""本地项目数据库服务。"""
+"""本地项目草稿 JSON 存储服务。"""
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,24 +10,38 @@ from typing import Any, Dict, List, Optional
 
 
 class ProjectService:
-    """用 SQLite 保存项目草稿，替代浏览器缓存作为主存储。"""
+    """用单个 JSON 文件保存项目草稿，避免运行时生成本地数据库文件。"""
 
-    DB_PATH = Path(
+    STORE_PATH = Path(
         os.getenv(
-            "YIBIAO_PROJECT_DB_PATH",
-            str(Path(__file__).resolve().parents[3] / "artifacts" / "data" / "projects.sqlite3"),
+            "YIBIAO_PROJECT_STORE_PATH",
+            str(Path(__file__).resolve().parents[3] / "artifacts" / "runtime" / "projects.json"),
         )
     )
 
     @classmethod
-    def _connect(cls) -> sqlite3.Connection:
-        cls.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(cls.DB_PATH))
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        cls._ensure_schema(conn)
-        return conn
+    def _read_store(cls) -> Dict[str, Any]:
+        if not cls.STORE_PATH.exists():
+            return {"active_project_id": "", "projects": []}
+        try:
+            payload = json.loads(cls.STORE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {"active_project_id": "", "projects": []}
+        if not isinstance(payload, dict):
+            return {"active_project_id": "", "projects": []}
+        projects = payload.get("projects")
+        return {
+            "active_project_id": str(payload.get("active_project_id") or ""),
+            "projects": projects if isinstance(projects, list) else [],
+        }
+
+    @classmethod
+    def _write_store(cls, payload: Dict[str, Any]) -> None:
+        cls.STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cls.STORE_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _now() -> str:
@@ -37,32 +50,6 @@ class ProjectService:
     @staticmethod
     def _new_id() -> str:
         return f"project-{uuid.uuid4().hex[:12]}"
-
-    @classmethod
-    def _ensure_schema(cls, conn: sqlite3.Connection) -> None:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                draft_json TEXT NOT NULL,
-                completed INTEGER NOT NULL DEFAULT 0,
-                total INTEGER NOT NULL DEFAULT 0,
-                word_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
 
     @staticmethod
     def _clean_title(value: Any) -> str:
@@ -111,53 +98,45 @@ class ProjectService:
         return {"completed": completed, "total": total, "word_count": word_count}
 
     @staticmethod
-    def _row_to_record(row: sqlite3.Row, include_draft: bool = True) -> Dict[str, Any]:
+    def _record_from_project(project: Dict[str, Any], include_draft: bool = True) -> Dict[str, Any]:
         record = {
-            "id": row["id"],
-            "title": row["title"],
-            "createdAt": row["created_at"],
-            "updatedAt": row["updated_at"],
-            "completed": row["completed"],
-            "total": row["total"],
-            "wordCount": row["word_count"],
+            "id": str(project.get("id") or ""),
+            "title": str(project.get("title") or "未命名标书"),
+            "createdAt": str(project.get("createdAt") or ""),
+            "updatedAt": str(project.get("updatedAt") or ""),
+            "completed": int(project.get("completed") or 0),
+            "total": int(project.get("total") or 0),
+            "wordCount": int(project.get("wordCount") or 0),
         }
         if include_draft:
-            try:
-                record["draft"] = json.loads(row["draft_json"])
-            except Exception:
-                record["draft"] = {}
+            draft = project.get("draft")
+            record["draft"] = draft if isinstance(draft, dict) else {}
         return record
 
     @classmethod
     def get_active_project_id(cls) -> Optional[str]:
-        with cls._connect() as conn:
-            row = conn.execute("SELECT value FROM app_meta WHERE key='active_project_id'").fetchone()
-            return str(row["value"]) if row else None
+        project_id = cls._read_store().get("active_project_id") or ""
+        return str(project_id) if project_id else None
 
     @classmethod
     def set_active_project_id(cls, project_id: str) -> None:
-        with cls._connect() as conn:
-            conn.execute(
-                "INSERT INTO app_meta(key, value) VALUES('active_project_id', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (project_id,),
-            )
-            conn.commit()
+        store = cls._read_store()
+        store["active_project_id"] = str(project_id or "")
+        cls._write_store(store)
 
     @classmethod
     def list_projects(cls, limit: int = 20) -> List[Dict[str, Any]]:
-        with cls._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM projects ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [cls._row_to_record(row, include_draft=True) for row in rows]
+        projects = cls._read_store().get("projects", [])
+        records = [cls._record_from_project(item, include_draft=True) for item in projects if isinstance(item, dict)]
+        records.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
+        return records[:limit]
 
     @classmethod
     def get_project(cls, project_id: str) -> Optional[Dict[str, Any]]:
-        with cls._connect() as conn:
-            row = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
-            return cls._row_to_record(row, include_draft=True) if row else None
+        for project in cls._read_store().get("projects", []):
+            if isinstance(project, dict) and project.get("id") == project_id:
+                return cls._record_from_project(project, include_draft=True)
+        return None
 
     @classmethod
     def get_active_project(cls) -> Optional[Dict[str, Any]]:
@@ -168,46 +147,33 @@ class ProjectService:
 
     @classmethod
     def upsert_project(cls, draft: Dict[str, Any], project_id: Optional[str] = None, activate: bool = True) -> Dict[str, Any]:
+        store = cls._read_store()
+        projects = [item for item in store.get("projects", []) if isinstance(item, dict)]
         now = cls._now()
         stats = cls._stats(draft)
         title = cls._draft_title(draft)
-        project_id = project_id or cls.get_active_project_id() or cls._new_id()
-        draft_json = json.dumps(draft or {}, ensure_ascii=False)
+        project_id = project_id or store.get("active_project_id") or cls._new_id()
 
-        with cls._connect() as conn:
-            existing = conn.execute("SELECT created_at FROM projects WHERE id=?", (project_id,)).fetchone()
-            created_at = existing["created_at"] if existing else now
-            conn.execute(
-                """
-                INSERT INTO projects(id, title, draft_json, completed, total, word_count, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    title=excluded.title,
-                    draft_json=excluded.draft_json,
-                    completed=excluded.completed,
-                    total=excluded.total,
-                    word_count=excluded.word_count,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    project_id,
-                    title,
-                    draft_json,
-                    stats["completed"],
-                    stats["total"],
-                    stats["word_count"],
-                    created_at,
-                    now,
-                ),
-            )
-            if activate:
-                conn.execute(
-                    "INSERT INTO app_meta(key, value) VALUES('active_project_id', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (project_id,),
-                )
-            conn.commit()
+        existing = next((item for item in projects if item.get("id") == project_id), None)
+        created_at = str(existing.get("createdAt") or now) if existing else now
+        record = {
+            "id": project_id,
+            "title": title,
+            "draft": draft or {},
+            "completed": stats["completed"],
+            "total": stats["total"],
+            "wordCount": stats["word_count"],
+            "createdAt": created_at,
+            "updatedAt": now,
+        }
 
+        projects = [item for item in projects if item.get("id") != project_id]
+        projects.append(record)
+        projects.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
+        store["projects"] = projects
+        if activate:
+            store["active_project_id"] = project_id
+        cls._write_store(store)
         return cls.get_project(project_id) or {}
 
     @classmethod
@@ -223,19 +189,14 @@ class ProjectService:
 
     @classmethod
     def delete_project(cls, project_id: str) -> bool:
-        with cls._connect() as conn:
-            cursor = conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
-            active = conn.execute("SELECT value FROM app_meta WHERE key='active_project_id'").fetchone()
-            if active and active["value"] == project_id:
-                next_row = conn.execute(
-                    "SELECT id FROM projects ORDER BY updated_at DESC LIMIT 1"
-                ).fetchone()
-                if next_row:
-                    conn.execute(
-                        "UPDATE app_meta SET value=? WHERE key='active_project_id'",
-                        (next_row["id"],),
-                    )
-                else:
-                    conn.execute("DELETE FROM app_meta WHERE key='active_project_id'")
-            conn.commit()
-            return cursor.rowcount > 0
+        store = cls._read_store()
+        projects = [item for item in store.get("projects", []) if isinstance(item, dict)]
+        before = len(projects)
+        projects = [item for item in projects if item.get("id") != project_id]
+        if len(projects) == before:
+            return False
+        store["projects"] = projects
+        if store.get("active_project_id") == project_id:
+            store["active_project_id"] = projects[0].get("id", "") if projects else ""
+        cls._write_store(store)
+        return True

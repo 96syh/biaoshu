@@ -1,23 +1,13 @@
 """文档处理相关API路由"""
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, HTTPException
 from ..models.schemas import (
     AnalysisReportRequest,
     AnalysisTaskControlRequest,
     AnalysisTaskControlResponse,
     AnalysisRequest,
     AnalysisType,
-    ComplianceReviewRequest,
-    ConsistencyRevisionRequest,
-    DocumentBlocksPlanRequest,
-    FileUploadResponse,
-    VisualAssetGenerationRequest,
-    VisualAssetGenerationResponse,
-    WordExportRequest,
 )
-from ..services.file_service import FileService
 from ..services.openai_service import OpenAIService
-from ..services.visual_asset_service import generate_visual_asset_response
-from ..services.word_export_service import create_word_export_response
 from ..utils.config_manager import config_manager
 from ..utils.provider_registry import get_provider_auth_error
 from ..utils.sse import sse_response
@@ -26,7 +16,7 @@ import asyncio
 import time
 import uuid
 
-router = APIRouter(prefix="/api/document", tags=["文档处理"])
+router = APIRouter(prefix="/api/document", tags=["标准解析"])
 
 
 class AnalysisTaskState:
@@ -68,104 +58,6 @@ def _analysis_stream_payload(
         **extra,
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-@router.post("/upload", response_model=FileUploadResponse)
-async def upload_file(file: UploadFile = File(...)):
-    """上传文档文件并提取文本内容"""
-    try:
-        file_kind = FileService.detect_upload_file_kind(file)
-        if file_kind in (None, "doc"):
-            return FileUploadResponse(
-                success=False,
-                message=FileService.get_upload_validation_message(file)
-            )
-        
-        # 处理文件并提取文本
-        parse_result = await FileService.process_uploaded_file_with_metadata(file)
-        file_content = parse_result.get("file_content", "")
-        parser_info = parse_result.get("parser_info", {})
-        source_preview_html = parse_result.get("source_preview_html") or ""
-        source_preview_pages = parse_result.get("source_preview_pages") or []
-        parser_name = parser_info.get("parser") or "unknown"
-        fallback_note = "（已降级到内置解析器）" if parser_info.get("fallback_used") else ""
-        
-        return FileUploadResponse(
-            success=True,
-            message=f"文件 {file.filename} 上传成功，解析器：{parser_name}{fallback_note}，已在上传阶段转换为 {parser_info.get('format') or '文本'}",
-            file_content=file_content,
-            source_preview_status=parse_result.get("source_preview_status") or "unavailable",
-            source_preview_html=source_preview_html,
-            source_preview_pages=source_preview_pages,
-            parser_info=parser_info,
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        return FileUploadResponse(
-            success=False,
-            message=f"文件处理失败: {str(e)}"
-        )
-
-
-@router.post("/upload-text", response_model=FileUploadResponse)
-async def upload_file_text(file: UploadFile = File(...)):
-    """上传文档文件并只提取文本，源文件预览由独立接口异步获取。"""
-    try:
-        file_kind = FileService.detect_upload_file_kind(file)
-        if file_kind in (None, "doc"):
-            return FileUploadResponse(
-                success=False,
-                message=FileService.get_upload_validation_message(file)
-            )
-
-        parse_result = await FileService.process_uploaded_file_with_metadata(
-            file,
-            include_preview=False,
-            cleanup_saved_file=False,
-        )
-        file_content = parse_result.get("file_content", "")
-        parser_info = parse_result.get("parser_info", {})
-        parser_name = parser_info.get("parser") or "unknown"
-        fallback_note = "（已降级到内置解析器）" if parser_info.get("fallback_used") else ""
-
-        return FileUploadResponse(
-            success=True,
-            message=f"文件 {file.filename} 文本解析完成，解析器：{parser_name}{fallback_note}，原文预览将后台生成",
-            file_content=file_content,
-            source_preview_id=parse_result.get("source_preview_id"),
-            source_preview_status=parse_result.get("source_preview_status") or "unavailable",
-            parser_info=parser_info,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        return FileUploadResponse(
-            success=False,
-            message=f"文件处理失败: {str(e)}"
-        )
-
-
-@router.get("/source-preview/{source_preview_id}", response_model=FileUploadResponse)
-async def get_source_preview(source_preview_id: str):
-    """为已上传 DOCX 单独生成源文件预览，避免拖慢主上传链路。"""
-    try:
-        preview_result = FileService.build_source_preview_for_saved_file(source_preview_id)
-        return FileUploadResponse(
-            success=True,
-            message="源文件预览生成完成" if preview_result.get("source_preview_status") == "ready" else "该文件暂无可用源文件预览",
-            source_preview_status=preview_result.get("source_preview_status") or "unavailable",
-            source_preview_html=preview_result.get("source_preview_html") or "",
-            source_preview_pages=preview_result.get("source_preview_pages") or [],
-            parser_info=preview_result.get("parser_info") or {},
-        )
-    except Exception as e:
-        return FileUploadResponse(
-            success=False,
-            message=f"源文件预览生成失败: {str(e)}",
-            source_preview_status="unavailable",
-        )
-
 
 @router.post("/analyze-stream")
 async def analyze_document_stream(request: AnalysisRequest):
@@ -492,186 +384,3 @@ async def control_analysis_task(task_id: str, request: AnalysisTaskControlReques
 
     raise HTTPException(status_code=400, detail="不支持的解析任务控制动作")
 
-
-@router.post("/reference-style-upload")
-async def reference_style_upload(file: UploadFile = File(...)):
-    """上传成熟投标文件样例并生成可复用风格剖面"""
-    try:
-        file_kind = FileService.detect_upload_file_kind(file)
-        if file_kind in (None, "doc"):
-            return FileUploadResponse(success=False, message=FileService.get_upload_validation_message(file))
-
-        parse_result = await FileService.process_uploaded_file_with_metadata(file)
-        file_content = parse_result.get("file_content", "")
-        parser_info = parse_result.get("parser_info", {})
-        config = config_manager.load_config()
-        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
-        if auth_error:
-            raise HTTPException(status_code=400, detail=auth_error)
-
-        profile = await OpenAIService().generate_reference_bid_style_profile(file_content)
-        image_assets = parser_info.get("image_assets") if isinstance(parser_info, dict) else []
-        image_slots = profile.get("image_slots") if isinstance(profile, dict) else []
-        if isinstance(image_assets, list) and isinstance(image_slots, list):
-            for index, slot in enumerate(image_slots):
-                if not isinstance(slot, dict) or index >= len(image_assets):
-                    continue
-                asset = image_assets[index] if isinstance(image_assets[index], dict) else {}
-                if asset.get("url") and not slot.get("image_url"):
-                    slot["image_url"] = asset.get("url")
-                if asset.get("alt") and not slot.get("image_alt"):
-                    slot["image_alt"] = asset.get("alt")
-                if asset.get("source_path") and not slot.get("source_ref"):
-                    slot["source_ref"] = asset.get("source_path")
-        return FileUploadResponse(
-            success=True,
-            message=f"样例文件 {file.filename} 已通过 {parser_info.get('parser') or '文档解析器'} 解析，并生成写作模板剖面",
-            file_content=file_content,
-            parser_info=parser_info,
-            reference_bid_style_profile=profile,
-        )
-    except HTTPException as e:
-        return FileUploadResponse(success=False, message=e.detail)
-    except Exception as e:
-        return FileUploadResponse(success=False, message=f"样例解析失败: {str(e)}")
-
-
-@router.post("/generate-visual-asset", response_model=VisualAssetGenerationResponse)
-async def generate_visual_asset(request: VisualAssetGenerationRequest):
-    """调用图片模型生成投标文件图表素材。"""
-    return await generate_visual_asset_response(request)
-
-
-@router.post("/document-blocks-plan-stream")
-async def document_blocks_plan_stream(request: DocumentBlocksPlanRequest):
-    """生成图表、表格、图片、承诺书和附件规划"""
-    try:
-        config = config_manager.load_config()
-        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
-        if auth_error:
-            raise HTTPException(status_code=400, detail=auth_error)
-
-        async def generate():
-            try:
-                service = OpenAIService()
-                compute_task = asyncio.create_task(service.generate_document_blocks_plan(
-                    outline=[item.model_dump(mode="json") for item in request.outline],
-                    analysis_report=request.analysis_report.model_dump(mode="json") if request.analysis_report else None,
-                    response_matrix=request.response_matrix.model_dump(mode="json") if request.response_matrix else None,
-                    reference_bid_style_profile=request.reference_bid_style_profile,
-                    enterprise_materials=[item.model_dump(mode="json") for item in request.enterprise_materials],
-                    asset_library=request.asset_library,
-                ))
-                while not compute_task.done():
-                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(1)
-                result_json = json.dumps(await compute_task, ensure_ascii=False)
-                for index in range(0, len(result_json), 256):
-                    yield f"data: {json.dumps({'chunk': result_json[index:index + 256]}, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'chunk': '', 'error': True, 'message': f'图表素材规划失败: {str(e)}'}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return sse_response(generate())
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"图表素材规划失败: {str(e)}")
-
-
-@router.post("/consistency-revision-stream")
-async def consistency_revision_stream(request: ConsistencyRevisionRequest):
-    """生成全文一致性修订报告"""
-    try:
-        config = config_manager.load_config()
-        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
-        if auth_error:
-            raise HTTPException(status_code=400, detail=auth_error)
-
-        async def generate():
-            try:
-                service = OpenAIService()
-                compute_task = asyncio.create_task(service.generate_consistency_revision_report(
-                    full_bid_draft=[item.model_dump(mode="json") for item in request.full_bid_draft],
-                    analysis_report=request.analysis_report.model_dump(mode="json") if request.analysis_report else None,
-                    response_matrix=request.response_matrix.model_dump(mode="json") if request.response_matrix else None,
-                    reference_bid_style_profile=request.reference_bid_style_profile,
-                    document_blocks_plan=request.document_blocks_plan,
-                ))
-                while not compute_task.done():
-                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(1)
-                result_json = json.dumps(await compute_task, ensure_ascii=False)
-                for index in range(0, len(result_json), 256):
-                    yield f"data: {json.dumps({'chunk': result_json[index:index + 256]}, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'chunk': '', 'error': True, 'message': f'全文一致性修订失败: {str(e)}'}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return sse_response(generate())
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"全文一致性修订失败: {str(e)}")
-
-
-@router.post("/review-compliance-stream")
-async def review_compliance_stream(request: ComplianceReviewRequest):
-    """导出前执行覆盖性、缺料、废标风险和虚构风险审校"""
-    try:
-        config = config_manager.load_config()
-        auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
-        if auth_error:
-            raise HTTPException(status_code=400, detail=auth_error)
-
-        openai_service = OpenAIService()
-
-        async def generate():
-            try:
-                compute_task = asyncio.create_task(
-                    openai_service.generate_compliance_review(
-                        outline=[item.model_dump(mode="json") for item in request.outline],
-                        analysis_report=(
-                            request.analysis_report.model_dump(mode="json")
-                            if request.analysis_report else None
-                        ),
-                        response_matrix=(
-                            request.response_matrix.model_dump(mode="json")
-                            if request.response_matrix else None
-                        ),
-                        project_overview=request.project_overview or "",
-                        reference_bid_style_profile=request.reference_bid_style_profile,
-                        document_blocks_plan=request.document_blocks_plan,
-                    )
-                )
-
-                while not compute_task.done():
-                    yield f"data: {json.dumps({'chunk': ''}, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(1)
-
-                review_json = json.dumps(await compute_task, ensure_ascii=False)
-                chunk_size = 256
-                for index in range(0, len(review_json), chunk_size):
-                    piece = review_json[index:index + chunk_size]
-                    yield f"data: {json.dumps({'chunk': piece}, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                payload = {
-                    "chunk": "",
-                    "error": True,
-                    "message": f"导出前合规审校失败: {str(e)}",
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-            yield "data: [DONE]\n\n"
-
-        return sse_response(generate())
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"导出前合规审校失败: {str(e)}")
-
-
-@router.post("/export-word")
-async def export_word(request: WordExportRequest):
-    """根据目录数据导出Word文档"""
-    return await create_word_export_response(request)

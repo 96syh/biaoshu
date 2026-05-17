@@ -11,14 +11,24 @@ type ProgressState = {
 
 export const TaskProgress = ({ progress, onRetry }: { progress: ProgressState | null; onRetry?: () => void }) => {
   if (!progress) return null;
+  const safePercent = Math.max(0, Math.min(100, Math.round(progress.percent || 0)));
+  const visualPercent = progress.status === 'success' ? 100 : safePercent;
   return (
     <div className={`task-progress task-progress--${progress.status}`}>
       <div className="task-progress__head">
         <strong>{progress.detail}</strong>
-        <span>{progress.percent}%</span>
+        <span>{visualPercent}%</span>
+      </div>
+      <div className="task-progress__motion" aria-hidden="true">
+        <span
+          className="task-progress__dog"
+          style={{ left: `${visualPercent}%` }}
+        >
+          🐕
+        </span>
       </div>
       <div className="task-progress__bar">
-        <span style={{ width: `${progress.percent}%` }} />
+        <span style={{ width: `${visualPercent}%` }} />
       </div>
       {progress.status === 'error' && (
         <div className="task-progress__error">

@@ -6,6 +6,177 @@ from .core import _json, get_full_bid_rulebook
 from .outline_templates import get_generic_service_plan_outline_template
 
 
+def _compact_text(value: Any, limit: int = 360) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}……"
+
+
+def _compact_item(item: Any, keys: tuple[str, ...], text_limit: int = 360) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    compact: Dict[str, Any] = {}
+    for key in keys:
+        value = item.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, str):
+            compact[key] = _compact_text(value, text_limit)
+        elif isinstance(value, list):
+            compact[key] = [
+                _compact_text(part, 180) if not isinstance(part, dict) else _compact_item(part, ("id", "title", "name", "requirement", "source_ref"), 160)
+                for part in value[:8]
+            ]
+        elif isinstance(value, dict):
+            compact[key] = _compact_item(
+                value,
+                ("id", "title", "name", "order", "source_ref", "requirement", "chapter_type", "volume_id"),
+                180,
+            )
+        else:
+            compact[key] = value
+    return compact
+
+
+def _compact_list(items: Any, keys: tuple[str, ...], limit: int = 40, text_limit: int = 360) -> List[Dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    return [
+        compact
+        for compact in (_compact_item(item, keys, text_limit) for item in items[:limit])
+        if compact
+    ]
+
+
+def _compact_bid_document_requirements(bid_doc: Any) -> Dict[str, Any]:
+    if not isinstance(bid_doc, dict):
+        return {}
+    composition_keys = (
+        "id", "order", "title", "volume_id", "chapter_type", "generation_scope",
+        "source_ref", "requirement_summary", "children",
+    )
+    selected_keys = (
+        "target_id", "target_title", "parent_composition_id", "target_source",
+        "target_source_type", "generation_scope", "use_as_outline_basis",
+        "base_outline_strategy", "confidence", "base_outline_items",
+    )
+    scheme_keys = (
+        "id", "order", "title", "requirement", "source_ref", "derived_from",
+        "must_preserve_title", "children",
+    )
+    return {
+        "composition": _compact_list(bid_doc.get("composition"), composition_keys, limit=30, text_limit=220),
+        "selected_generation_target": _compact_item(bid_doc.get("selected_generation_target"), selected_keys, 260),
+        "scheme_or_technical_outline_requirements": _compact_list(
+            bid_doc.get("scheme_or_technical_outline_requirements"),
+            scheme_keys,
+            limit=30,
+            text_limit=260,
+        ),
+    }
+
+
+def _compact_response_matrix(matrix: Any) -> Dict[str, Any]:
+    if not isinstance(matrix, dict):
+        return {}
+    item_keys = (
+        "id", "category", "title", "requirement_summary", "response_strategy",
+        "scoring_item_id", "requirement_id", "source_ref", "priority",
+    )
+    return {
+        "coverage_summary": _compact_text(matrix.get("coverage_summary"), 500),
+        "items": _compact_list(matrix.get("items"), item_keys, limit=120, text_limit=240),
+    }
+
+
+def _compact_reference_profile(profile: Any) -> Dict[str, Any]:
+    if not isinstance(profile, dict):
+        return {}
+    outline_keys = (
+        "id", "title", "level", "source_type", "scoring_purpose",
+        "expected_depth", "tables_required", "image_slots",
+    )
+    blueprint_keys = (
+        "chapter_title", "applies_when", "writing_function",
+        "recommended_structure", "tender_fact_slots", "enterprise_fact_slots",
+        "tables_to_insert", "assets_to_insert", "do_not_copy",
+    )
+    return {
+        "profile_name": _compact_text(profile.get("profile_name"), 120),
+        "document_scope": _compact_text(profile.get("document_scope"), 120),
+        "recommended_use_case": _compact_text(profile.get("recommended_use_case"), 240),
+        "source_history_case": _compact_item(
+            profile.get("source_history_case"),
+            ("project_title", "file_name", "document_category", "primary_domain", "node_title", "node_path", "profile_source"),
+            180,
+        ),
+        "outline_template": _compact_list(profile.get("outline_template"), outline_keys, limit=18, text_limit=180),
+        "chapter_blueprints": _compact_list(profile.get("chapter_blueprints"), blueprint_keys, limit=10, text_limit=220),
+        "quality_risks": _compact_list(profile.get("quality_risks"), ("risk", "location", "fix_rule"), limit=8, text_limit=220),
+    }
+
+
+def _compact_document_blocks_plan(plan: Any) -> Dict[str, Any]:
+    if not isinstance(plan, dict):
+        return {}
+    block_keys = (
+        "id", "chapter_id", "chapter_title", "block_type", "title",
+        "purpose", "source_ref", "required_assets", "required_enterprise_data",
+    )
+    return {
+        "document_blocks": _compact_list(plan.get("document_blocks"), block_keys, limit=50, text_limit=220),
+        "missing_assets": _compact_list(plan.get("missing_assets"), ("id", "name", "reason", "chapter_title"), limit=20, text_limit=180),
+        "missing_enterprise_data": _compact_list(plan.get("missing_enterprise_data"), ("id", "name", "reason", "chapter_title"), limit=20, text_limit=180),
+    }
+
+
+def _compact_outline_analysis_report(report: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(report, dict):
+        return {}
+    project_keys = (
+        "name", "number", "purchaser", "agency", "project_type",
+        "service_scope", "service_period", "service_location",
+        "quality_requirements", "maximum_price", "submission_method",
+    )
+    scoring_keys = (
+        "id", "name", "score", "weight", "standard", "requirement",
+        "criterion", "logic", "response_strategy", "source_ref",
+        "required_materials", "evidence_requirements",
+    )
+    requirement_keys = (
+        "id", "name", "review_type", "target", "score", "standard",
+        "requirement", "criterion", "logic", "source_ref",
+    )
+    material_keys = ("id", "name", "title", "requirement", "source_ref", "purpose")
+    return {
+        "project": _compact_item(report.get("project"), project_keys, 320),
+        "bid_mode_recommendation": report.get("bid_mode_recommendation", ""),
+        "bid_document_requirements": _compact_bid_document_requirements(report.get("bid_document_requirements")),
+        "volume_rules": _compact_list(report.get("volume_rules"), ("id", "title", "scope", "requirement", "source_ref"), limit=20, text_limit=220),
+        "anonymity_rules": _compact_list(report.get("anonymity_rules"), ("id", "title", "requirement", "source_ref"), limit=20, text_limit=220),
+        "bid_structure": _compact_item(report.get("bid_structure"), ("mode", "volumes", "notes"), 240),
+        "technical_scoring_items": _compact_list(report.get("technical_scoring_items"), scoring_keys, limit=60, text_limit=260),
+        "business_scoring_items": _compact_list(report.get("business_scoring_items"), scoring_keys, limit=40, text_limit=240),
+        "price_scoring_items": _compact_list(report.get("price_scoring_items"), scoring_keys, limit=20, text_limit=220),
+        "qualification_review_items": _compact_list(report.get("qualification_review_items"), requirement_keys, limit=50, text_limit=240),
+        "qualification_requirements": _compact_list(report.get("qualification_requirements"), requirement_keys, limit=50, text_limit=240),
+        "formal_review_items": _compact_list(report.get("formal_review_items"), requirement_keys, limit=30, text_limit=220),
+        "responsiveness_review_items": _compact_list(report.get("responsiveness_review_items"), requirement_keys, limit=40, text_limit=220),
+        "mandatory_clauses": _compact_list(report.get("mandatory_clauses"), requirement_keys, limit=40, text_limit=220),
+        "rejection_risks": _compact_list(report.get("rejection_risks"), ("id", "risk", "fix_rule", "source_ref"), limit=40, text_limit=240),
+        "required_materials": _compact_list(report.get("required_materials"), material_keys, limit=60, text_limit=220),
+        "fixed_format_forms": _compact_list(report.get("fixed_format_forms"), material_keys, limit=40, text_limit=220),
+        "signature_requirements": _compact_list(report.get("signature_requirements"), material_keys, limit=30, text_limit=180),
+        "price_rules": _compact_item(
+            report.get("price_rules"),
+            ("score", "quote_method", "maximum_price_rule", "abnormally_low_price_rule", "missing_item_rule", "source_ref"),
+            260,
+        ),
+        "response_matrix": _compact_response_matrix(report.get("response_matrix")),
+    }
+
+
 def generate_level1_outline_prompt(
     overview: str,
     requirements: str,
@@ -16,7 +187,10 @@ def generate_level1_outline_prompt(
     document_blocks_plan: Dict[str, Any] | None = None,
 ) -> Tuple[str, str]:
     report = analysis_report or {}
-    response_matrix = report.get("response_matrix") or {}
+    compact_report = _compact_outline_analysis_report(report)
+    response_matrix = _compact_response_matrix(report.get("response_matrix") or compact_report.get("response_matrix"))
+    compact_profile = _compact_reference_profile(reference_bid_style_profile or report.get("reference_bid_style_profile") or {})
+    compact_blocks_plan = _compact_document_blocks_plan(document_blocks_plan or report.get("document_blocks_plan") or {})
     rulebook = get_full_bid_rulebook()
     service_template = _json(get_generic_service_plan_outline_template(), indent=2)
     system_prompt = f"""你是资深投标文件目录规划专家。目标是根据 AnalysisReport、ResponseMatrix、用户目标和可选样例风格生成一级目录 JSON。
@@ -59,10 +233,10 @@ def generate_level1_outline_prompt(
 <overview>{overview}</overview>
 <requirements>{requirements}</requirements>
 <bid_mode>{bid_mode or report.get('bid_mode_recommendation') or ''}</bid_mode>
-<analysis_report_json>{_json(report, indent=2)}</analysis_report_json>
+<analysis_report_json>{_json(compact_report, indent=2)}</analysis_report_json>
 <response_matrix_json>{_json(response_matrix, indent=2)}</response_matrix_json>
-<reference_bid_style_profile_json>{_json(reference_bid_style_profile or report.get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile_json>
-<document_blocks_plan_json>{_json(document_blocks_plan or report.get('document_blocks_plan') or {}, indent=2)}</document_blocks_plan_json>
+<reference_bid_style_profile_json>{_json(compact_profile, indent=2)}</reference_bid_style_profile_json>
+<document_blocks_plan_json>{_json(compact_blocks_plan, indent=2)}</document_blocks_plan_json>
 
 直接返回 JSON 对象或 JSON 数组。"""
     return system_prompt, user_prompt
@@ -81,6 +255,10 @@ def generate_level23_outline_prompt(
 ) -> Tuple[str, str]:
     schema_json = _json(current_outline_json, indent=2)
     rulebook = get_full_bid_rulebook()
+    compact_report = _compact_outline_analysis_report(analysis_report or {})
+    compact_response_matrix = _compact_response_matrix(response_matrix or compact_report.get("response_matrix") or {})
+    compact_profile = _compact_reference_profile(reference_bid_style_profile or (analysis_report or {}).get("reference_bid_style_profile") or {})
+    compact_blocks_plan = _compact_document_blocks_plan(document_blocks_plan or (analysis_report or {}).get("document_blocks_plan") or {})
     system_prompt = f"""你是标书二级目录设计专家。目标是补全当前一级章节的 children、description、映射字段和预期内容块。
 
 输出契约：
@@ -119,10 +297,10 @@ description 要说明：
 <overview>{overview}</overview>
 <requirements>{requirements}</requirements>
 <bid_mode>{bid_mode or ''}</bid_mode>
-<analysis_report_json>{_json(analysis_report or {}, indent=2)}</analysis_report_json>
-<response_matrix_json>{_json(response_matrix or {}, indent=2)}</response_matrix_json>
-<reference_bid_style_profile_json>{_json(reference_bid_style_profile or (analysis_report or {}).get('reference_bid_style_profile') or {}, indent=2)}</reference_bid_style_profile_json>
-<document_blocks_plan_json>{_json(document_blocks_plan or (analysis_report or {}).get('document_blocks_plan') or {}, indent=2)}</document_blocks_plan_json>
+<analysis_report_json>{_json(compact_report, indent=2)}</analysis_report_json>
+<response_matrix_json>{_json(compact_response_matrix, indent=2)}</response_matrix_json>
+<reference_bid_style_profile_json>{_json(compact_profile, indent=2)}</reference_bid_style_profile_json>
+<document_blocks_plan_json>{_json(compact_blocks_plan, indent=2)}</document_blocks_plan_json>
 
 直接返回 JSON。"""
     return system_prompt, user_prompt

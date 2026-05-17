@@ -39,7 +39,7 @@ const getDefaultApiBaseUrl = () => {
       return 'http://127.0.0.1:8000';
     }
 
-    if (isLocalDevHost && window.location.port === '3010') {
+    if (isLocalDevHost && ['3002', '3010'].includes(window.location.port)) {
       return 'http://127.0.0.1:8010';
     }
 
@@ -112,8 +112,17 @@ export interface HistoryRequirementEvidence {
   primary_subdomain?: string;
   document_id?: string;
   file_name?: string;
+  document_category?: string;
+  document_category_basis?: string;
   document_path?: string;
   pageindex_tree_path?: string;
+  pageindex_node_id?: string;
+  node_id?: string;
+  node_title?: string;
+  node_path?: string[];
+  node_path_text?: string;
+  node_level?: number;
+  node_line_num?: number;
   snippet?: string;
   matched_term?: string;
   is_winning_case?: boolean;

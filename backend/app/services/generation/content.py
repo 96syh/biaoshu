@@ -153,6 +153,7 @@ class ContentGenerationMixin:
         """为单个章节流式生成内容。"""
         try:
             if self._force_local_fallback():
+                self._log_content_generation_branch(chapter, "路径=本地兜底；原因=YIBIAO_FORCE_LOCAL_FALLBACK 生效")
                 yield self._fallback_chapter_content(
                     chapter,
                     project_overview=project_overview,
@@ -164,6 +165,10 @@ class ContentGenerationMixin:
             effective_response_matrix = response_matrix or (analysis_report or {}).get("response_matrix") or {}
             effective_history_reference_drafts = history_reference_drafts or []
             if not effective_history_reference_drafts:
+                self._log_content_generation_branch(
+                    chapter,
+                    "E=检索历史相似章节：未收到上游候选，服务层兜底检索历史库",
+                )
                 try:
                     effective_history_reference_drafts = HistoryCaseService.find_chapter_reference_drafts(
                         chapter=chapter,
@@ -174,13 +179,30 @@ class ContentGenerationMixin:
                         limit=3,
                     )
                 except Exception as exc:
-                    print(f"历史章节参考检索失败，继续直接生成正文：{exc}")
+                    self._log_content_generation_branch(chapter, f"E=检索历史相似章节：失败 -> F=无历史候选 -> J=回退自主正文生成；原因={exc}")
                     effective_history_reference_drafts = []
+            else:
+                self._log_content_generation_branch(
+                    chapter,
+                    f"E=检索历史相似章节：使用上游候选；count={len(effective_history_reference_drafts)}",
+                )
             primary_history_draft = self._select_primary_history_draft(effective_history_reference_drafts)
+            history_levels = [
+                str(draft.get("match_level") or "unknown")
+                for draft in effective_history_reference_drafts
+                if isinstance(draft, dict)
+            ]
+            self._log_content_generation_branch(
+                chapter,
+                f"历史参考候选={len(effective_history_reference_drafts)}；match_levels={history_levels[:5]}",
+            )
             if primary_history_draft:
                 try:
                     history_name = self._history_reference_log_name(primary_history_draft)
-                    print(f"当前章节正在复用历史记录{history_name}")
+                    self._log_content_generation_branch(
+                        chapter,
+                        f"F=有 high/medium 历史 Word block -> G=历史 Word patch 生成；复用历史记录={history_name}；规则=保留历史 Word block，模型只输出最小补丁",
+                    )
                     markdown, html_content, operations = await self._generate_patch_based_chapter_content(
                         chapter=chapter,
                         parent_chapters=parent_chapters or [],
@@ -195,11 +217,21 @@ class ContentGenerationMixin:
                         "patch_operations": operations,
                         "history_reference": self._compact_history_reference(primary_history_draft),
                     }
+                    self._log_content_generation_branch(
+                        chapter,
+                        f"H=patch 成功 -> I=复用历史表格/图片/HTML block 并应用补丁；operations={len(operations)}；O=随后去标题",
+                    )
                     yield markdown
                     return
                 except Exception as exc:
-                    print(f"历史 Word patch 生成失败，回退为正文生成：{exc}")
+                    self._log_content_generation_branch(chapter, f"H=patch 失败 -> J=回退自主正文生成；原因={exc}")
                     self._last_chapter_render = {}
+            else:
+                self._log_content_generation_branch(
+                    chapter,
+                    "F=无 high/medium 历史 Word block -> J=回退自主正文生成；原因=没有 high/medium 且包含 matched_blocks 的历史 Word 主稿；"
+                    "自主生成将按当前正文 prompt 规则执行",
+                )
             model_history_reference_drafts = self._compact_history_reference_drafts_for_model(
                 effective_history_reference_drafts,
                 chapter=chapter,
@@ -221,24 +253,31 @@ class ContentGenerationMixin:
                 document_blocks_plan=document_blocks_plan or (analysis_report or {}).get("document_blocks_plan"),
                 history_reference_drafts=model_history_reference_drafts,
             )
+            self._log_content_generation_branch(
+                chapter,
+                f"K=按 prompt 直接流式生成正文：prompt={len(system_prompt) + len(user_prompt)} chars≈{(len(system_prompt) + len(user_prompt)) // 2} tokens",
+            )
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ]
             try:
-                print("当前章节正在自主生成内容")
+                self._log_content_generation_branch(chapter, "开始调用模型流式生成正文；temperature=0.35")
                 async for chunk in self.stream_chat_completion(messages, temperature=0.35):
                     yield chunk
+                self._log_content_generation_branch(chapter, "K=按 prompt 直接流式生成正文：完成 -> O=去掉章节标题/Markdown heading")
             except Exception as e:
                 if not self._generation_fallbacks_enabled():
+                    self._log_content_generation_branch(chapter, f"L=模型失败 -> 不允许兜底 -> N=返回错误；原因={e}")
                     raise self._fallback_disabled_error("章节正文生成", str(e)) from e
-                print(f"章节模型输出不可用，启用文本兜底正文：{str(e)}")
+                self._log_content_generation_branch(chapter, f"L=模型失败 -> 允许兜底 -> M=本地兜底正文；原因={str(e)}")
                 yield self._fallback_chapter_content(
                     chapter,
                     project_overview=project_overview,
                     analysis_report=analysis_report,
                     missing_materials=missing_materials,
                 )
+                self._log_content_generation_branch(chapter, "M=本地兜底正文：完成 -> O=去掉章节标题/Markdown heading")
         except Exception as e:
             print(f"生成章节内容时出错: {str(e)}")
             raise Exception(f"生成章节内容时出错: {str(e)}") from e
@@ -255,6 +294,19 @@ class ContentGenerationMixin:
             ):
                 return draft
         return None
+
+    @staticmethod
+    def _json_char_count(value: Any) -> int:
+        try:
+            return len(json.dumps(value or {}, ensure_ascii=False, indent=2))
+        except (TypeError, ValueError):
+            return len(str(value or ""))
+
+    @classmethod
+    def _log_content_generation_branch(cls, chapter: dict, message: str) -> None:
+        chapter_id = cls._single_line_text((chapter or {}).get("id"), 40) or "unknown"
+        title = cls._single_line_text((chapter or {}).get("title"), 80) or "未命名章节"
+        print(f"[正文生成] {chapter_id} {title} | {message}", flush=True)
 
     @classmethod
     def _compact_history_reference_drafts_for_model(
@@ -501,6 +553,10 @@ class ContentGenerationMixin:
             ),
             generated_summaries=generated_summaries,
         )
+        self._log_content_generation_branch(
+            chapter,
+            f"历史 patch prompt 字符数 prompt={len(system_prompt) + len(user_prompt)} chars≈{(len(system_prompt) + len(user_prompt)) // 2} tokens",
+        )
         raw_patch = await self._collect_stream_text(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             temperature=0.18,
@@ -512,6 +568,10 @@ class ContentGenerationMixin:
             operations = []
         matched_blocks = history_reference_draft.get("matched_blocks")
         if isinstance(matched_blocks, list) and matched_blocks:
+            self._log_content_generation_branch(
+                chapter,
+                f"I=复用历史表格/图片/HTML block 并应用补丁：走 matched_blocks 分支；blocks={len(matched_blocks)}；operations={len(operations)}",
+            )
             reusable_blocks = self._prepare_history_blocks_for_reuse(
                 matched_blocks,
                 chapter=chapter,
@@ -525,6 +585,10 @@ class ContentGenerationMixin:
             if not markdown.strip() and html_content.strip():
                 markdown = "详见本节保留的历史 Word 表格、图片或附件内容。"
         else:
+            self._log_content_generation_branch(
+                chapter,
+                f"I=复用历史内容并应用补丁：无 matched_blocks，走 markdown/html 文本 patch 分支；operations={len(operations)}",
+            )
             markdown = self._apply_history_patch_operations(source_markdown, operations, html_mode=False)
             markdown = HistoryCaseService._strip_non_text_markdown_from_reference(markdown)
             markdown = self._strip_generated_markdown_headings(markdown)

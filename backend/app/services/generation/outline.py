@@ -331,6 +331,34 @@ class OutlineGenerationMixin:
         node["children"] = cleaned_children
         return node
 
+    @classmethod
+    def _build_tender_direct_scheme_outline(
+        cls,
+        report: Dict[str, Any],
+        bid_mode: str,
+    ) -> list[dict[str, Any]]:
+        """When the tender already states scheme headings, use them as level-1 truth."""
+        mode = str(bid_mode or report.get("bid_mode_recommendation") or "").strip()
+        if mode not in {"", "technical_only", "technical_service_plan", "service_plan", "construction_plan", "goods_supply_plan"}:
+            return []
+        if len(FallbackGenerationMixin._collect_scheme_outline_items(report)) < 2:
+            return []
+
+        response_matrix = report.get("response_matrix") or FallbackGenerationMixin._fallback_response_matrix(report)
+        nodes = FallbackGenerationMixin._build_scheme_outline_nodes(report, response_matrix)
+        outline: list[dict[str, Any]] = []
+        for index, raw_node in enumerate(nodes, start=1):
+            node = cls._normalize_outline_node(
+                raw_node,
+                str(index),
+                str(raw_node.get("title") or f"方案要求{index}"),
+                mode or "technical_only",
+            )
+            if not node.get("children"):
+                node["children"] = cls._seed_secondary_outline_children(node, report)
+            outline.append(cls._strip_outline_below_second_level(node))
+        return outline
+
     @staticmethod
     def _is_technical_scheme_node(node: Dict[str, Any]) -> bool:
         """识别整本投标文件中的技术标/方案类章节包装节点。"""
@@ -600,6 +628,26 @@ class OutlineGenerationMixin:
         if isinstance(cached_outline, dict):
             return cached_outline
 
+        tender_direct_outline = self._build_tender_direct_scheme_outline(report, effective_bid_mode)
+        if tender_direct_outline:
+            if progress_callback:
+                await progress_callback({
+                    "stage": "tender_direct_outline",
+                    "message": "已按招标文件明确列出的服务方案目录生成一级标题，并基于标题拆分/评分项生成二级标题，未调用一级目录模型。",
+                    "outline": tender_direct_outline,
+                })
+            if not blocks_plan:
+                blocks_plan = {"document_blocks": [], "missing_assets": [], "missing_enterprise_data": []}
+            result = {
+                "outline": tender_direct_outline,
+                "response_matrix": report.get("response_matrix"),
+                "coverage_summary": "已按招标文件 selected_generation_target/base_outline_items 生成方案目录；一级标题来自招标文件，二级标题由评分项和标题语义确定性生成。",
+                "reference_bid_style_profile": style_profile,
+                "document_blocks_plan": blocks_plan,
+            }
+            GenerationCacheService.set("outline", cache_key, result)
+            return result
+
         if self._force_local_fallback():
             fallback = self._fallback_outline(report, effective_bid_mode)
             fallback.setdefault("document_blocks_plan", blocks_plan or {"document_blocks": [], "missing_assets": [], "missing_enterprise_data": []})
@@ -643,6 +691,7 @@ class OutlineGenerationMixin:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+        outline_level1_timeout = max(30, self._int_env("YIBIAO_OUTLINE_LEVEL1_TIMEOUT", 180))
         try:
             full_content = await asyncio.wait_for(
                 self._generate_with_json_check(
@@ -654,8 +703,20 @@ class OutlineGenerationMixin:
                     log_prefix="一级提纲",
                     raise_on_fail=False,
                 ),
-                timeout=120,
+                timeout=outline_level1_timeout,
             )
+        except asyncio.TimeoutError as e:
+            reason = (
+                f"模型一级提纲生成超过 {outline_level1_timeout} 秒未完成；"
+                "通常是目录 prompt 过大、模型网关响应过慢或模型输出过长。"
+            )
+            if not self._generation_fallbacks_enabled():
+                raise self._fallback_disabled_error("一级提纲生成", reason) from e
+            print(f"一级提纲模型输出超时，启用通用兜底目录：{reason}")
+            fallback = self._fallback_outline(report, effective_bid_mode)
+            fallback.setdefault("document_blocks_plan", blocks_plan or {"document_blocks": [], "missing_assets": [], "missing_enterprise_data": []})
+            fallback.setdefault("reference_bid_style_profile", style_profile)
+            return fallback
         except Exception as e:
             if not self._generation_fallbacks_enabled():
                 raise self._fallback_disabled_error("一级提纲生成", str(e)) from e

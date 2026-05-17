@@ -13,9 +13,7 @@ import {
   FolderIcon,
   PauseIcon,
   PencilSquareIcon,
-  PhotoIcon,
   PlayIcon,
-  ShieldCheckIcon,
   SparklesIcon,
   StopIcon,
   XMarkIcon,
@@ -61,7 +59,7 @@ import {
 } from '../../utils/visualAssets';
 import { ReferenceSlotPreview } from '../assets/ReferenceSlotPreview';
 import { ReferenceSlotShowcase } from '../assets/ReferenceSlotShowcase';
-import { DocumentPreviewNode, docSectionId } from '../content/DocumentPreviewNode';
+import { DocumentPreviewNode, docSectionId, parseDocumentPreviewBlocks } from '../content/DocumentPreviewNode';
 import { DocumentTocRows } from '../content/DocumentTocRows';
 import { VerifyLine } from '../config/VerifyLine';
 import { OutlineDraftPreview } from '../outline/OutlineDraftPreview';
@@ -69,6 +67,97 @@ import { OutlineRows } from '../outline/OutlineRows';
 import { Metric } from '../review/Metric';
 import { TaskProgress } from '../shared/TaskProgress';
 import { ProgressState, useProgressState } from './hooks/useProgressState';
+import { markdownLinesFromRowsWithHeader } from '../../utils/tableHeaders';
+
+const normalizeGeneratedHtmlTables = (value: string) => {
+  if (!value || !value.toLowerCase().includes('<table')) return value || '';
+  const cellText = (html: string) => html
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\|/g, '\\|');
+
+  return value.replace(/<table\b[^>]*>[\s\S]*?<\/table>/gi, (tableHtml) => {
+    const rows: string[][] = [];
+    const rowMatches = Array.from(tableHtml.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi));
+    for (const rowMatch of rowMatches) {
+      const rowHtml = rowMatch[1] || '';
+      const cellMatches = Array.from(rowHtml.matchAll(/<(?:th|td)\b[^>]*>([\s\S]*?)<\/(?:th|td)>/gi));
+      const cells = cellMatches.map(match => cellText(match[1] || ''));
+      if (cells.length) rows.push(cells);
+    }
+    if (!rows.length) return tableHtml;
+    const lines = markdownLinesFromRowsWithHeader(rows);
+    if (!lines.length) return tableHtml;
+    return `\n${lines.join('\n')}\n`;
+  }).replace(/\n{3,}/g, '\n\n').trim();
+};
+
+const normalizeGeneratedContentForExport = (value: string) => {
+  const content = normalizeGeneratedHtmlTables(value || '');
+  if (!content.includes('|')) return content;
+  return parseDocumentPreviewBlocks(content)
+    .map(block => {
+      if (block.type === 'markdown') return block.content;
+      const lines = markdownLinesFromRowsWithHeader(block.rows);
+      if (!lines.length) return '';
+      return block.captionTitle ? `${block.captionTitle}\n${lines.join('\n')}` : lines.join('\n');
+    })
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+};
+
+type BrowserWritableFileStream = {
+  write: (data: Blob) => Promise<void>;
+  close: () => Promise<void>;
+};
+
+type BrowserFileHandle = {
+  createWritable: () => Promise<BrowserWritableFileStream>;
+};
+
+type BrowserSaveFilePicker = (options?: {
+  suggestedName?: string;
+  types?: Array<{
+    description: string;
+    accept: Record<string, string[]>;
+  }>;
+}) => Promise<BrowserFileHandle>;
+
+const browserSaveFilePicker = () => {
+  if (typeof window === 'undefined') return undefined;
+  return (window as Window & { showSaveFilePicker?: BrowserSaveFilePicker }).showSaveFilePicker;
+};
+
+const pickLocalWordFile = async (filename: string) => {
+  const picker = browserSaveFilePicker();
+  if (!picker) return null;
+  return picker({
+    suggestedName: filename,
+    types: [
+      {
+        description: 'Word 文档',
+        accept: {
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
+        },
+      },
+    ],
+  });
+};
+
+const writeBlobToLocalFile = async (fileHandle: BrowserFileHandle, blob: Blob) => {
+  const writable = await fileHandle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+};
 
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
 type NavKey = 'project' | 'analysis' | 'outline' | 'assets' | 'content' | 'review' | 'config';
@@ -309,15 +398,13 @@ interface ChapterEntry {
 
 const NAV_ITEMS: Array<{ key: NavKey; label: string; description: string; icon: React.ElementType; target?: string }> = [
   { key: 'project', label: '上传文件', description: '选择招标文件', icon: FolderIcon, target: 'panel-analysis' },
-  { key: 'analysis', label: '开始解析', description: '抽取条款与评分', icon: DocumentTextIcon, target: 'panel-analysis' },
-  { key: 'outline', label: '生成目录', description: '映射评分风险', icon: Bars3BottomLeftIcon, target: 'panel-outline' },
-  { key: 'assets', label: '图表素材', description: '生成图表素材', icon: PhotoIcon, target: 'panel-assets' },
-  { key: 'content', label: '生成正文', description: '写入选中章节', icon: PencilSquareIcon, target: 'panel-content' },
-  { key: 'review', label: '执行审校', description: '检查合规风险', icon: ShieldCheckIcon, target: 'panel-review' },
+  { key: 'analysis', label: '标准解析', description: '评审要点识别', icon: DocumentTextIcon, target: 'panel-analysis' },
+  { key: 'outline', label: '目录规划', description: '评分响应映射', icon: Bars3BottomLeftIcon, target: 'panel-outline' },
+  { key: 'content', label: '响应正文', description: '章节内容编制', icon: PencilSquareIcon, target: 'panel-content' },
   { key: 'config', label: '模型配置', description: 'LiteLLM 接入', icon: Cog6ToothIcon },
 ];
 
-const FLOW_STEPS = ['上传', '标准解析', '目录映射', '正文生成', '合规审校', '导出'];
+const FLOW_STEPS = ['上传', '标准解析', '目录映射', '正文生成', '合规审核', '导出'];
 const ANALYSIS_STEPS = ['文件解析', '条款识别', '评分项提取', '合规要求提取', '结果校验'];
 const BLOCKING_REPORT_WARNING_PATTERN = /兜底|未完整返回|模型输出未完整|解析失败|超时/;
 const CLIENT_GENERATION_FALLBACKS_ENABLED = process.env.REACT_APP_ENABLE_GENERATION_FALLBACKS === '1';
@@ -1645,7 +1732,7 @@ export const useBidWorkspaceController = () => {
   const [analysisControl, setAnalysisControl] = useState<GenerationControlState>('idle');
   const [generationControl, setGenerationControl] = useState<GenerationControlState>('idle');
   const [generationProgress, setGenerationProgress] = useState<ProgressState | null>(null);
-  const [exportDirectory, setExportDirectory] = useState('~/Downloads');
+  const [exportDirectory, setExportDirectory] = useState('');
   const [manualReviewConfirmed, setManualReviewConfirmed] = useState(false);
   const [historyRecords, setHistoryRecords] = useState<DraftHistoryRecord[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -1870,17 +1957,22 @@ export const useBidWorkspaceController = () => {
     || cleanDisplayTitle(effectiveOutline?.project_name)
     || cleanDisplayTitle(uploadedFileName || state.uploadedFileName)
     || '待解析项目';
+  const activeTaskIdForRuntime = legacyBusy || Object.values(tasks).find(task => task.status === 'running' || task.status === 'paused')?.id || '';
+  const normalizedRuntimeTaskId = normalizeTaskId(activeTaskIdForRuntime);
+  const modelBusyTasks = ['analysis', 'outline', 'reference', 'history_match', 'document_blocks', 'batch', 'review', 'consistency'];
+  const isLocalModelTaskRunning = modelBusyTasks.includes(normalizedRuntimeTaskId)
+    || normalizedRuntimeTaskId.startsWith('chapter:')
+    || normalizedRuntimeTaskId.startsWith('asset:');
   const runtimeEvent = modelRuntime?.active_requests?.[0] || modelRuntime?.last_event || null;
   const runtimeStatus = runtimeEvent?.status || 'idle';
-  const runtimeStatusText = modelRuntime?.active
+  const runtimeIsCurrentTaskActive = Boolean(modelRuntime?.active && isLocalModelTaskRunning);
+  const runtimeStatusText = runtimeIsCurrentTaskActive
     ? runtimeStatus === 'streaming'
       ? `模型返回中${runtimeEvent?.chunk_count ? ` · ${runtimeEvent.chunk_count}段` : ''}`
       : '模型连接中'
     : runtimeStatus === 'error'
       ? '模型调用失败'
-      : runtimeStatus === 'success'
-        ? '模型已返回'
-        : '模型空闲';
+      : '模型空闲';
   const sourcePanelStatusText = (() => {
     const label = sourceLocateResult.label || activeSourceLabel || activeParseSection?.title || '';
     if (sourceLocateResult.status === 'found') return `已定位：${label || '原文位置'}`;
@@ -2289,7 +2381,7 @@ export const useBidWorkspaceController = () => {
     if (!busy.startsWith('chapter') && busy !== 'batch') return;
     generationPausedRef.current = true;
     setGenerationControl('paused');
-    setGenerationProgress(prev => prev ? { ...prev, detail: `已暂停：${prev.detail}`, status: 'running' } : prev);
+    setGenerationProgress(prev => prev ? { ...prev, detail: `已暂停：${prev.detail}`, status: 'paused' } : prev);
   };
 
   const resumeGeneration = () => {
@@ -2471,7 +2563,7 @@ export const useBidWorkspaceController = () => {
     setReferenceFile(file);
     setReferenceFileName(file.name);
     clearReferenceProfileFromDraft();
-    setSuccess('成熟样例已选择，点击“去解析”后会调用文档解析器和模型解析');
+    setSuccess('成熟样例已选择，可进行参考范本解析');
   };
 
   const runReferenceAnalysis = async () => {
@@ -2498,8 +2590,8 @@ export const useBidWorkspaceController = () => {
       if (effectiveOutline) {
         updateOutline({ ...effectiveOutline, reference_bid_style_profile: profile });
       }
-      completeProgress('样例写作模板已生成', taskVersion);
-      setSuccess('成熟样例已接入，后续响应矩阵、目录、正文和审校会复用其模板结构');
+      completeProgress('参考范本画像已生成', taskVersion);
+      setSuccess('成熟样例已接入，可用于目录、正文与审校口径参考');
     } catch (error: any) {
       failProgress(error.response?.data?.detail || error.message || '样例解析失败', undefined, taskVersion);
       setError(error.response?.data?.detail || error.message || '样例解析失败');
@@ -2510,14 +2602,14 @@ export const useBidWorkspaceController = () => {
 
   const runHistoryReferenceMatch = async () => {
     if (!state.fileContent?.trim()) {
-      setError('请先上传并解析招标文件，再自动匹配历史案例库');
+      setError('请先导入招标文件，再进行案例库智能比选');
       return;
     }
     setBusy('reference-match');
     const taskVersion = startProgress(
       '历史案例匹配',
-      ['召回历史案例', 'LLM 选择案例', '生成样例模板'],
-      '正在从历史标书数据库匹配成熟案例',
+      ['检索历史案例', '筛选参考案例', '生成参考范本'],
+      '正在进行案例库智能比选',
       8,
     );
     try {
@@ -2545,7 +2637,7 @@ export const useBidWorkspaceController = () => {
       if (effectiveOutline) {
         updateOutline({ ...effectiveOutline, reference_bid_style_profile: profile });
       }
-      completeProgress('历史案例已匹配并生成样例模板', taskVersion);
+      completeProgress('历史案例已匹配并生成参考范本', taskVersion);
       setSuccess(`已匹配历史案例：${matched?.project_title || '历史案例库'}`);
     } catch (error: any) {
       failProgress(error.response?.data?.detail || error.message || '历史案例匹配失败', undefined, taskVersion);
@@ -2664,15 +2756,15 @@ export const useBidWorkspaceController = () => {
 
   const runAnalysis = async () => {
     if (!state.fileContent) {
-      setError('请先上传招标文件');
+      setError('请先导入招标文件');
       return;
     }
     if (!hasParsedDocumentText(state.fileContent)) {
-      setError('请先重新上传招标文件，并等待文档解析完成后再进入标准解析。');
+      setError('请重新导入招标文件，并确认文件解析完成后再进入标准化解析。');
       return;
     }
     setBusy('analysis');
-    const taskVersion = startProgress('标准解析', ANALYSIS_STEPS, '准备调用模型解析招标文件', 6);
+    const taskVersion = startProgress('标准解析', ANALYSIS_STEPS, '准备识别评审要点', 6);
     analysisStoppedRef.current = false;
     setAnalysisTaskId('');
     setAnalysisControl('running');
@@ -2888,12 +2980,12 @@ export const useBidWorkspaceController = () => {
     await consumeSseStream(response, (payload) => {
       if (payload.status === 'error') throw new Error(payload.message || '正文生成失败');
       if (payload.status === 'streaming' && payload.full_content) {
-        content = payload.full_content;
+        content = normalizeGeneratedHtmlTables(payload.full_content);
         options?.onContent?.(content);
         options?.onProgress?.(content);
       }
       if (payload.status === 'completed' && payload.content) {
-        content = payload.content;
+        content = normalizeGeneratedHtmlTables(payload.content);
         contentHtml = typeof payload.content_html === 'string' ? payload.content_html : '';
         patchOperations = Array.isArray(payload.patch_operations) ? payload.patch_operations : [];
         historyReference = payload.history_reference && typeof payload.history_reference === 'object' ? payload.history_reference : {};
@@ -2974,7 +3066,6 @@ export const useBidWorkspaceController = () => {
         signal: controller.signal,
         onContent: (partial) => {
           setContentStreamText(partial);
-          saveGeneratedContent(selectedEntry, partial, false);
         },
         onProgress: (partial) => {
           const percent = Math.min(84, 18 + Math.floor(partial.length / 120));
@@ -3042,11 +3133,6 @@ export const useBidWorkspaceController = () => {
           signal: controller.signal,
           onContent: (partial) => {
             setContentStreamText(`# ${entry.item.id} ${entry.item.title}\n\n${partial}`);
-            const currentOutline = batchOutlineRef.current;
-            if (!currentOutline) return;
-            const patchedOutline = { ...currentOutline, outline: updateOutlineItem(currentOutline.outline, entry.item.id, { content: partial }) };
-            batchOutlineRef.current = patchedOutline;
-            updateOutline(patchedOutline);
           },
           onProgress: (partial) => {
             const chapterProgress = Math.min(8, Math.floor(partial.length / 260));
@@ -3131,7 +3217,10 @@ export const useBidWorkspaceController = () => {
     setBusy('review');
     const taskVersion = startProgress('合规审校', ['整理正文', '模型审校', '写入报告'], '正在整理正文和解析结果', 10);
     try {
-      const contentById = Object.fromEntries(entries.map(entry => [entry.item.id, entry.item.content || '']));
+      const contentById = Object.fromEntries(entries.map(entry => [
+        entry.item.id,
+        normalizeGeneratedContentForExport(entry.item.content || ''),
+      ]));
       const outline = buildExportOutline(effectiveOutline.outline, contentById);
       let raw = '';
       advanceProgress('正在调用模型检查覆盖率、阻塞项和风险项', 24, 1);
@@ -3343,16 +3432,32 @@ export const useBidWorkspaceController = () => {
       setError('请先生成目录和正文');
       return;
     }
-    if (!manualReviewConfirmed) {
-      setError('导出前必须人工复核并勾选确认，模型生成结果可能存在误读、漏项、虚构和格式偏差。');
+    const reviewConfirmed = manualReviewConfirmed || window.confirm('导出前请确认：你已经人工复核模型生成结果，知晓可能存在误读、漏项、虚构和格式偏差。是否继续导出？');
+    if (!reviewConfirmed) {
+      setError('已取消导出：导出前需要人工复核确认。');
       return;
     }
     setBusy('export');
     const taskVersion = startProgress('导出 Word', ['整理章节', '写入复核清单', '生成文件'], '正在整理章节正文', 20);
     try {
-      const contentById = Object.fromEntries(entries.map(entry => [entry.item.id, entry.item.content || '']));
+      const contentById = Object.fromEntries(entries.map(entry => [
+        entry.item.id,
+        normalizeGeneratedContentForExport(entry.item.content || ''),
+      ]));
       advanceProgress('正在生成 Word 文件', 70, 1);
       const targetExportDir = exportDirectory.trim();
+      const filename = `${effectiveOutline.project_name || project?.name || '投标文件'}.docx`;
+      let localFileHandle: BrowserFileHandle | null = null;
+      if (!targetExportDir) {
+        try {
+          localFileHandle = await pickLocalWordFile(filename);
+        } catch (saveError: any) {
+          if (saveError?.name === 'AbortError') {
+            throw new Error('已取消保存 Word 文件');
+          }
+          throw saveError;
+        }
+      }
       const response = await documentApi.exportWord({
         project_name: effectiveOutline.project_name || project?.name || '投标文件',
         project_overview: effectiveOutline.project_overview || state.projectOverview,
@@ -3362,10 +3467,9 @@ export const useBidWorkspaceController = () => {
         reference_bid_style_profile: activeReferenceProfile,
         document_blocks_plan: displayDocumentBlocksPlan,
         asset_library: activeAssetLibrary,
-        manual_review_confirmed: manualReviewConfirmed,
+        manual_review_confirmed: reviewConfirmed,
         export_dir: targetExportDir || undefined,
       });
-      const filename = `${effectiveOutline.project_name || project?.name || '投标文件'}.docx`;
       if (!response.ok) {
         const errorPayload = await response.json().catch(() => null);
         throw new Error(errorPayload?.detail || errorPayload?.message || '导出失败');
@@ -3377,9 +3481,13 @@ export const useBidWorkspaceController = () => {
         return;
       }
       const blob = await response.blob();
-      saveAs(blob, filename);
+      const savedWithPicker = Boolean(localFileHandle);
+      if (localFileHandle) await writeBlobToLocalFile(localFileHandle, blob);
+      if (!savedWithPicker) {
+        saveAs(blob, filename);
+      }
       completeProgress('Word 文件已生成', taskVersion);
-      setSuccess(`Word 文件已生成：${filename}`);
+      setSuccess(savedWithPicker ? `Word 文件已保存：${filename}` : `浏览器不支持选择保存位置，已按下载方式生成：${filename}`);
     } catch (error: any) {
       failProgress(error.message || '导出失败', undefined, taskVersion);
       setError(error.message || '导出失败');
@@ -3464,7 +3572,45 @@ export const useBidWorkspaceController = () => {
       : 0
     : -1;
 
+  const workflowAccess = (key: NavKey): { enabled: boolean; reason: string } => {
+    if (key === 'project' || key === 'config') return { enabled: true, reason: '' };
+    if (key === 'analysis') {
+      return state.fileContent
+        ? { enabled: true, reason: '' }
+        : { enabled: false, reason: '请先上传招标文件' };
+    }
+    if (key === 'outline') {
+      return activeReport
+        ? { enabled: true, reason: '' }
+        : { enabled: false, reason: state.fileContent ? '请先完成标准解析' : '请先上传招标文件' };
+    }
+    if (key === 'assets') {
+      if (!state.fileContent) return { enabled: false, reason: '请先上传招标文件' };
+      return effectiveOutline
+        ? { enabled: true, reason: '' }
+        : { enabled: false, reason: activeReport ? '请先生成目录' : '请先完成标准解析' };
+    }
+    if (key === 'content') {
+      if (!state.fileContent) return { enabled: false, reason: '请先上传招标文件' };
+      return effectiveOutline
+        ? { enabled: true, reason: '' }
+        : { enabled: false, reason: activeReport ? '请先生成目录' : '请先完成标准解析' };
+    }
+    if (key === 'review') {
+      if (!state.fileContent) return { enabled: false, reason: '请先上传招标文件' };
+      return completedLeaves > 0
+        ? { enabled: true, reason: '' }
+        : { enabled: false, reason: effectiveOutline ? '请先生成至少一个章节正文' : '请先生成目录和正文' };
+    }
+    return { enabled: true, reason: '' };
+  };
+
   const handleWorkflowAction = (item: typeof NAV_ITEMS[number]) => {
+    const access = workflowAccess(item.key);
+    if (!access.enabled) {
+      setInfo(access.reason);
+      return;
+    }
     goToPage(item.key);
   };
 
@@ -3510,11 +3656,18 @@ export const useBidWorkspaceController = () => {
     if (key === 'project') return state.fileContent ? '已上传' : '选择';
     if (key === 'analysis') return state.analysisReport ? '已完成' : state.fileContent ? '可执行' : '待上传';
     if (key === 'outline') return effectiveOutline ? '已生成' : state.analysisReport ? '可执行' : '待解析';
-    if (key === 'assets') return plannedBlocksCount ? `${generatedVisualCount}/${visualBlocksCount}` : effectiveOutline ? '可规划' : '待目录';
+    if (key === 'assets') return effectiveOutline ? (plannedBlocksCount ? `${generatedVisualCount}/${visualBlocksCount}` : '可规划') : '待目录';
     if (key === 'content') return completedLeaves > 0 ? `${completedLeaves}/${entries.length}` : effectiveOutline ? '可执行' : '待目录';
     if (key === 'review') return reviewReport ? '已审校' : completedLeaves > 0 ? '可执行' : '待正文';
     return '设置';
   };
+
+  const projectProgressText = (() => {
+    if (entries.length) return `已生成 ${completedLeaves}/${entries.length} 章节`;
+    if (state.analysisReport) return '下一步：生成目录';
+    if (state.fileContent) return '下一步：开始标准解析';
+    return '等待上传招标文件';
+  })();
 
   const busyText = progress?.detail
     || (busy === 'batch'
@@ -3734,6 +3887,7 @@ export const useBidWorkspaceController = () => {
     profileRecord,
     progress,
     project,
+    projectProgressText,
     projectTitle,
     rawReferenceProfile,
     referenceFile,
@@ -3768,6 +3922,7 @@ export const useBidWorkspaceController = () => {
     runReferenceAnalysis,
     runReview,
     runtimeEvent,
+    runtimeIsCurrentTaskActive,
     runtimeStatus,
     runtimeStatusText,
     runVisualAssetGeneration,
@@ -3888,6 +4043,7 @@ export const useBidWorkspaceController = () => {
     waitIfGenerationPaused,
     warningIssues,
     wordPreviewStyle,
+    workflowAccess,
     workflowStatus,
   } as const;
 };

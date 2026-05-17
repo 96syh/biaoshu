@@ -18,9 +18,6 @@ from ..utils.provider_registry import get_provider_auth_error
 from ..utils import prompt_manager
 
 
-router = APIRouter(prefix="/api/history-cases", tags=["历史标书案例库"])
-
-
 class HistoryCaseSearchRequest(BaseModel):
     query: str = Field(..., description="检索关键词")
     limit: int = Field(10, ge=1, le=50, description="最大返回条数")
@@ -39,60 +36,126 @@ class RequirementCheckRequest(BaseModel):
     use_llm: bool = Field(True, description="是否使用 LLM 对检索证据做二次判断")
 
 
-@router.get("/summary")
-async def get_history_case_summary():
-    """返回历史标书案例库统计。"""
-    return HistoryCaseService.summary()
+class HistoryCaseController:
+    """历史案例统计、检索、要求核对和样例匹配控制器。"""
 
+    def __init__(self) -> None:
+        self.router = APIRouter(prefix="/api/history-cases", tags=["历史标书案例库"])
+        self.router.get("/summary")(self.get_summary)
+        self.router.get("/projects")(self.list_projects)
+        self.router.get("/domains")(self.list_domains)
+        self.router.post("/search")(self.search)
+        self.router.post("/check-requirements")(self.check_requirements)
+        self.router.post("/match-reference")(self.match_reference)
 
-@router.get("/projects")
-async def list_history_case_projects(
-    limit: int = Query(100, ge=1, le=500),
-    year: str = Query("", description="按年份过滤，如 2025"),
-    subject: str = Query("", description="按投标主体/标签模糊过滤"),
-    result: str = Query("", description="按结果过滤，如 中标、未中、流标"),
-    domain: str = Query("", description="按领域过滤，如 石油、燃气、化工"),
-):
-    """列出已入库的历史项目。"""
-    return {
-        "success": True,
-        "projects": HistoryCaseService.list_projects(
-            limit=limit,
-            year=year,
-            subject=subject,
-            result=result,
-            domain=domain,
-        ),
-    }
+    async def get_summary(self):
+        """返回历史标书案例库统计。"""
+        return HistoryCaseService.summary()
 
+    async def list_projects(
+        self,
+        limit: int = Query(100, ge=1, le=500),
+        year: str = Query("", description="按年份过滤，如 2025"),
+        subject: str = Query("", description="按投标主体/标签模糊过滤"),
+        result: str = Query("", description="按结果过滤，如 中标、未中、流标"),
+        domain: str = Query("", description="按领域过滤，如 石油、燃气、化工"),
+    ):
+        """列出已入库的历史项目。"""
+        return {
+            "success": True,
+            "projects": HistoryCaseService.list_projects(
+                limit=limit,
+                year=year,
+                subject=subject,
+                result=result,
+                domain=domain,
+            ),
+        }
 
-@router.get("/domains")
-async def list_history_case_domains():
-    """列出历史项目领域分类统计。"""
-    return {
-        "success": True,
-        "domains": HistoryCaseService.list_domains(),
-    }
+    async def list_domains(self):
+        """列出历史项目领域分类统计。"""
+        return {
+            "success": True,
+            "domains": HistoryCaseService.list_domains(),
+        }
 
+    async def search(self, request: HistoryCaseSearchRequest):
+        """全文检索历史标书内容，并返回来源文档和 PageIndex 树路径。"""
+        return {
+            "success": True,
+            "results": HistoryCaseService.search(query=request.query, limit=request.limit),
+        }
 
-@router.post("/search")
-async def search_history_cases(request: HistoryCaseSearchRequest):
-    """全文检索历史标书内容，并返回来源文档和 PageIndex 树路径。"""
-    return {
-        "success": True,
-        "results": HistoryCaseService.search(query=request.query, limit=request.limit),
-    }
+    async def check_requirements(self, request: RequirementCheckRequest):
+        """用历史中标案例库核对标准解析中的评分项、资质项是否已有满足证据。"""
+        result = HistoryCaseService.check_requirements(
+            analysis_report=request.analysis_report,
+            limit_per_item=request.limit_per_item,
+        )
+        llm_reason = ""
+        if request.use_llm and result["checks"]:
+            llm_reason = await self._apply_requirement_llm_judgment(result)
 
+        return {
+            "success": True,
+            "message": "历史案例库要求项校验完成",
+            "summary": result["summary"],
+            "checks": result["checks"],
+            "llm_reason": llm_reason,
+        }
 
-@router.post("/check-requirements")
-async def check_history_case_requirements(request: RequirementCheckRequest):
-    """用历史中标案例库核对标准解析中的评分项、资质项是否已有满足证据。"""
-    result = HistoryCaseService.check_requirements(
-        analysis_report=request.analysis_report,
-        limit_per_item=request.limit_per_item,
-    )
-    llm_reason = ""
-    if request.use_llm and result["checks"]:
+    async def match_reference(self, request: ReferenceMatchRequest):
+        """根据当前招标文件自动匹配历史成熟案例，并生成可复用样例风格剖面。"""
+        cache_key = GenerationCacheService.build_key(
+            "history_reference_match",
+            str(config_manager.load_config().get("model_name", "")),
+            {"workflow": "pageindex_history_v2", **request.model_dump(mode="json")},
+        )
+        cached = GenerationCacheService.get("history_reference_match", cache_key)
+        if isinstance(cached, dict):
+            return cached
+
+        candidates = HistoryCaseService.match_candidates(
+            tender_text=request.file_content,
+            analysis_report=request.analysis_report,
+            limit=request.limit,
+        )
+        if not candidates:
+            return {
+                "success": False,
+                "message": "历史案例库未匹配到可用候选",
+                "candidates": [],
+            }
+
+        selected, llm_reason = await self._select_candidate(request, candidates)
+        pageindex_context = HistoryCaseService.load_pageindex_context_for_candidate(selected)
+        profile_source = pageindex_context or HistoryCaseService.load_markdown(str(selected.get("markdown_path") or ""))
+        if not profile_source:
+            return {
+                "success": False,
+                "message": "已匹配候选，但无法读取历史案例 PageIndex/Markdown 文本",
+                "matched_case": selected,
+                "candidates": candidates,
+            }
+
+        profile, llm_reason = await self._build_reference_profile(profile_source, selected, llm_reason)
+        result = {
+            "success": True,
+            "message": f"已自动匹配历史案例：{selected.get('project_title')}",
+            "matched_case": selected,
+            "candidates": candidates,
+            "llm_reason": llm_reason,
+            "reference_bid_style_profile": profile,
+        }
+        GenerationCacheService.set("history_reference_match", cache_key, result)
+        return result
+
+    @staticmethod
+    def _refresh_requirement_summary(result: dict) -> None:
+        result["summary"]["satisfied"] = sum(1 for check in result["checks"] if check.get("satisfied"))
+        result["summary"]["not_found"] = result["summary"]["total"] - result["summary"]["satisfied"]
+
+    async def _apply_requirement_llm_judgment(self, result: dict) -> str:
         try:
             judged, llm_reason = await _judge_requirement_checks_with_llm(result["checks"])
             if judged:
@@ -108,105 +171,70 @@ async def check_history_case_requirements(request: RequirementCheckRequest):
                     )
                     if judgment.get("reason"):
                         check["reason"] = str(judgment.get("reason"))
-                result["summary"]["satisfied"] = sum(1 for check in result["checks"] if check.get("satisfied"))
-                result["summary"]["not_found"] = result["summary"]["total"] - result["summary"]["satisfied"]
+                self._refresh_requirement_summary(result)
+            return llm_reason
         except Exception as exc:
-            llm_reason = f"LLM 判定失败，已使用历史库检索规则结果：{str(exc)}"
+            return f"LLM 判定失败，已使用历史库检索规则结果：{str(exc)}"
 
-    return {
-        "success": True,
-        "message": "历史案例库要求项校验完成",
-        "summary": result["summary"],
-        "checks": result["checks"],
-        "llm_reason": llm_reason,
-    }
+    async def _select_candidate(self, request: ReferenceMatchRequest, candidates: list[dict]) -> tuple[dict, str]:
+        selected = candidates[0]
+        llm_reason = ""
+        if not request.use_llm:
+            return selected, llm_reason
 
-
-@router.post("/match-reference")
-async def match_reference_case(request: ReferenceMatchRequest):
-    """根据当前招标文件自动匹配历史成熟案例，并生成可复用样例风格剖面。"""
-    cache_key = GenerationCacheService.build_key(
-        "history_reference_match",
-        str(config_manager.load_config().get("model_name", "")),
-        request.model_dump(mode="json"),
-    )
-    cached = GenerationCacheService.get("history_reference_match", cache_key)
-    if isinstance(cached, dict):
-        return cached
-
-    candidates = HistoryCaseService.match_candidates(
-        tender_text=request.file_content,
-        analysis_report=request.analysis_report,
-        limit=request.limit,
-    )
-    if not candidates:
-        return {
-            "success": False,
-            "message": "历史案例库未匹配到可用候选",
-            "candidates": [],
-        }
-
-    selected = candidates[0]
-    llm_reason = ""
-    if request.use_llm:
         config = config_manager.load_config()
         auth_error = get_provider_auth_error(config.get("provider"), config.get("api_key"))
         if auth_error:
-            llm_reason = f"LLM 选择跳过，已使用规则得分最高候选：{auth_error}"
-        else:
-            try:
-                selected_id, llm_reason = await _select_reference_candidate_with_llm(
-                    request.file_content,
-                    request.analysis_report,
-                    candidates,
-                )
-                selected = next((item for item in candidates if item.get("project_id") == selected_id), selected)
-                guarded_selected, guard_reason = HistoryCaseService.validate_reference_selection(
-                    selected,
-                    candidates,
-                    request.file_content,
-                    request.analysis_report,
-                )
-                if guard_reason:
-                    selected = guarded_selected
-                    llm_reason = f"{llm_reason}；{guard_reason}" if llm_reason else guard_reason
-            except Exception as exc:
-                llm_reason = f"LLM 选择失败，已使用规则得分最高候选：{str(exc)}"
+            return selected, f"LLM 选择跳过，已使用规则得分最高候选：{auth_error}"
 
-    markdown = HistoryCaseService.load_markdown(str(selected.get("markdown_path") or ""))
-    if not markdown:
-        return {
-            "success": False,
-            "message": "已匹配候选，但无法读取历史案例 Markdown 文本",
-            "matched_case": selected,
-            "candidates": candidates,
-        }
+        try:
+            selected_id, llm_reason = await _select_reference_candidate_with_llm(
+                request.file_content,
+                request.analysis_report,
+                candidates,
+            )
+            selected = next((item for item in candidates if item.get("project_id") == selected_id), selected)
+            guarded_selected, guard_reason = HistoryCaseService.validate_reference_selection(
+                selected,
+                candidates,
+                request.file_content,
+                request.analysis_report,
+            )
+            if guard_reason:
+                selected = guarded_selected
+                llm_reason = f"{llm_reason}；{guard_reason}" if llm_reason else guard_reason
+        except Exception as exc:
+            llm_reason = f"LLM 选择失败，已使用规则得分最高候选：{str(exc)}"
+        return selected, llm_reason
 
-    try:
-        profile = await OpenAIService().generate_reference_bid_style_profile(markdown)
-    except Exception as exc:
-        profile = _build_rule_based_reference_profile(markdown, selected, str(exc))
-        warning = f"成熟样例剖面模型生成失败，已使用规则模板：{str(exc)}"
-        llm_reason = f"{llm_reason}；{warning}" if llm_reason else warning
+    @staticmethod
+    async def _build_reference_profile(profile_source: str, selected: dict, llm_reason: str) -> tuple[dict, str]:
+        try:
+            profile = await OpenAIService().generate_reference_bid_style_profile(profile_source)
+        except Exception as exc:
+            profile = _build_rule_based_reference_profile(profile_source, selected, str(exc))
+            warning = f"成熟样例剖面模型生成失败，已使用规则模板：{str(exc)}"
+            llm_reason = f"{llm_reason}；{warning}" if llm_reason else warning
 
-    profile.setdefault("source_history_case", {
-        "project_id": selected.get("project_id"),
-        "project_title": selected.get("project_title"),
-        "document_id": selected.get("best_document_id"),
-        "file_name": selected.get("best_file_name"),
-        "primary_domain": selected.get("primary_domain"),
-        "pageindex_tree_path": selected.get("pageindex_tree_path"),
-    })
-    result = {
-        "success": True,
-        "message": f"已自动匹配历史案例：{selected.get('project_title')}",
-        "matched_case": selected,
-        "candidates": candidates,
-        "llm_reason": llm_reason,
-        "reference_bid_style_profile": profile,
-    }
-    GenerationCacheService.set("history_reference_match", cache_key, result)
-    return result
+        profile.setdefault("source_history_case", {
+            "project_id": selected.get("project_id"),
+            "project_title": selected.get("project_title"),
+            "document_id": selected.get("best_document_id"),
+            "file_name": selected.get("best_file_name"),
+            "document_category": selected.get("best_document_category"),
+            "document_category_basis": selected.get("best_document_category_basis"),
+            "primary_domain": selected.get("primary_domain"),
+            "pageindex_tree_path": selected.get("pageindex_tree_path"),
+            "pageindex_node_id": selected.get("best_pageindex_node_id"),
+            "node_title": selected.get("best_node_title"),
+            "node_path": selected.get("best_node_path"),
+            "profile_source": "pageindex_nodes",
+        })
+        return profile, llm_reason
+
+
+controller = HistoryCaseController()
+router = controller.router
 
 
 def _build_rule_based_reference_profile(markdown: str, selected: Dict[str, Any], failure_reason: str = "") -> Dict[str, Any]:
@@ -321,6 +349,10 @@ async def _select_reference_candidate_with_llm(
             "primary_domain": item.get("primary_domain"),
             "primary_subdomain": item.get("primary_subdomain"),
             "file_name": item.get("best_file_name"),
+            "document_category": item.get("best_document_category"),
+            "pageindex_node_id": item.get("best_pageindex_node_id"),
+            "node_title": item.get("best_node_title"),
+            "node_path": item.get("best_node_path"),
             "snippet": item.get("snippet"),
             "match_reasons": item.get("match_reasons", []),
         }
@@ -383,6 +415,10 @@ async def _judge_requirement_checks_with_llm(checks: list[dict]) -> tuple[list[d
                     "project_title": item.get("project_title"),
                     "result": item.get("result"),
                     "file_name": item.get("file_name"),
+                    "document_category": item.get("document_category"),
+                    "pageindex_node_id": item.get("pageindex_node_id"),
+                    "node_title": item.get("node_title"),
+                    "node_path": item.get("node_path"),
                     "snippet": str(item.get("snippet") or "")[:300],
                 }
                 for item in (check.get("evidence") or [])[:3]

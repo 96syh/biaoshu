@@ -1,7 +1,7 @@
 /**
  * 项目草稿存储
  *
- * 主存储已迁移到后端 SQLite 项目数据库。浏览器 localStorage / IndexedDB
+ * 主存储已迁移到后端 JSON 项目状态文件。浏览器 localStorage / IndexedDB
  * 只在启动时清理旧缓存，不再保存业务草稿。
  */
 

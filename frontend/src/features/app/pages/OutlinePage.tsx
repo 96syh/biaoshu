@@ -196,7 +196,6 @@ export const OutlinePage = ({ controller }: PageProps) => {
     normalizeCssValue,
     normalizeSourceText,
     notice,
-    openAssetsWorkspace,
     openOutlineEditor,
     outlineDraftRows,
     outlineEditorForm,
@@ -371,15 +370,6 @@ export const OutlinePage = ({ controller }: PageProps) => {
 
   return (
     <div className="ops-page-stack">
-                    <div className="flow-panel">
-                      {FLOW_STEPS.map((step, index) => (
-                        <div key={step} className={`flow-step ${index <= flowIndex ? 'flow-step--done' : ''}`}>
-                          <span>{index <= flowIndex ? <CheckCircleIcon className="h-4 w-4" /> : index + 1}</span>
-                          <strong>{step}</strong>
-                        </div>
-                      ))}
-                      <button type="button" className="solid-button" onClick={runOutline} disabled={busy === 'outline' || !state.analysisReport}>生成目录</button>
-                    </div>
                     <div className="outline-panel">
                       <div className="ops-panel__head">
                         <div>
@@ -388,28 +378,11 @@ export const OutlinePage = ({ controller }: PageProps) => {
                         </div>
                         <div className="outline-actions">
                           {effectiveOutline && <button type="button" className="solid-button" onClick={() => goToPage('content')}>去生成正文</button>}
-                          <button type="button" onClick={openAssetsWorkspace} disabled={!effectiveOutline || !state.analysisReport}>
-                            {busy === 'blocks' ? '规划中' : '图表素材规划'}
-                          </button>
                           <button type="button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>智能建议</button>
                           <button type="button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>{effectiveOutline ? '重新生成' : '生成目录'}</button>
                         </div>
                       </div>
-                      {Object.keys(displayDocumentBlocksPlan || {}).length ? (
-                        <div className="field-hint">
-                          文档块规划已接入：{((displayDocumentBlocksPlan as any).document_blocks || []).length || 0} 个表格/图片/承诺书块，
-                          导出 Word 时会生成可替换占位。
-                        </div>
-                      ) : (
-                        <div className="field-hint">目录生成后可单独执行图表素材规划，补齐表格、流程图、组织架构图、图片和承诺书位置。</div>
-                      )}
                       {busy === 'outline' && <TaskProgress progress={progress} />}
-                      {activeResponseMatrix && (
-                        <div className="matrix-strip">
-                          <strong>响应矩阵</strong>
-                          <span>{activeResponseMatrix.coverage_summary || `共 ${responseMatrixItems.length} 项，待覆盖 ${uncoveredMatrixCount} 项`}</span>
-                        </div>
-                      )}
                       {editingOutlineItem && (
                         <div className="outline-edit-panel">
                           <div className="outline-edit-panel__head">
@@ -474,17 +447,7 @@ export const OutlinePage = ({ controller }: PageProps) => {
                       ) : (
                         busy === 'outline' ? (
                           <OutlineDraftPreview rows={outlineDraftRows} />
-                        ) : (
-                          <div className={`empty-state ${outlineErrorText ? 'empty-state--error' : ''}`}>
-                            <strong>{outlineErrorText ? '目录生成失败' : '目录还没有生成'}</strong>
-                            <span>
-                              {outlineErrorText || '完成标准解析后，点击“生成目录”，后端会把招标结构、评分项、风险和材料要求映射到章节。'}
-                            </span>
-                            <button type="button" className="solid-button" onClick={runOutline} disabled={!state.analysisReport || busy === 'outline'}>
-                              {outlineErrorText ? '重新调用模型生成目录' : '调用模型生成目录'}
-                            </button>
-                          </div>
-                        )
+                        ) : null
                       )}
                     </div>
                   </div>

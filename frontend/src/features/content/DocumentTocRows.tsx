@@ -22,7 +22,7 @@ export const DocumentTocRows = ({ item, activeId, level = 0, onSelect }: Documen
         onClick={() => onSelect(item)}
       >
         {hasChildren ? <ChevronRightIcon className="h-3.5 w-3.5" /> : <span className="tree-branch" />}
-        <span>{item.id} {item.title}</span>
+        <span className="word-toc-row__title">{item.id} {item.title}</span>
         {generated && <CheckCircleIcon className="h-3.5 w-3.5 text-emerald-600" />}
       </button>
       {item.children?.map(child => (

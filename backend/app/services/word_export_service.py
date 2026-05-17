@@ -5,6 +5,8 @@ import json
 import re
 import urllib.request
 from copy import deepcopy
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -619,12 +621,12 @@ async def create_word_export_response(request: WordExportRequest):
             tbl_layout = get_or_add(tbl_pr, "w:tblLayout")
             tbl_layout.set(qn("w:type"), "fixed")
 
+            line = {"val": "single", "sz": "8", "space": "0", "color": "000000"}
             tbl_borders = get_or_add(tbl_pr, "w:tblBorders")
             for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
                 element = get_or_add(tbl_borders, f"w:{edge}")
-                element.set(qn("w:val"), "nil")
-                element.set(qn("w:sz"), "0")
-                element.set(qn("w:space"), "0")
+                for key, value in line.items():
+                    element.set(qn(f"w:{key}"), value)
 
             existing_grid = tbl.tblGrid
             if existing_grid is not None:
@@ -688,10 +690,7 @@ async def create_word_export_response(request: WordExportRequest):
             table = doc.add_table(rows=len(normalized_rows), cols=cols)
             set_table_property(table, table_width, widths)
 
-            empty_border = {"val": "nil", "sz": "0", "space": "0"}
-            strong_line = {"val": "single", "sz": "12", "space": "0", "color": "000000"}
-            header_line = {"val": "single", "sz": "8", "space": "0", "color": "000000"}
-            last_row_idx = len(normalized_rows) - 1
+            full_border = {"val": "single", "sz": "8", "space": "0", "color": "000000"}
 
             for row_idx, row in enumerate(normalized_rows):
                 if row_idx == 0:
@@ -705,19 +704,13 @@ async def create_word_export_response(request: WordExportRequest):
                     cell = table.rows[row_idx].cells[col_idx]
                     set_cell_margins_and_width(cell, widths[col_idx])
                     set_table_cell_text(cell, value, row_idx == 0, col_idx)
-
-                    borders = {
-                        "top": empty_border,
-                        "left": empty_border,
-                        "bottom": empty_border,
-                        "right": empty_border,
-                    }
-                    if row_idx == 0:
-                        borders["top"] = strong_line
-                        borders["bottom"] = header_line if last_row_idx > 0 else strong_line
-                    if row_idx == last_row_idx:
-                        borders["bottom"] = strong_line
-                    set_cell_border(cell, **borders)
+                    set_cell_border(
+                        cell,
+                        top=full_border,
+                        left=full_border,
+                        bottom=full_border,
+                        right=full_border,
+                    )
 
             spacer = doc.add_paragraph()
             spacer.paragraph_format.space_after = Pt(4)
@@ -900,6 +893,72 @@ async def create_word_export_response(request: WordExportRequest):
             """解析并渲染 Markdown 文本到文档"""
             blocks = parse_markdown_blocks(content)
             render_markdown_blocks(blocks, item=item)
+
+        class HtmlTableExtractor(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__(convert_charrefs=True)
+                self.tables: list[list[list[str]]] = []
+                self._in_table = False
+                self._in_row = False
+                self._in_cell = False
+                self._current_table: list[list[str]] = []
+                self._current_row: list[str] = []
+                self._cell_parts: list[str] = []
+
+            def handle_starttag(self, tag: str, attrs) -> None:
+                tag = tag.lower()
+                if tag == "table":
+                    self._in_table = True
+                    self._current_table = []
+                elif self._in_table and tag == "tr":
+                    self._in_row = True
+                    self._current_row = []
+                elif self._in_row and tag in {"td", "th"}:
+                    self._in_cell = True
+                    self._cell_parts = []
+                elif self._in_cell and tag == "br":
+                    self._cell_parts.append("\n")
+
+            def handle_endtag(self, tag: str) -> None:
+                tag = tag.lower()
+                if tag in {"td", "th"} and self._in_cell:
+                    text = re.sub(r"[ \t\r\f\v]+", " ", "".join(self._cell_parts))
+                    text = re.sub(r"\n\s+", "\n", text).strip()
+                    self._current_row.append(unescape(text))
+                    self._in_cell = False
+                    self._cell_parts = []
+                elif tag == "tr" and self._in_row:
+                    if any(cell.strip() for cell in self._current_row):
+                        self._current_table.append(self._current_row)
+                    self._in_row = False
+                    self._current_row = []
+                elif tag == "table" and self._in_table:
+                    if self._current_table:
+                        self.tables.append(self._current_table)
+                    self._in_table = False
+                    self._current_table = []
+
+            def handle_data(self, data: str) -> None:
+                if self._in_cell:
+                    self._cell_parts.append(data)
+
+        def extract_html_tables(content_html: str | None) -> list[list[list[str]]]:
+            if not content_html or "<table" not in content_html.lower():
+                return []
+            parser = HtmlTableExtractor()
+            try:
+                parser.feed(content_html)
+                parser.close()
+            except Exception:
+                return []
+            return [normalize_table_rows(table) for table in parser.tables if normalize_table_rows(table)]
+
+        def add_html_tables(content_html: str | None) -> bool:
+            inserted = False
+            for table_rows in extract_html_tables(content_html):
+                add_three_line_table(table_rows)
+                inserted = True
+            return inserted
 
         def item_history_source_paths(item) -> dict:
             reference = getattr(item, "history_reference", {}) or {}
@@ -1194,10 +1253,13 @@ async def create_word_export_response(request: WordExportRequest):
                         display_number=display_number,
                         source_id=str(item.id or ""),
                     )
-                    if add_history_word_blocks_if_possible(item):
-                        pass
-                    elif content.strip():
+                    if content.strip():
                         add_markdown_content(content, item=item)
+                        add_html_tables(getattr(item, "content_html", None))
+                    elif add_history_word_blocks_if_possible(item):
+                        pass
+                    elif add_html_tables(getattr(item, "content_html", None)):
+                        pass
                     add_planned_blocks(item.id)
                 else:
                     add_planned_blocks(item.id)
